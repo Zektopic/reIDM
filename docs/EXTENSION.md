@@ -36,5 +36,13 @@ Browser updates may auto-disable unpacked extensions; Firefox needs `about:debug
 ## Security notes
 
 * The WebSocket endpoint only accepts `chrome-extension://`, `moz-extension://` or origin-less (local process) clients; any `http(s)` page origin gets 403. Without this, any website could queue downloads on your machine.
+* That check deliberately admits **any** extension origin, not a fixed list of IDs, because the protocol has no way to tell one extension from another — this is the same position the original IDM is in. A malicious extension you have installed can therefore queue downloads. Only install extensions you trust.
 * The daemon binds `127.0.0.1` only.
-* Filenames from servers/pages are stripped of path components and reserved characters.
+* The control API (the page at `127.0.0.1:61002` and the desktop app) needs a per-run token, which the daemon writes to `api-token` in its data directory with mode `0600`. Any process running as you can read it, so this protects against other *users* and against web pages, not against local malware.
+* Filenames from servers/pages are stripped of path components and reserved characters, including the Windows device names (`NUL`, `CON.txt`, `LPT1`, …).
+
+## Known limitations
+
+* If a server answers the first ranged request with `206` but later stops honouring `Range`, the download fails with a clear message rather than silently producing a wrong file. Retrying later, or deleting the row so it starts fresh, is the workaround.
+* No resumption validator: reIDM does not store `ETag`/`Last-Modified` or send `If-Range`, so resuming against a URL whose content changed in place can stitch two revisions together. This matters for "latest build" style URLs.
+* A daemon that cannot read its own `downloads.json` (for example after a truncated write) refuses to start rather than starting with an empty list, so no download history is silently lost — but there is no in-product recovery; the file has to be repaired or removed by hand.
