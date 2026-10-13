@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>reIDM</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#1b1f24;--mut:#6a737d;--line:#e1e4e8;--acc:#2563eb;--ok:#16a34a;--bad:#dc2626;--warn:#d97706}
+@media(prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1f26;--fg:#e6e9ee;--mut:#8b95a3;--line:#2a313b;--acc:#60a5fa;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,Segoe UI,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0}
+h1{font-size:18px;margin:0;font-weight:650}h1 span{color:var(--acc)}
+.sp{flex:1}.stat{color:var(--mut);font-size:13px}
+main{max-width:980px;margin:0 auto;padding:16px}
+form{display:flex;gap:8px;margin-bottom:16px}
+input{flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit}
+button{padding:8px 14px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);font:inherit;cursor:pointer}
+button.p{background:var(--acc);border-color:var(--acc);color:#fff}button:hover{filter:brightness(.95)}
+button.s{padding:4px 10px;font-size:12px}
+.tabs{display:flex;gap:6px;margin-bottom:12px}.tabs button.on{border-color:var(--acc);color:var(--acc)}
+.item{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px}
+.top{display:flex;gap:10px;align-items:baseline}.name{font-weight:600;word-break:break-all;flex:1}
+.badge{font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid currentColor}
+.Running{color:var(--acc)}.Done{color:var(--ok)}.Failed{color:var(--bad)}.Paused,.Queued{color:var(--warn)}
+.bar{height:6px;background:var(--line);border-radius:4px;margin:10px 0 6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--acc);transition:width .4s}
+.Done .bar i,.item.Done .bar i{background:var(--ok)}
+.meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--mut);font-size:12px}.meta .url{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acts{display:flex;gap:6px;margin-top:8px}.err{color:var(--bad);font-size:12px;margin-top:6px}
+.empty{text-align:center;color:var(--mut);padding:48px 0}
+</style></head><body>
+<header><h1>re<span>IDM</span></h1><div class="sp"></div><div class="stat" id="stat"></div></header>
+<main>
+<form id="f"><input id="u" placeholder="Paste a download URL (http / https)…" autocomplete="off" autofocus><button class="p">Download</button></form>
+<div class="tabs" id="tabs"></div><div id="list"></div>
+</main>
+<script>
+const TOKEN="__TOKEN__";
+const H={"X-Reidm-Token":TOKEN,"Content-Type":"application/json"};
+let items=[],filter="all",prev={};
+const $=s=>document.querySelector(s);
+const hum=n=>{if(n==null)return"?";const u=["B","KiB","MiB","GiB","TiB"];let i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(i?1:0)+" "+u[i]};
+const dur=s=>!isFinite(s)||s<0?"–":s<60?Math.round(s)+"s":s<3600?Math.floor(s/60)+"m "+Math.round(s%60)+"s":Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m";
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(m,p,b){const r=await fetch("/api/downloads"+p,{method:m,headers:H,body:b?JSON.stringify(b):undefined});if(!r.ok)throw new Error(await r.text()||r.status);return r.status===204?null:r.json()}
+const act=(id,w)=>api("POST","/"+id+"/"+w).then(tick).catch(e=>alert(e.message));
+const del=(id,purge)=>{if(purge&&!confirm("Delete the file too?"))return;api("DELETE","/"+id+(purge?"?purge=true":"")).then(tick)};
+window.act=act;window.del=del;
+function render(){
+  const st=i=>i.status.state;
+  const tabs=[["all","All"],["active","Active"],["Done","Completed"],["Failed","Failed"]];
+  $("#tabs").innerHTML=tabs.map(([k,l])=>`<button class="${filter===k?"on":""}" onclick="filter='${k}';render()">${l}</button>`).join("");
+  const vis=items.filter(i=>filter==="all"||(filter==="active"?["Running","Queued","Paused"].includes(st(i)):st(i)===filter)).sort((a,b)=>b.id-a.id);
+  const now=Date.now();let total=0;
+  $("#list").innerHTML=vis.length?vis.map(i=>{
+    const s=st(i),p=prev[i.id];let sp=0;
+    if(s==="Running"&&p&&now>p.t)sp=(i.downloaded-p.d)/((now-p.t)/1000);
+    if(s==="Running")total+=Math.max(sp,0);
+    const pct=i.size?Math.min(100,i.downloaded*100/i.size):(s==="Done"?100:0);
+    const name=i.path.split(/[\\/]/).pop();
+    return `<div class="item ${s}"><div class="top"><div class="name">${esc(name)}</div><span class="badge ${s}">${s}</span></div>
+    <div class="bar"><i style="width:${pct}%"></i></div>
+    <div class="meta"><span>${hum(i.downloaded)} / ${hum(i.size)}${i.size?` (${pct.toFixed(0)}%)`:""}</span>${s==="Running"?`<span>${hum(Math.max(sp,0))}/s</span><span>ETA ${i.size?dur((i.size-i.downloaded)/Math.max(sp,1)):"–"}</span>`:""}<span class="url" title="${esc(i.request.url)}">${esc(i.request.url)}</span></div>
+    ${s==="Failed"?`<div class="err">${esc(i.status.error||"")}</div>`:""}
+    <div class="acts">${s==="Running"?`<button class="s" onclick="act(${i.id},'pause')">Pause</button>`:""}${s==="Paused"||s==="Failed"?`<button class="s" onclick="act(${i.id},'resume')">${s==="Failed"?"Retry":"Resume"}</button>`:""}${s==="Done"?`<button class="s" onclick="act(${i.id},'open')">Open</button>`:""}<button class="s" onclick="act(${i.id},'folder')">Show in folder</button><button class="s" onclick="del(${i.id},false)">Remove</button><button class="s" onclick="del(${i.id},true)">Delete file</button></div></div>`}).join(""):'<div class="empty">No downloads yet. Paste a URL above, or download something in a browser with the IDM extension.</div>';
+  $("#stat").textContent=items.filter(i=>st(i)==="Running").length+" active · "+hum(total)+"/s";
+  prev={};items.forEach(i=>prev[i.id]={d:i.downloaded,t:now});
+}
+window.render=render;
+async function tick(){try{items=await api("GET","");render()}catch(e){$("#stat").textContent="daemon unreachable"}}
+$("#f").onsubmit=async e=>{e.preventDefault();const u=$("#u").value.trim();if(!u)return;try{await api("POST","",{url:u});$("#u").value="";tick()}catch(x){alert(x.message)}};
+tick();setInterval(tick,1000);
+</script></body></html>

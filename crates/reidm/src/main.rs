@@ -1,4 +1,6 @@
 mod install;
+mod launch;
+mod web;
 mod session;
 mod ws;
 
@@ -54,6 +56,8 @@ enum Cmd {
     Resume { id: u64 },
     /// Remove a download from the list (add --purge to delete its files).
     Rm { id: u64, #[arg(long)] purge: bool },
+    /// Open the web UI in your browser (starts the daemon if needed).
+    Ui,
     /// Register the native-messaging host (com.tonec.idm) with installed browsers.
     InstallHost,
     UninstallHost,
@@ -115,6 +119,14 @@ async fn main() -> Result<()> {
                     }
                 });
             }
+            {
+                let m = mgr.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = web::serve(m).await {
+                        tracing::error!("web UI unavailable: {e} (is another reidm running?)");
+                    }
+                });
+            }
             let local = format!("127.0.0.1:{}", ws::LOCAL_PORT);
             tokio::select! {
                 r = ws::listen(&local, mgr) => r?,
@@ -169,6 +181,19 @@ async fn main() -> Result<()> {
         Cmd::Pause { id } => drop(send_to_daemon(vec![ctl(session::T_CTL_PAUSE, id, None)]).await?),
         Cmd::Resume { id } => drop(send_to_daemon(vec![ctl(session::T_CTL_RESUME, id, None)]).await?),
         Cmd::Rm { id, purge } => drop(send_to_daemon(vec![ctl(session::T_CTL_REMOVE, id, Some(purge as i64))]).await?),
+        Cmd::Ui => {
+            let up = || std::net::TcpStream::connect_timeout(&format!("127.0.0.1:{}", web::UI_PORT).parse().unwrap(), Duration::from_millis(300)).is_ok();
+            if !up() {
+                launch::spawn_daemon()?;
+                for _ in 0..40 {
+                    if up() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+            launch::open_url(&format!("http://127.0.0.1:{}/", web::UI_PORT));
+        }
         Cmd::InstallHost => install::install()?,
         Cmd::UninstallHost => install::uninstall()?,
         Cmd::PatchExtension { src, dst } => patch_extension(&src, &dst)?,

@@ -19,6 +19,7 @@ ArchitecturesAllowed=x64compatible
 
 [Files]
 Source: "..\..\target\release\reidm.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\target\release\reidm-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\release\reidm-host.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\docs\EXTENSION.md"; DestDir: "{app}\docs"; Flags: ignoreversion
@@ -32,10 +33,12 @@ Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\com.tonec.idm"
 Root: HKCU; Subkey: "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.tonec.idm"; ValueType: string; ValueData: "{app}\com.tonec.idm.chromium.json"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Mozilla\NativeMessagingHosts\com.tonec.idm"; ValueType: string; ValueData: "{app}\com.tonec.idm.firefox.json"; Flags: uninsdeletekey
 ; Start the daemon at login
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "reIDM"; ValueData: """{app}\reidm.exe"" daemon"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "reIDM"; ValueData: """{app}\reidm-gui.exe"" --background"; Flags: uninsdeletevalue
 
 [Icons]
+Name: "{group}\reIDM"; Filename: "{app}\reidm-gui.exe"
+Name: "{autodesktop}\reIDM"; Filename: "{app}\reidm-gui.exe"
 Name: "{group}\reIDM docs"; Filename: "{app}\docs\EXTENSION.md"
 
 [Run]
-Filename: "{app}\reidm.exe"; Parameters: "daemon"; Description: "Start reIDM now"; Flags: nowait postinstall skipifsilent runhidden
+Filename: "{app}\reidm-gui.exe"; Description: "Open reIDM now"; Flags: nowait postinstall skipifsilent

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/reidm-proto", "crates/reidm-core", "crates/reidm", "crates/reidm-host"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Zektopic/reIDM"
@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio", "json", "query"] }
 url = "2"
 percent-encoding = "2"
 

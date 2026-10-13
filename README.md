@@ -8,8 +8,14 @@ so the *official* "IDM Integration Module" extension can hand downloads to it.
 * CLI: `reidm get|add|list|pause|resume|rm|daemon|install-host|patch-extension`
 * No telemetry, no licensing logic — see `NOTICE.md`
 
+## UI
+
+`reidm ui` (Windows: the **reIDM** Start Menu/desktop shortcut, `reidm-gui.exe`) starts the daemon if needed and opens
+`http://127.0.0.1:61002/` — add URLs, see progress/speed/ETA, pause, resume, retry, open, show in folder, remove.
+The page only answers to its own `127.0.0.1` host with a per-run token, so other websites cannot drive it.
+
 > Status: **0.1, early.** Download engine and extension handshake/capture are tested (see `docs/PROTOCOL.md` → Verification).
-> There is no GUI, no scheduler, no video/media grabber, no FTP, no authentication prompts.
+> There is no native GUI (the UI is a local web page), no scheduler, no video/media grabber, no FTP, no authentication prompts.
 
 ## Install
 
