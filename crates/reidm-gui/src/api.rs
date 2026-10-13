@@ -6,7 +6,7 @@
 
 use crate::model::Item;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -127,7 +127,7 @@ impl Api {
                         token = read_token();
                     }
                     // Capabilities change rarely, so refresh them about every 5 seconds.
-                    if ticks % 16 == 0 {
+                    if ticks.is_multiple_of(16) {
                         if let Some(t) = token.as_deref() {
                             if let Some(c) = fetch_status(&agent, &base2, t) {
                                 caps = c;
@@ -203,11 +203,8 @@ impl Api {
     /// Non-blocking: returns the newest snapshot if the poller produced one.
     pub fn try_recv(&self) -> Option<Snapshot> {
         let mut last = None;
-        loop {
-            match self.rx.try_recv() {
-                Ok(s) => last = Some(s),
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
+        while let Ok(s) = self.rx.try_recv() {
+            last = Some(s);
         }
         last
     }

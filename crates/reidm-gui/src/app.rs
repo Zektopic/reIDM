@@ -45,7 +45,6 @@ pub struct App {
     opt_conn: usize,
     confirm_remove: Option<u64>,
     about: bool,
-    settings_loaded: bool,
 }
 
 impl App {
@@ -72,7 +71,6 @@ impl App {
             opt_conn: 8,
             confirm_remove: None,
             about: false,
-            settings_loaded: false,
         }
     }
 
@@ -106,7 +104,7 @@ impl App {
         self.snap.items.iter().filter(|i| c.matches(i)).count()
     }
 
-    /// Selection helpers -------------------------------------------------
+    // ── selection ────────────────────────────────────────────────────────
 
     fn select_only(&mut self, id: u64) {
         self.selected = vec![id];
@@ -135,7 +133,7 @@ impl App {
         self.snap.items.iter().filter(|i| self.selected.contains(&i.id)).collect()
     }
 
-    /// Actions -----------------------------------------------------------
+    // ── commands ─────────────────────────────────────────────────────────
 
     fn start_selected(&mut self) {
         let ids: Vec<u64> = self.selected_items().iter().filter(|i| i.status.is_stopped()).map(|i| i.id).collect();
@@ -313,11 +311,13 @@ impl App {
                     }
                     sep(ui);
                     if tool(ui, p, "Options", Icon::Gear, false).clicked() {
-                        if !self.settings_loaded {
-                            self.show_options = true;
-                        } else {
-                            self.show_options = true;
+                        // Seed the dialog from the daemon's live values, so re-opening it never
+                        // shows a stale folder or connection count.
+                        if let Some((dir, conn)) = self.api.fetch_settings() {
+                            self.opt_dir = dir;
+                            self.opt_conn = conn;
                         }
+                        self.show_options = true;
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -539,13 +539,11 @@ impl App {
                             // Size
                             row.col(|ui| {
                                 let t = match it.size {
-                                    Some(s) => size_human(s),
+                                    Some(sz) if it.status != Status::Done && it.downloaded > 0 => {
+                                        format!("{} of {}", size_human(it.downloaded), size_human(sz))
+                                    }
+                                    Some(sz) => size_human(sz),
                                     None => "Unknown".to_string(),
-                                };
-                                let t = if it.size.is_some() && it.status != Status::Done && it.downloaded > 0 {
-                                    format!("{} of {}", size_human(it.downloaded), size_human(it.size.unwrap()))
-                                } else {
-                                    t
                                 };
                                 ui.label(RichText::new(t).size(12.0).color(p.text_dim));
                             });
@@ -743,16 +741,6 @@ impl App {
     fn options_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         if !self.show_options {
             return;
-        }
-        // Seed once from the daemon.
-        if !self.settings_loaded {
-            if self.snap.connected {
-                if let Some(s) = self.api.fetch_settings() {
-                    self.opt_dir = s.0;
-                    self.opt_conn = s.1;
-                    self.settings_loaded = true;
-                }
-            }
         }
         let mut open = true;
         let mut save = false;
