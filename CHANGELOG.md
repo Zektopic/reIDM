@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2
+
+* The window checks for a new release **once shortly after it starts**, so a newer version is
+  noticed without the user going looking for it. It is a single GET to api.github.com; nothing is
+  reported back, and nothing is downloaded or run automatically.
+* Fixed a clippy failure on the macOS job (`chunks_exact` with a constant size).
+
 ## 0.2.1
 
 ### Added

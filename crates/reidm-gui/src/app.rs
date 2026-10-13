@@ -68,6 +68,8 @@ pub struct App {
     /// IDM's "Categories > Downloads" node is collapsible; start open.
     cats_open: bool,
     downloads_open: bool,
+    /// An update check is kicked off once, a moment after startup.
+    checked_on_start: bool,
 }
 
 impl App {
@@ -98,6 +100,7 @@ impl App {
             update_rx: None,
             cats_open: true,
             downloads_open: true,
+            checked_on_start: false,
         }
     }
 
@@ -289,6 +292,12 @@ impl eframe::App for App {
             self.snap = s;
         }
         self.poll_update();
+        // One check shortly after launch, so a new release is noticed without the user going
+        // looking. It is a single GET to api.github.com and reports nothing back to us.
+        if !self.checked_on_start && self.snap.connected {
+            self.checked_on_start = true;
+            self.check_for_updates();
+        }
 
         let ctx = ui.ctx().clone();
         if self.applied_theme != Some(self.dark) {

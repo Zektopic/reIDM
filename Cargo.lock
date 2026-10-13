@@ -2857,7 +2857,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reidm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "reidm-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "directories",
@@ -2893,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "reidm-gui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "directories",
@@ -2911,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "reidm-host"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2923,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "reidm-proto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde_json",
 ]
