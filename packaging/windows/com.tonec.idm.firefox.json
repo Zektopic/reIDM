@@ -1,0 +1,7 @@
+{
+  "name": "com.tonec.idm",
+  "description": "reIDM native messaging host (IDM-compatible)",
+  "type": "stdio",
+  "path": "reidm-host.exe",
+  "allowed_extensions": [ "mozilla_cc3@internetdownloadmanager.com" ]
+}

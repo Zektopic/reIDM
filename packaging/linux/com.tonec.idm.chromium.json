@@ -1,0 +1,10 @@
+{
+  "name": "com.tonec.idm",
+  "description": "reIDM native messaging host (IDM-compatible)",
+  "type": "stdio",
+  "path": "/usr/bin/reidm-host",
+  "allowed_origins": [
+    "chrome-extension://ngpampappnmepgilojfohadhhmbhlaek/",
+    "chrome-extension://llbjbkhnmlidjebalopleeepgdfgcpec/"
+  ]
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=reIDM download manager daemon
+
+[Service]
+ExecStart=/usr/bin/reidm daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

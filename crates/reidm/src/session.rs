@@ -1,0 +1,196 @@
+//! Transport-independent protocol logic: one `Session` per connected extension (or CLI) client.
+
+use reidm_core::{Manager, Request};
+use reidm_proto::{Message, Value};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Protocol revision we advertise. The extension gates features on this number
+/// (>= 113 means the server supplies every pattern list itself).
+const SERVER_PROTO: i64 = 113;
+/// Version we report as the "manager" (6.43 build 15, encoded major<<24|minor<<16|build<<8).
+const MANAGER_VERSION: i64 = (6 << 24) | (43 << 16) | (15 << 8);
+
+/// File types captured from browser downloads by default (IDM's stock list).
+const DEFAULT_FILE_TYPES: &str = "3GP|7Z|AAC|ACE|AIF|ARJ|ASF|AVI|BIN|BZ2|DEB|DMG|EXE|GZ|GZIP|IMG|ISO|LZH|M4A|M4V|MKV|MOV|MP3|MP4|MPA|MPE|MPEG|MPG|MSI|MSU|OGG|OGV|PDF|PKG|PLJ|PPS|PPT|QT|RA|RAR|RM|RPM|SEA|SIT|SITX|TAR|TIF|TIFF|WAV|WMA|WMV|XZ|Z|ZIP|ZST";
+
+/// Property names the content script hooks to spot XHR/fetch downloads (key 23).
+const PAGE_HOOKS: &str = "XMLHttpRequest|open|send|setRequestHeader|upload|loadend|responseText|fetch|headers|body|text|json|getReader|pipeThrough|Headers|accept|*/*|application/vnd.t1c|Response|url|get";
+
+// Message types sent by the extension.
+const T_KEEPALIVE: u32 = 0;
+const T_REPLY: u32 = 1;
+const T_HELLO: u32 = 2;
+const T_INTERCEPT: u32 = 13;
+const T_DOWNLOAD: u32 = 14;
+// Message types sent by the server.
+const T_HELLO_ACK: u32 = 3;
+const T_SETTINGS: u32 = 4;
+// reIDM control extensions (never emitted by the real extension).
+pub const T_CTL_PAUSE: u32 = 1001;
+pub const T_CTL_RESUME: u32 = 1002;
+pub const T_CTL_REMOVE: u32 = 1003;
+
+// Reply codes understood by the extension (`mc()` in background.js).
+const R_IGNORE: i64 = 0;
+const R_TAKEN: i64 = 3;
+
+// Keys
+const K_URL: u32 = 6;
+const K_PAGE: u32 = 7;
+const K_NAME: u32 = 100;
+const K_REFERER: u32 = 50;
+const K_COOKIE: u32 = 51;
+const K_UA: u32 = 54;
+
+static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+pub struct Session {
+    mgr: Manager,
+    /// Dispatches every message to the bundled handler; counts hellos for diagnostics.
+    pub hello_seen: bool,
+}
+
+fn nid() -> u32 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The URL may carry IDM's `idmdwnlmfv9://` marker in front of the real scheme.
+fn clean_url(u: &str) -> String {
+    match u.find("://") {
+        Some(i) if u[..i].starts_with("idmdwnlmfv") => u[i + 3..].to_string(),
+        _ => u.to_string(),
+    }
+}
+
+impl Session {
+    pub fn new(mgr: Manager) -> Self {
+        Self { mgr, hello_seen: false }
+    }
+
+    fn reply(req: &Message, args: &[i64]) -> Message {
+        let mut m = Message::new(nid(), T_REPLY, 2, 0);
+        m.args.push(reidm_proto::Arg::Int(req.id as i64));
+        m.args.extend(args.iter().map(|a| reidm_proto::Arg::Int(*a)));
+        m
+    }
+
+    fn hello_ack(&self) -> Vec<Message> {
+        // type 3: [proto, ?, ?, ?, dpi, manager-version, client-id, ?, zoom%]
+        let ack = Message::new(nid(), T_HELLO_ACK, 1, 0).with_args([SERVER_PROTO, 0, 0, 0, 96, MANAGER_VERSION, 1, 0, 100]);
+        // type 4: capture settings. flags: 64 auto-capture, 32 sniffing UI, 256/512 menu items, 1024 ext. mode
+        let mut set = Message::new(nid(), T_SETTINGS, 1, 64 | 32 | 256 | 512 | 1024).with_args([0, 0, MANAGER_VERSION, 0]);
+        set.keys.insert(1, Value::Str(DEFAULT_FILE_TYPES.into()));
+        set.keys.insert(23, Value::Str(PAGE_HOOKS.into()));
+        vec![ack, set]
+    }
+
+    fn request_from(m: &Message) -> Option<Request> {
+        let url = clean_url(m.str_key(K_URL)?);
+        let nonempty = |k| m.str_key(k).filter(|s| !s.is_empty()).map(str::to_string);
+        Some(Request {
+            url,
+            referer: nonempty(K_REFERER).or_else(|| nonempty(K_PAGE)),
+            cookie: nonempty(K_COOKIE),
+            user_agent: nonempty(K_UA),
+            filename: nonempty(K_NAME),
+            dir: None,
+        })
+    }
+
+    /// Handle one inbound message and return the messages to send back.
+    pub fn handle(&mut self, m: &Message) -> Vec<Message> {
+        let wants_reply = m.flags & 1 != 0;
+        match m.ty {
+            T_HELLO => {
+                self.hello_seen = true;
+                tracing::info!("extension hello (args={:?})", m.args.iter().map(|a| a.as_i64()).collect::<Vec<_>>());
+                self.hello_ack()
+            }
+            T_KEEPALIVE => vec![Self::reply(m, &[])],
+            T_DOWNLOAD => {
+                match Self::request_from(m) {
+                    Some(r) => match self.mgr.add(r) {
+                        Ok(id) => tracing::info!("queued download #{id}"),
+                        Err(e) => tracing::warn!("rejected download: {e:#}"),
+                    },
+                    None => tracing::debug!("type 14 without URL"),
+                }
+                if wants_reply { vec![Self::reply(m, &[R_TAKEN])] } else { vec![] }
+            }
+            T_INTERCEPT if m.flags & 128 != 0 => {
+                // The browser is about to save a file itself; claim it if it is plain http(s).
+                let taken = match Self::request_from(m).map(|r| self.mgr.add(r)) {
+                    Some(Ok(id)) => {
+                        tracing::info!("captured browser download as #{id}");
+                        true
+                    }
+                    Some(Err(e)) => {
+                        tracing::info!("not capturing: {e:#}");
+                        false
+                    }
+                    None => false,
+                };
+                vec![Self::reply(m, &[if taken { R_TAKEN } else { R_IGNORE }])]
+            }
+            T_INTERCEPT => {
+                // Passive request sniffing: we do not capture from raw network events.
+                if wants_reply { vec![Self::reply(m, &[R_IGNORE])] } else { vec![] }
+            }
+            T_REPLY => vec![], // answer to something we sent; nothing pending
+            T_CTL_PAUSE | T_CTL_RESUME | T_CTL_REMOVE => {
+                let id = m.arg(0).unwrap_or(-1);
+                if id >= 0 {
+                    let id = id as u64;
+                    match m.ty {
+                        T_CTL_PAUSE => self.mgr.pause(id),
+                        T_CTL_RESUME => {
+                            if let Err(e) = self.mgr.resume(id) {
+                                tracing::warn!("resume {id}: {e:#}");
+                            }
+                        }
+                        _ => self.mgr.remove(id, m.arg(1).unwrap_or(0) != 0),
+                    }
+                }
+                vec![Self::reply(m, &[1])]
+            }
+            _ => {
+                if wants_reply { vec![Self::reply(m, &[])] } else { vec![] }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mgr() -> Manager {
+        let d = std::env::temp_dir().join(format!("reidm-test-{}", std::process::id()));
+        Manager::open(&d, d.clone(), 2).unwrap()
+    }
+
+    #[tokio::test]
+    async fn hello_gets_ack_and_settings() {
+        let mut s = Session::new(mgr());
+        let out = s.handle(&Message::new(1, T_HELLO, 5, 0).with_args([113, 93]));
+        assert_eq!(out.iter().map(|m| m.ty).collect::<Vec<_>>(), vec![T_HELLO_ACK, T_SETTINGS]);
+        // encodes to something the parser accepts
+        for m in &out {
+            Message::decode(m.encode().as_bytes()).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn keepalive_is_answered() {
+        let mut s = Session::new(mgr());
+        let out = s.handle(&Message::new(9, T_KEEPALIVE, 1, 1));
+        assert_eq!(out[0].ty, T_REPLY);
+        assert_eq!(out[0].arg(0), Some(9));
+    }
+
+    #[test]
+    fn strips_idm_scheme_marker() {
+        assert_eq!(clean_url("idmdwnlmfv9://https://a/b"), "https://a/b");
+        assert_eq!(clean_url("https://a/b"), "https://a/b");
+    }
+}

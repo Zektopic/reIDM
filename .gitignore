@@ -1,0 +1,10 @@
+/target
+/dist
+# Vendor binaries and files recovered from the installer are NOT redistributed.
+/samples/
+# Local Ghidra scratch
+*.gpr
+*.rep/
+# pre-existing local files, not part of the project
+/archive-ygyt97/
+/build/
