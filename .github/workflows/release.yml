@@ -47,6 +47,15 @@ jobs:
 
   macos-dmg:
     runs-on: macos-14
+    env:
+      # `secrets` is not available in a step's `if`, so surface them as job-level env
+      # and test those. All are empty on a repository without them and the steps skip.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      MACOS_APPLE_ID: ${{ secrets.MACOS_APPLE_ID }}
+      MACOS_APPLE_PASSWORD: ${{ secrets.MACOS_APPLE_PASSWORD }}
+      MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,10 +65,7 @@ jobs:
       # Optional: Developer ID signing. Both steps no-op when the secrets are absent, so the
       # build still succeeds ad-hoc signed — see docs/PACKAGING.md.
       - name: Import the signing certificate
-        if: ${{ secrets.MACOS_CERT_P12 != '' }}
-        env:
-          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        if: ${{ env.MACOS_CERT_P12 != '' }}
         run: |
           KEYCHAIN=build.keychain
           security create-keychain -p actions "$KEYCHAIN"
@@ -71,19 +77,14 @@ jobs:
           rm -f cert.p12
           security find-identity -v -p codesigning "$KEYCHAIN"
       - name: Store the notarization credentials
-        if: ${{ secrets.MACOS_APPLE_ID != '' }}
-        env:
-          MACOS_APPLE_ID: ${{ secrets.MACOS_APPLE_ID }}
-          MACOS_APPLE_PASSWORD: ${{ secrets.MACOS_APPLE_PASSWORD }}
-          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        if: ${{ env.MACOS_APPLE_ID != '' }}
         run: |
           xcrun notarytool store-credentials reidm-notary \
             --apple-id "$MACOS_APPLE_ID" --password "$MACOS_APPLE_PASSWORD" --team-id "$MACOS_TEAM_ID"
       - name: Build the DMG
         env:
-          MACOS_SIGN_IDENTITY: "${{ secrets.MACOS_SIGN_IDENTITY }}"
           # Only notarize when both a certificate and notary credentials were provided.
-          MACOS_NOTARY_PROFILE: "${{ secrets.MACOS_CERT_P12 != '' && secrets.MACOS_APPLE_ID != '' && 'reidm-notary' || '' }}"
+          MACOS_NOTARY_PROFILE: "${{ env.MACOS_CERT_P12 != '' && env.MACOS_APPLE_ID != '' && 'reidm-notary' || '' }}"
         run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do cargo build --release --locked --target $t; done
           mkdir -p dist universal
