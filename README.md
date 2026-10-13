@@ -5,17 +5,23 @@ so the *official* "IDM Integration Module" extension can hand downloads to it.
 
 * Segmented parallel downloads (default 8 connections), resume after restart/crash, retry with back-off
 * Browser-download capture via the IDM extension (WebSocket `:1001`/`:61001` or native messaging host `com.tonec.idm`)
-* CLI: `reidm get|add|list|pause|resume|rm|daemon|install-host|patch-extension`
+* A native desktop window (toolbar, category tree, sortable download table, status bar) — no browser needed
+* CLI: `reidm get|add|list|pause|resume|rm|daemon|ui|install-host|patch-extension`
 * No telemetry, no licensing logic — see `NOTICE.md`
 
-## UI
+## The window
 
-`reidm ui` (Windows: the **reIDM** Start Menu/desktop shortcut, `reidm-gui.exe`) starts the daemon if needed and opens
-`http://127.0.0.1:61002/` — add URLs, see progress/speed/ETA, pause, resume, retry, open, show in folder, remove.
-The page only answers to its own `127.0.0.1` host with a per-run token, so other websites cannot drive it.
+**reIDM** (Start Menu / desktop shortcut on Windows, `reIDM.app` on macOS, `reidm-gui` on Linux) is a desktop
+front-end for the background service. It starts the service if it is not already running, so downloads continue
+after the window is closed.
 
-> Status: **0.1, early.** Download engine and extension handshake/capture are tested (see `docs/PROTOCOL.md` → Verification).
-> There is no native GUI (the UI is a local web page), no scheduler, no video/media grabber, no FTP, no authentication prompts.
+The same list is also reachable as a local web page via `reidm ui` (`http://127.0.0.1:61002/`), which is handy
+over SSH or on a headless box. That page only answers to its own `127.0.0.1` host and needs a per-run token, so
+no other website can drive it.
+
+> Status: **0.1, early.** The download engine, the extension handshake/capture and the window are tested
+> (see `docs/PROTOCOL.md` → Verification). There is no scheduler, no video/media grabber, no FTP, and no
+> authentication prompts.
 
 ## Install
 

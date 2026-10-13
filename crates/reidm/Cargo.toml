@@ -33,15 +33,22 @@ license-file = ["../../LICENSE", "0"]
 extended-description = "Cross-platform download manager (segmented, resumable) that speaks the IDM browser-extension protocol. Not affiliated with Tonec."
 section = "net"
 priority = "optional"
-depends = "$auto"
+# `$auto` picks up the shared libraries the binaries link against; these are the GUI's, which are
+# loaded through the windowing stack rather than always appearing in the ELF dependency list.
+depends = "$auto, libxkbcommon0, libgl1 | libgl1-mesa-glx, libxcb1, libwayland-client0, libfontconfig1"
 assets = [
   ["../../target/release/reidm", "usr/bin/reidm", "755"],
   ["../../target/release/reidm-host", "usr/bin/reidm-host", "755"],
+  ["../../target/release/reidm-gui", "usr/bin/reidm-gui", "755"],
+  ["../../packaging/linux/reidm.desktop", "usr/share/applications/reidm.desktop", "644"],
+  ["../../packaging/icon/reidm-256.png", "usr/share/icons/hicolor/256x256/apps/reidm.png", "644"],
+  ["../../packaging/icon/reidm-512.png", "usr/share/icons/hicolor/512x512/apps/reidm.png", "644"],
   ["../../packaging/linux/reidm.service", "usr/lib/systemd/user/reidm.service", "644"],
   ["../../packaging/linux/com.tonec.idm.chromium.json", "etc/opt/chrome/native-messaging-hosts/com.tonec.idm.json", "644"],
   ["../../packaging/linux/com.tonec.idm.chromium.json", "etc/chromium/native-messaging-hosts/com.tonec.idm.json", "644"],
   ["../../packaging/linux/com.tonec.idm.chromium.json", "etc/opt/edge/native-messaging-hosts/com.tonec.idm.json", "644"],
   ["../../packaging/linux/com.tonec.idm.firefox.json", "usr/lib/mozilla/native-messaging-hosts/com.tonec.idm.json", "644"],
   ["../../docs/EXTENSION.md", "usr/share/doc/reidm/EXTENSION.md", "644"],
+  ["../../CHANGELOG.md", "usr/share/doc/reidm/CHANGELOG.md", "644"],
   ["../../README.md", "usr/share/doc/reidm/README.md", "644"],
 ]

@@ -80,9 +80,19 @@ async fn serve_conn(stream: TcpStream, mgr: Manager) -> Result<()> {
     Ok(())
 }
 
-pub async fn listen(addr: &str, mgr: Manager) -> Result<()> {
+/// Take the port, so the caller can tell whether it got it before committing to serving.
+pub async fn bind(addr: &str) -> Result<TcpListener> {
     let l = TcpListener::bind(addr).await?;
     tracing::info!("listening on ws://{addr}");
+    Ok(l)
+}
+
+pub async fn listen(addr: &str, mgr: Manager) -> Result<()> {
+    let l = bind(addr).await?;
+    serve(l, mgr).await
+}
+
+pub async fn serve(l: TcpListener, mgr: Manager) -> Result<()> {
     loop {
         let (s, peer) = l.accept().await?;
         let mgr = mgr.clone();

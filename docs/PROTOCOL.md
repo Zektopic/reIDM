@@ -5,13 +5,17 @@ Everything below was **observed** in (a) the official extension *IDM Integration
 then confirmed by running the real extension against reIDM (see "Verification").
 Anything marked *(inferred)* was derived from how the extension consumes a field, not from IDM's server code.
 
+Sections marked **vendor** describe the original IDM binaries and are recorded as evidence for why
+reIDM behaves the way it does. They are *not* a description of reIDM; the "reIDM" column or the
+surrounding text says what this project actually does.
+
 ## Transports
 
 | Path | How | Evidence |
 |---|---|---|
-| WebSocket | extension dials `ws://127.0.0.1:1001/?cid=<n>&rnd=<n>` with sub-protocol `plugin.v3.internetdownloadmanager.com`, then `ws://0.1.0.1:1001`; **binary** frames in both directions | `background.js` (`La`, `n.Ba`), `IDMNetMon` decomp (RFC 6455 handshake, `HTTP/1.1 101 ...`) |
-| Native messaging | `chrome.runtime.connectNative("com.tonec.idm")` → `IDMMsgHost.exe` (stdio) | `background.js`, host manifests in the installer (`allowed_origins` ngpampappnmepgilojfohadhhmbhlaek / llbjbkhnmlidjebalopleeepgdfgcpec, Firefox `mozilla_cc3@internetdownloadmanager.com`) |
-| Host → manager | named pipe `\\.\pipe\IDMNetworkMonitor.<n>`; host prefixes a `MSG#0#17#1#0:9:<pid>;` hello, unescapes JSON strings to UTF-8 and re-escapes replies (`FUN_00402420`, `FUN_00402550`, `FUN_00403530` in `decomp/IDMMsgHost.exe.c`) | decompilation |
+| WebSocket *(vendor, and reIDM)* | The extension dials `ws://127.0.0.1:1001/?cid=<n>&rnd=<n>` with sub-protocol `plugin.v3.internetdownloadmanager.com`, falling back to `ws://0.1.0.1:1001`; **binary** frames in both directions. reIDM serves the same sub-protocol but binds `127.0.0.1` only — the `0.1.0.1` fallback is *not* served, and the unprivileged port 61001 is used outside Windows (see `docs/EXTENSION.md`). | `background.js` (`La`, `n.Ba`), `IDMNetMon` decomp (RFC 6455 handshake, `HTTP/1.1 101 ...`), `crates/reidm/src/ws.rs` |
+| Native messaging *(vendor shape, reIDM reimplements the host)* | Chrome: `chrome.runtime.connectNative("com.tonec.idm")` → a host process on stdio. The vendor host is `IDMMsgHost.exe`; reIDM ships its own `reidm-host`, which is a plain WebSocket relay to the daemon and does **not** implement the vendor's named-pipe protocol. | `background.js`, host manifests in the installer (`allowed_origins` ngpampappnmepgilojfohadhhmbhlaek / llbjbkhnmlidjebalopleeepgdfgcpec, Firefox `mozilla_cc3@internetdownloadmanager.com`), `crates/reidm-host/src/main.rs` |
+| Host → manager *(vendor only)* | The vendor's host talks to the manager over the named pipe `\\.\pipe\IDMNetworkMonitor.<n>`, prefixing a `MSG#0#17#1#0:9:<pid>;` hello and JSON-escaping/unescaping payloads (`FUN_00402420`, `FUN_00402550`, `FUN_00403530` in `decomp/IDMMsgHost.exe.c`). **reIDM has no pipe code and never sends a type-17 frame**; this row is background on the original design. | decompilation |
 
 Native-messaging payloads are **JSON strings** (one frame per string) inside Chrome's `u32-LE length + JSON` envelope.
 
@@ -36,7 +40,7 @@ value := <int> | <utf8-byte-length>:<bytes>
 | 0 | ext→srv | keep-alive (every 15 s) | type‑1 reply |
 | 13, flags&128 | ext→srv | browser started saving a file; keys 6 url, 4 ext, 100 name, 103 size, 127 mime, 50 referrer, 51 cookie, 54 UA | queues it, replies `[id, 3]` ⇒ extension cancels the browser's own download |
 | 13, other | ext→srv | passive request sniffing | replies `[id, 0]` (not captured) |
-| 14 | ext→srv | explicit "Download with IDM" / link list (15 announces a batch) | queues it |
+| 14 | ext→srv | explicit "Download with IDM" / link list (15 announces a batch) | queues it and replies `[id, 3]` when the request was queued, `[id, 0]` when it was rejected — the extension uses this to decide whether to cancel the browser's own download, so reporting "taken" for a link we could not queue would drop it *(the reply value is reIDM's choice; the vendor's exact reply is not recovered)* |
 | 1 | both | reply `[request id, result]`; result 3 = taken over | — |
 | 1001–1003 | cli→daemon | **reIDM-only** pause/resume/remove | — |
 

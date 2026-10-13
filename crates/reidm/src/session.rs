@@ -108,14 +108,29 @@ impl Session {
             }
             T_KEEPALIVE => vec![Self::reply(m, &[])],
             T_DOWNLOAD => {
-                match Self::request_from(m) {
+                // The reply tells the extension whether we took the download. Answering "taken"
+                // when we could not queue anything would make the browser silently drop it.
+                let taken = match Self::request_from(m) {
                     Some(r) => match self.mgr.add(r) {
-                        Ok(id) => tracing::info!("queued download #{id}"),
-                        Err(e) => tracing::warn!("rejected download: {e:#}"),
+                        Ok(id) => {
+                            tracing::info!("queued download #{id}");
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!("rejected download: {e:#}");
+                            false
+                        }
                     },
-                    None => tracing::debug!("type 14 without URL"),
+                    None => {
+                        tracing::debug!("type 14 without URL");
+                        false
+                    }
+                };
+                if wants_reply {
+                    vec![Self::reply(m, &[if taken { R_TAKEN } else { R_IGNORE }])]
+                } else {
+                    vec![]
                 }
-                if wants_reply { vec![Self::reply(m, &[R_TAKEN])] } else { vec![] }
             }
             T_INTERCEPT if m.flags & 128 != 0 => {
                 // The browser is about to save a file itself; claim it if it is plain http(s).

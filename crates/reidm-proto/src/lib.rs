@@ -47,7 +47,8 @@ impl Value {
 pub struct Message {
     pub id: u32,
     pub ty: u32,
-    /// Third header field (the extension sends 5 for hello, 1/2 for requests/replies).
+    /// Third header field. Observed as 0 in the extension's hello and 1/2 on requests and replies;
+    /// its meaning is not otherwise established.
     pub class: u32,
     /// Fourth header field: bit flags. Bit 0 = "sender expects a reply (type 1)".
     pub flags: u32,
@@ -174,13 +175,18 @@ impl Message {
             let val: i64 = v.parse().map_err(|_| ParseError::Malformed("bad key value"))?;
             p += end + 1;
             if sep == b':' {
-                let n = val as usize;
-                if input.len() < p + n + 1 {
+                // A length is attacker-controlled: a negative or absurd value must be a clean
+                // parse error, never an overflowed slice index.
+                if val < 0 {
+                    return Err(ParseError::Malformed("negative string length"));
+                }
+                let end = p.checked_add(val as usize).ok_or(ParseError::Malformed("string length overflow"))?;
+                if input.len() <= end {
                     return Err(ParseError::Incomplete);
                 }
-                let s = String::from_utf8_lossy(&input[p..p + n]).into_owned();
+                let s = String::from_utf8_lossy(&input[p..end]).into_owned();
                 m.keys.insert(key, Value::Str(s));
-                p += n;
+                p = end;
                 term = input[p];
                 if term != b',' && term != b';' {
                     return Err(ParseError::Malformed("expected , or ; after string"));
@@ -242,5 +248,41 @@ mod tests {
     #[test]
     fn incomplete() {
         assert_eq!(Message::decode(b"MSG#1#2#0#5:1:2"), Err(ParseError::Incomplete));
+    }
+
+    /// Any local process can open the daemon's socket, so a hostile frame must be a clean error —
+    /// a negative length used to overflow the slice index and panic the connection task.
+    #[test]
+    fn hostile_lengths_are_rejected_not_panicked() {
+        for raw in [
+            &b"MSG#1#1#1#0,6=-5:x;"[..],
+            &b"MSG#1#1#1#0,6=-9223372036854775808:x;"[..],
+            &b"MSG#1#1#1#0,6=9223372036854775807:x;"[..],
+        ] {
+            assert!(Message::decode(raw).is_err(), "must reject {:?}", String::from_utf8_lossy(raw));
+        }
+        // A zero length is legitimate: it is the empty string.
+        let (m, _) = Message::decode(b"MSG#1#1#1#0,6=0:;").unwrap();
+        assert_eq!(m.str_key(6), Some(""));
+    }
+
+    /// A value may itself contain the separators, because it carries an explicit byte length.
+    #[test]
+    fn separators_inside_values() {
+        let raw = "MSG#1#1#1#0,6=8:a,b;c:d=;";
+        let (m, n) = Message::decode(raw.as_bytes()).unwrap();
+        assert_eq!(n, raw.len());
+        assert_eq!(m.str_key(6), Some("a,b;c:d="));
+    }
+
+    /// Lengths count bytes, not characters.
+    #[test]
+    fn non_ascii_value_roundtrip() {
+        let m = Message::new(1, 1, 1, 0).with_str(7, "héllo");
+        let enc = m.encode();
+        assert!(enc.contains(",7=6:héllo"), "byte length, not char count: {enc}");
+        let (d, n) = Message::decode(enc.as_bytes()).unwrap();
+        assert_eq!(n, enc.len());
+        assert_eq!(d.str_key(7), Some("héllo"));
     }
 }

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=reIDM
+GenericName=Download Manager
+Comment=Segmented, resumable downloads, with IDM browser-extension support
+Exec=reidm-gui
+Icon=reidm
+Terminal=false
+Categories=Network;FileTransfer;GTK;
+StartupNotify=true
+StartupWMClass=reIDM
+Keywords=download;manager;resume;idm;

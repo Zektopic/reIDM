@@ -1,0 +1,33 @@
+[package]
+name = "reidm-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "reIDM desktop application"
+
+[[bin]]
+name = "reidm-gui"
+path = "src/main.rs"
+
+[dependencies]
+reidm-core = { path = "../reidm-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+directories.workspace = true
+
+egui = "0.36"
+egui_extras = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Window icon only; the packaged formats carry their own copies.
+png = "0.18"
+# Native folder/file pickers. On Linux the portal backend avoids a GTK3 build dependency.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+
+[build-dependencies]
+# Only used on Windows; the build script no-ops elsewhere.
+winresource = "0.1"
+
+[features]
+default = []

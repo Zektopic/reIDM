@@ -39,8 +39,17 @@ pub fn open_url(url: &str) {
 pub fn open_path(p: &Path, reveal: bool) {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("explorer");
-        if reveal { c.arg(format!("/select,{}", p.display())); } else { c.arg(p); }
+        if reveal {
+            // explorer.exe does not use the normal C runtime quoting rules: it wants
+            // `/select,C:\path with spaces\file` as one *unquoted* argument. Rust would quote any
+            // argument containing a space, which makes explorer open the default folder instead,
+            // so pass the raw text.
+            c.raw_arg(format!("/select,{}", p.display()));
+        } else {
+            c.arg(p);
+        }
         let _ = c.spawn();
     }
     #[cfg(target_os = "macos")]

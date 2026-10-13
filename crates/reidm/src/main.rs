@@ -111,18 +111,41 @@ async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Daemon { connections, dir, no_idm_port } => {
             let mgr = Manager::open(&default_data_dir(), dir.unwrap_or_else(default_download_dir), connections)?;
+            let idm_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             if !no_idm_port {
                 let m = mgr.clone();
+                let bound = idm_port.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = ws::listen(&format!("127.0.0.1:{}", ws::IDM_PORT), m).await {
-                        tracing::info!("not serving IDM port {}: {e} (use the native host or reidm patch-extension)", ws::IDM_PORT);
+                    match ws::bind(&format!("127.0.0.1:{}", ws::IDM_PORT)).await {
+                        Ok(l) => {
+                            bound.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if let Err(e) = ws::serve(l, m).await {
+                                tracing::error!("extension port {} stopped: {e:#}", ws::IDM_PORT);
+                            }
+                        }
+                        Err(e) => {
+                            // On Unix 1001 is privileged, so the usual cause there is the port
+                            // number itself rather than a competing download manager.
+                            let hint = if e.to_string().contains("os error 13") {
+                                "ports below 1024 need privileges on this system"
+                            } else {
+                                "another download manager may be using it"
+                            };
+                            tracing::warn!(
+                                "not serving the extension's default port {}: {e} ({hint}). \
+                                 The native-messaging host and `reidm patch-extension` still work — \
+                                 see docs/EXTENSION.md.",
+                                ws::IDM_PORT
+                            );
+                        }
                     }
                 });
             }
             {
                 let m = mgr.clone();
+                let bound = idm_port.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = web::serve(m).await {
+                    if let Err(e) = web::serve(m, bound).await {
                         tracing::error!("web UI unavailable: {e} (is another reidm running?)");
                     }
                 });
@@ -220,6 +243,22 @@ fn patch_extension(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     }
     if !src.join("manifest.json").exists() {
         bail!("{} is not an unpacked extension (no manifest.json)", src.display());
+    }
+    // `std::fs::copy` truncates its destination before writing, so `reidm patch-extension X X`
+    // would erase every file as it went. Refuse rather than destroy the user's copy.
+    fn absolute(p: &std::path::Path) -> std::path::PathBuf {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir().map(|c| c.join(p)).unwrap_or_else(|_| p.to_path_buf())
+        }
+    }
+    let (a, b) = (absolute(src), absolute(dst));
+    if a == b {
+        bail!("source and destination are the same directory ({}); nothing was changed", a.display());
+    }
+    if b.starts_with(&a) {
+        bail!("destination {} is inside the source directory {}", b.display(), a.display());
     }
     copy_dir(src, dst)?;
     // Drop Chrome's integrity file: it would flag the modified script as corrupt.
