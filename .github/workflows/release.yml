@@ -53,7 +53,38 @@ jobs:
         with: { targets: "x86_64-apple-darwin,aarch64-apple-darwin" }
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
-      - run: |
+      # Optional: Developer ID signing. Both steps no-op when the secrets are absent, so the
+      # build still succeeds ad-hoc signed — see docs/PACKAGING.md.
+      - name: Import the signing certificate
+        if: ${{ secrets.MACOS_CERT_P12 != '' }}
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN=build.keychain
+          security create-keychain -p actions "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p actions "$KEYCHAIN"
+          echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+          security import cert.p12 -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions "$KEYCHAIN"
+          rm -f cert.p12
+          security find-identity -v -p codesigning "$KEYCHAIN"
+      - name: Store the notarization credentials
+        if: ${{ secrets.MACOS_APPLE_ID != '' }}
+        env:
+          MACOS_APPLE_ID: ${{ secrets.MACOS_APPLE_ID }}
+          MACOS_APPLE_PASSWORD: ${{ secrets.MACOS_APPLE_PASSWORD }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          xcrun notarytool store-credentials reidm-notary \
+            --apple-id "$MACOS_APPLE_ID" --password "$MACOS_APPLE_PASSWORD" --team-id "$MACOS_TEAM_ID"
+      - name: Build the DMG
+        env:
+          MACOS_SIGN_IDENTITY: "${{ secrets.MACOS_SIGN_IDENTITY }}"
+          # Only notarize when both a certificate and notary credentials were provided.
+          MACOS_NOTARY_PROFILE: "${{ secrets.MACOS_CERT_P12 != '' && secrets.MACOS_APPLE_ID != '' && 'reidm-notary' || '' }}"
+        run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do cargo build --release --locked --target $t; done
           mkdir -p dist universal
           for b in reidm reidm-host reidm-gui; do

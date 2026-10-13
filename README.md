@@ -5,8 +5,9 @@ so the *official* "IDM Integration Module" extension can hand downloads to it.
 
 * Segmented parallel downloads (default 8 connections), resume after restart/crash, retry with back-off
 * Browser-download capture via the IDM extension (WebSocket `:1001`/`:61001` or native messaging host `com.tonec.idm`)
-* A native desktop window (toolbar, category tree, sortable download table, status bar) — no browser needed
-* CLI: `reidm get|add|list|pause|resume|rm|daemon|ui|install-host|patch-extension`
+* A native desktop window (menu bar, icon toolbar, category tree, sortable download table, status bar) — no browser needed
+* Update checking against GitHub Releases (`reidm update-check`, or Help → Check for updates)
+* CLI: `reidm get|add|list|pause|resume|rm|daemon|ui|update-check|install-host|patch-extension`
 * No telemetry, no licensing logic — see `NOTICE.md`
 
 ## The window
@@ -58,7 +59,7 @@ reidm list
 | `crates/reidm` | daemon + CLI |
 | `crates/reidm-host` | native-messaging host (`com.tonec.idm`) |
 | `decomp/` | Ghidra output of the analysed vendor binaries (**private repo only**, see `NOTICE.md`) |
-| `docs/` | protocol, extension and reverse-engineering notes |
-| `tools/` | unpacker, bulk-decompile script, manifest generator |
+| `docs/` | protocol, extension, packaging and reverse-engineering notes |
+| `tools/` | installer unpacker, bulk-decompile script, icon generator, extension hand-off test |
 
 reIDM is not affiliated with Tonec. Use it only for content you are entitled to download.

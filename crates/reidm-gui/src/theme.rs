@@ -99,7 +99,9 @@ fn visuals(p: &Palette, dark: bool) -> Visuals {
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.active.bg_fill = p.accent.gamma_multiply(0.30);
     v.widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, p.accent_text);
+    // Not `accent_text`: egui resolves `RichText::strong()` to `widgets.active.fg_stroke`, so a
+    // white value here silently paints every strong label white-on-white.
+    v.widgets.active.fg_stroke = Stroke::new(1.0, p.text);
     v.window_corner_radius = CornerRadius::same(6);
     v
 }

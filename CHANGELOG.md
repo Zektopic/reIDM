@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.1
+
+### Added
+
+* **Update checking.** The window, the Options dialog and `reidm update-check` now compare the
+  running version against the repository's latest GitHub release. It reports and links; it never
+  downloads or runs anything by itself. The repository is private, so a check needs a token —
+  set `REIDM_GH_TOKEN` (or `GH_TOKEN`/`GITHUB_TOKEN`), or make the repository public and it works
+  unauthenticated.
+* A **redesigned window** closer to IDM's own: a menu bar (Tasks/File/Downloads/View/Help), an
+  icon-over-label toolbar with Resume, Stop, Stop All, Delete, Delete Completed, Options and
+  Scheduler, a category tree with expanders and per-type icons, and columns for Time Left,
+  Transfer Rate and Last Try alongside the existing ones, plus a row-selection checkbox column.
+  Clicking a column header sorts.
+* The **queue, grabber and quota nodes** are shown greyed with a tooltip saying they are not
+  implemented, rather than omitted, so the window does not look like it quietly lost features.
+* A new **application icon** with a gradient, an optical-size-aware glyph, and a multi-size
+  `.ico` (16/24/32/48/64/128/256) instead of one large bitmap, so Explorer and the taskbar each
+  get a crisp one. `tools/make_icon.py` still has no third-party dependencies.
+* `docs/PACKAGING.md`, covering how each artifact is built and what signing needs.
+
+### Fixed
+
+* **The macOS build could not run on Apple silicon.** `lipo` does not carry code signatures into
+  the universal binary it produces, and macOS refuses to execute an unsigned arm64 binary — the
+  symptom is a bare `Killed: 9` with no dialog. Each binary is now re-signed after `lipo`, and
+  the bundle is signed too.
+* Every `.strong()` label in the window rendered **white on white**, because egui resolves strong
+  text to `widgets.active.fg_stroke` and the theme used that slot for the primary button's white
+  caption. The column headers were invisible as a result.
+* Tree expanders pointed the wrong way: expanded nodes showed a collapsed chevron.
+* The sort indicator was drawn with `▲`/`▼`, which the bundled font has no glyph for and rendered
+  as a missing-character box; it is painted now.
+
 ## 0.2.0
 
 The first release with a real desktop application, and a correctness pass over the download engine.

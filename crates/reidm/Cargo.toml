@@ -50,5 +50,6 @@ assets = [
   ["../../packaging/linux/com.tonec.idm.firefox.json", "usr/lib/mozilla/native-messaging-hosts/com.tonec.idm.json", "644"],
   ["../../docs/EXTENSION.md", "usr/share/doc/reidm/EXTENSION.md", "644"],
   ["../../CHANGELOG.md", "usr/share/doc/reidm/CHANGELOG.md", "644"],
+  ["../../docs/PACKAGING.md", "usr/share/doc/reidm/PACKAGING.md", "644"],
   ["../../README.md", "usr/share/doc/reidm/README.md", "644"],
 ]

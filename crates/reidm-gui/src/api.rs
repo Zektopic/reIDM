@@ -284,6 +284,33 @@ impl Api {
         }
     }
 
+    /// Open a URL in the user's browser (used for release notes and update downloads).
+    pub fn open_url(&self, url: &str) {
+        #[cfg(windows)]
+        let mut c = {
+            let mut c = std::process::Command::new("rundll32");
+            c.args(["url.dll,FileProtocolHandler", url]);
+            c
+        };
+        #[cfg(target_os = "macos")]
+        let mut c = {
+            let mut c = std::process::Command::new("open");
+            c.arg(url);
+            c
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut c = {
+            let mut c = std::process::Command::new("xdg-open");
+            c.arg(url);
+            c
+        };
+        let _ = c
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
     /// Pause every active download.
     pub fn stop_all(&self) {
         for it in self.snapshot().items.iter().filter(|i| i.status.is_active()) {

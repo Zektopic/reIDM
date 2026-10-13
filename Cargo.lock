@@ -1142,6 +1142,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f9e3d69d39e4862ffed03ed071a76f9a13ba1d9109d355b0f0aa6b15e393c4"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -2856,7 +2857,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reidm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2876,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "reidm-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -2892,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "reidm-gui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -2910,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "reidm-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2922,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "reidm-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde_json",
 ]
@@ -2943,6 +2944,7 @@ dependencies = [
  "bytes",
  "cookie",
  "cookie_store",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/reidm-proto", "crates/reidm-core", "crates/reidm", "crates/reidm-host", "crates/reidm-gui"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Zektopic/reIDM"
@@ -15,7 +15,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "io-std", "net", "sync", "time", "signal"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip", "brotli", "cookies", "blocking", "json"] }
 clap = { version = "4", features = ["derive"] }
 directories = "5"
 tracing = "0.1"

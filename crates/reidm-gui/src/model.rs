@@ -50,6 +50,10 @@ pub struct Item {
     #[serde(default)]
     pub downloaded: u64,
     pub status: Status,
+    #[serde(default)]
+    pub added: u64,
+    #[serde(default)]
+    pub last_try: Option<u64>,
 }
 
 impl Item {
@@ -166,6 +170,31 @@ pub fn rate_human(bps: f64) -> String {
         return String::new();
     }
     format!("{}/s", size_human(bps as u64))
+}
+
+/// How long ago a unix timestamp was, for the "Last Try" column.
+///
+/// Relative rather than a clock time: the standard library exposes no local timezone, and
+/// "3 min ago" reads the same in every zone.
+pub fn since_human(ts: u64, now: u64) -> String {
+    if ts == 0 || ts > now {
+        return String::new();
+    }
+    match now - ts {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{} min ago", s / 60),
+        s if s < 86_400 => format!("{} h ago", s / 3600),
+        s if s < 86_400 * 7 => format!("{} d ago", s / 86_400),
+        s => format!("{} w ago", s / (86_400 * 7)),
+    }
+}
+
+/// Seconds since the unix epoch.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// `00:01:12`, or empty when unknown. IDM counts down the remaining time.

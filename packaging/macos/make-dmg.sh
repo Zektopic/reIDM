@@ -1,9 +1,27 @@
 #!/usr/bin/env bash
 # Build reIDM-<version>.dmg from universal binaries.
 # Usage: make-dmg.sh <version> <reidm> <reidm-host> <reidm-gui> <out.dmg>
+#
+# Signing: set MACOS_SIGN_IDENTITY to a "Developer ID Application: …" identity to sign for
+# distribution, and MACOS_NOTARY_PROFILE to a notarytool keychain profile to notarize. With
+# neither set, everything is ad-hoc signed, which is still *required*: `lipo` does not carry
+# code signatures over, and the kernel refuses to execute an unsigned arm64 binary — the
+# symptom is a bare "Killed: 9" with no dialog on Apple silicon.
 set -euo pipefail
 VER=$1; REIDM=$2; HOST=$3; GUI=$4; OUT=$5
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+SIGN_ID="${MACOS_SIGN_IDENTITY:--}"
+NOTARY_PROFILE="${MACOS_NOTARY_PROFILE:-}"
+
+sign() {  # sign <path> [--deep]
+  local path=$1; shift
+  if [ "$SIGN_ID" = "-" ]; then
+    codesign --force --sign - "$@" "$path"
+  else
+    codesign --force --options runtime --timestamp "$@" --sign "$SIGN_ID" "$path"
+  fi
+}
 STAGE=$(mktemp -d)/reIDM
 APP="$STAGE/reIDM.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$STAGE/bin"
@@ -14,6 +32,13 @@ chmod 755 "$STAGE/bin/reidm" "$STAGE/bin/reidm-host" "$APP/Contents/MacOS/reidm-
 
 # The daemon lives next to the app binary so `reidm-gui` can spawn it.
 cp "$STAGE/bin/reidm" "$APP/Contents/MacOS/reidm"
+
+# Re-sign what lipo produced; see the note at the top of this script.
+for b in "$STAGE/bin/reidm" "$STAGE/bin/reidm-host" "$APP/Contents/MacOS/reidm" "$APP/Contents/MacOS/reidm-gui"; do
+  sign "$b"
+done
+echo "code signatures:"
+codesign -dv "$APP/Contents/MacOS/reidm-gui" 2>&1 | grep -E "^Identifier|^Signature|^TeamIdentifier" || true
 
 # Icon: assemble an .icns from the PNGs we ship.
 ICONSET=$(mktemp -d)/reidm.iconset
@@ -41,7 +66,7 @@ cat > "$APP/Contents/Info.plist" <<EOP
 </dict></plist>
 EOP
 
-cp "$ROOT/README.md" "$STAGE/README.md"; cp "$ROOT/docs/EXTENSION.md" "$STAGE/EXTENSION.md"; cp "$ROOT/CHANGELOG.md" "$STAGE/CHANGELOG.md"
+cp "$ROOT/README.md" "$STAGE/README.md"; cp "$ROOT/docs/EXTENSION.md" "$STAGE/EXTENSION.md"; cp "$ROOT/CHANGELOG.md" "$STAGE/CHANGELOG.md"; cp "$ROOT/docs/PACKAGING.md" "$STAGE/PACKAGING.md"
 
 cat > "$STAGE/Install reIDM.command" <<'EOS'
 #!/usr/bin/env bash
@@ -74,7 +99,24 @@ echo "  * Add \$HOME/.local/bin to PATH to use the 'reidm' command."
 EOS
 chmod 755 "$STAGE/Install reIDM.command"
 
+# Sign the bundle itself, last, once its contents are final.
+sign "$APP"
+codesign --verify --verbose=2 "$APP" 2>&1 | tail -2
+
 # Launch the installer when the image is opened.
 ln -s /Applications "$STAGE/Applications" 2>/dev/null || true
 
 hdiutil create -volname "reIDM $VER" -srcfolder "$STAGE" -ov -format UDZO "$OUT"
+
+if [ -n "$NOTARY_PROFILE" ]; then
+  echo "notarizing (this can take a few minutes)…"
+  xcrun notarytool submit "$OUT" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$OUT"
+  xcrun stapler validate "$OUT"
+  echo "notarized and stapled"
+else
+  echo
+  echo "NOTE: this build is ad-hoc signed, not notarized."
+  echo "  It runs locally, but macOS will warn on other machines until it is signed with a"
+  echo "  Developer ID certificate and notarized. See docs/PACKAGING.md."
+fi

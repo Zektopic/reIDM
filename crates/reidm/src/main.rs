@@ -58,6 +58,8 @@ enum Cmd {
     Rm { id: u64, #[arg(long)] purge: bool },
     /// Open the web UI in your browser (starts the daemon if needed).
     Ui,
+    /// Check GitHub for a newer release.
+    UpdateCheck,
     /// Register the native-messaging host (com.tonec.idm) with installed browsers.
     InstallHost,
     UninstallHost,
@@ -216,6 +218,27 @@ async fn main() -> Result<()> {
                 }
             }
             launch::open_url(&format!("http://127.0.0.1:{}/", web::UI_PORT));
+        }
+        Cmd::UpdateCheck => {
+            let current = env!("CARGO_PKG_VERSION");
+            let token = reidm_core::update::token_from_env();
+            match reidm_core::update::check(reidm_core::update::REPO, current, token.as_deref()) {
+                Ok(Some(rel)) => {
+                    println!("reIDM {} is available (you have {current}).", rel.version());
+                    println!("{}", rel.html_url);
+                    if let Some(a) = rel.asset_for(std::env::consts::OS) {
+                        println!("your build: {} ({})", a.name, a.browser_download_url);
+                    }
+                    if !rel.body.trim().is_empty() {
+                        println!("\n{}", rel.body.trim());
+                    }
+                }
+                Ok(None) => println!("reIDM {current} is up to date."),
+                Err(e) => {
+                    eprintln!("could not check for updates: {e:#}");
+                    std::process::exit(1);
+                }
+            }
         }
         Cmd::InstallHost => install::install()?,
         Cmd::UninstallHost => install::uninstall()?,

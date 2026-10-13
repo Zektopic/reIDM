@@ -1,5 +1,7 @@
 //! Segmented, resumable download engine used by the reIDM daemon and CLI.
 
+pub mod update;
+
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use reqwest::header::{self, HeaderMap, HeaderValue};
@@ -65,6 +67,19 @@ pub struct Item {
     pub status: Status,
     segments: Vec<Segment>,
     resumable: bool,
+    /// When the download was queued, as unix seconds.
+    #[serde(default)]
+    pub added: u64,
+    /// When a transfer last ran, as unix seconds. Shown as IDM's "Last Try" column.
+    #[serde(default)]
+    pub last_try: Option<u64>,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 struct Live {
@@ -342,7 +357,18 @@ impl Manager {
             let path = unique_path(&dir, &hint, |p| claimed.contains(p));
             db.items.insert(
                 id,
-                Item { id, request: req, path, size: None, downloaded: 0, status: Status::Queued, segments: vec![], resumable: false },
+                Item {
+                    id,
+                    request: req,
+                    path,
+                    size: None,
+                    downloaded: 0,
+                    status: Status::Queued,
+                    segments: vec![],
+                    resumable: false,
+                    added: now_secs(),
+                    last_try: None,
+                },
             );
             id
         };
@@ -418,7 +444,11 @@ impl Manager {
     }
 
     fn set_status(&self, id: u64, st: Status) {
-        if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
+        let mut db = self.0.db.lock().unwrap();
+        if let Some(it) = db.items.get_mut(&id) {
+            if st == Status::Running {
+                it.last_try = Some(now_secs());
+            }
             it.status = st;
         }
     }

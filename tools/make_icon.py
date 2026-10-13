@@ -1,98 +1,142 @@
 #!/usr/bin/env python3
-"""Generate reIDM's application icon as PNG and ICO.
+"""Generate reIDM's application icon as PNG and a multi-size ICO.
 
-No third-party modules: the PNG is assembled by hand with zlib, and the ICO is a thin container
-around that PNG. Run from the repository root:
+No third-party modules: shapes are drawn from signed-distance fields, the PNG is
+assembled by hand with zlib, and the ICO is a container around those PNGs. Run
+from the repository root:
 
     python3 -I tools/make_icon.py
 
-Writes packaging/icon/reidm-512.png, reidm-256.png and reidm.ico.
+Writes into packaging/icon/: reidm-1024.png, reidm-512.png, reidm-256.png,
+reidm-128.png, reidm-64.png, reidm-48.png, reidm-32.png, reidm-16.png and
+reidm.ico (every size, so Explorer, the taskbar and the installer each pick a
+crisp one instead of rescaling a single large bitmap).
 """
+import math
 import os
 import struct
 import zlib
 
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packaging", "icon")
 
-# Accent colours, matching the desktop app.
-TOP = (0x2A, 0x84, 0xE0)
-BOTTOM = (0x08, 0x4A, 0xA8)
+# Palette: a deep, saturated blue that stays legible on both light and dark shells.
+TOP = (0x3D, 0x9B, 0xFF)
+BOTTOM = (0x0A, 0x46, 0xA0)
 WHITE = (0xFF, 0xFF, 0xFF)
-SS = 3  # supersampling factor per axis
+
+# Supersampling per axis. 4 gives clean curves without a drawing library.
+SS = 4
+ICO_SIZES = [16, 24, 32, 48, 64, 128, 256]
+PNG_SIZES = [1024, 512, 256, 128, 64, 48, 32, 24, 16]
 
 
-def rounded_rect_coverage(x, y, w, h, r):
-    """Coverage of a rounded rectangle whose edge is at distance `d`; 1 inside, 0 outside."""
-    # Signed distance to a rounded rect centred in the canvas.
-    cx, cy = w / 2.0, h / 2.0
-    dx = abs(x - cx) - (w / 2.0 - r)
-    dy = abs(y - cy) - (h / 2.0 - r)
-    outside = ((max(dx, 0.0)) ** 2 + (max(dy, 0.0)) ** 2) ** 0.5
+def _len(x, y):
+    return math.hypot(x, y)
+
+
+def sd_rounded_box(px, py, cx, cy, hw, hh, r):
+    """Signed distance to an axis-aligned rounded box (negative inside)."""
+    dx = abs(px - cx) - (hw - r)
+    dy = abs(py - cy) - (hh - r)
+    outside = _len(max(dx, 0.0), max(dy, 0.0))
     inside = min(max(dx, dy), 0.0)
-    return inside + outside - r
+    return outside + inside - r
 
 
-def arrow_coverage(x, y, w, h):
-    """The download glyph: a shaft, a triangular head, and a tray line."""
-    u = w / 512.0  # scale so the design is resolution independent
-    cx = w / 2.0
+def _dist_to_segment(px, py, a, b):
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    wx, wy = px - ax, py - ay
+    t = max(0.0, min(1.0, (wx * vx + wy * vy) / (vx * vx + vy * vy)))
+    return _len(wx - vx * t, wy - vy * t)
 
-    shaft_half = 30.0 * u
-    shaft_top = 130.0 * u
-    head_top = 250.0 * u
-    tip_y = 370.0 * u
-    head_half = 105.0 * u
 
-    def sdf_rect(px, py, x0, y0, x1, y1):
-        dx = max(x0 - px, px - x1)
-        dy = max(y0 - py, py - y1)
-        return ((max(dx, 0.0)) ** 2 + (max(dy, 0.0)) ** 2) ** 0.5 + min(max(dx, dy), 0.0)
+def sd_triangle(px, py, a, b, c):
+    """Signed distance to a triangle (negative inside).
 
-    d = sdf_rect(x, y, cx - shaft_half, shaft_top, cx + shaft_half, head_top)
+    The side is decided by a winding-independent inside test: a point is inside when
+    the three edge cross products all share a sign. An earlier attempt used the
+    orientation trick from the usual analytic form and got the winding backwards,
+    which filled the whole canvas with the glyph.
+    """
+    d = min(
+        _dist_to_segment(px, py, a, b),
+        _dist_to_segment(px, py, b, c),
+        _dist_to_segment(px, py, c, a),
+    )
 
-    # Triangle: signed distance to the two slanted edges plus the top edge.
-    if head_top <= y <= tip_y:
-        t = (y - head_top) / (tip_y - head_top)
-        half = head_half * (1.0 - t)
-        d = min(d, abs(x - cx) - half)
-    else:
-        d = min(d, 1e9)
+    def cross(o, p, q):
+        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
 
-    tray_y0 = 400.0 * u
-    tray_y1 = 432.0 * u
-    tray_half = 130.0 * u
-    d = min(d, sdf_rect(x, y, cx - tray_half, tray_y0, cx + tray_half, tray_y1))
+    p = (px, py)
+    d1 = cross(a, b, p)
+    d2 = cross(b, c, p)
+    d3 = cross(c, a, p)
+    inside = not ((d1 < 0 or d2 < 0 or d3 < 0) and (d1 > 0 or d2 > 0 or d3 > 0))
+    return -d if inside else d
+
+
+def glyph(px, py, s):
+    """The download mark: a bold arrow dropping onto a tray, in a square of side `s`."""
+    u = s / 512.0
+    cx = s / 2.0
+    r_head = 26.0 * u
+    r_tray = 26.0 * u
+    r_shaft = 34.0 * u
+
+    # Shaft, overlapping the head so the two read as one solid arrow.
+    d = sd_rounded_box(px, py, cx, 226.0 * u, r_shaft, 118.0 * u, 30.0 * u)
+
+    # Head: a wide triangle with rounded corners.
+    head = sd_triangle(
+        px, py,
+        (cx - 122.0 * u, 268.0 * u),
+        (cx + 122.0 * u, 268.0 * u),
+        (cx, 398.0 * u),
+    ) - r_head
+    d = min(d, head)
+
+    # Tray. The gap to the arrow tip is kept generous: at 16px a tighter one would
+    # merge into a single blob.
+    tray = sd_rounded_box(px, py, cx, 454.0 * u, 132.0 * u, 24.0 * u, r_tray)
+    d = min(d, tray)
     return d
 
 
 def render(size):
-    """Return RGBA rows for one square icon of the given size."""
+    """RGBA rows for one square icon."""
     rows = []
-    r = size * 0.22
+    r = size * 0.235
+    n = SS * SS
     for py in range(size):
         row = bytearray()
         for px in range(size):
-            # Supersample for smooth edges without a font or drawing library.
             bg_cov = 0.0
             fg_cov = 0.0
             for sy in range(SS):
                 for sx in range(SS):
                     x = px + (sx + 0.5) / SS
                     y = py + (sy + 0.5) / SS
-                    if rounded_rect_coverage(x, y, size, size, r) <= 0.0:
+                    if sd_rounded_box(x, y, size / 2.0, size / 2.0, size / 2.0, size / 2.0, r) <= 0.0:
                         bg_cov += 1.0
-                        if arrow_coverage(x, y, size, size) <= 0.0:
+                        if glyph(x, y, size) <= 0.0:
                             fg_cov += 1.0
-            n = SS * SS
             bg_cov /= n
             fg_cov /= n
             if bg_cov <= 0.0:
                 row += b"\x00\x00\x00\x00"
                 continue
+
+            # Base: vertical gradient, with a soft highlight across the top third so the
+            # shape reads as a physical key rather than a flat rectangle.
             t = py / max(size - 1, 1)
-            base = tuple(round(TOP[i] + (BOTTOM[i] - TOP[i]) * t) for i in range(3))
-            k = fg_cov / bg_cov if bg_cov > 0 else 0.0
-            rgb = tuple(round(base[i] + (WHITE[i] - base[i]) * k) for i in range(3))
+            base = [TOP[i] + (BOTTOM[i] - TOP[i]) * t for i in range(3)]
+            gleam = 0.22 * max(0.0, 1.0 - abs(t - 0.16) / 0.28)
+            base = [c + (255 - c) * gleam for c in base]
+
+            k = fg_cov / bg_cov
+            rgb = [round(base[i] + (WHITE[i] - base[i]) * k) for i in range(3)]
             row += bytes(rgb) + bytes([round(bg_cov * 255)])
         rows.append(bytes(row))
     return rows
@@ -102,8 +146,7 @@ def write_png(path, size, rows):
     raw = b"".join(b"\x00" + r for r in rows)
 
     def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
     png = b"\x89PNG\r\n\x1a\n"
     png += chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
@@ -114,22 +157,31 @@ def write_png(path, size, rows):
     return png
 
 
-def write_ico(path, png_bytes, size):
-    """An ICO may carry a PNG payload directly for entries of 256px and up."""
-    header = struct.pack("<HHH", 0, 1, 1)
-    entry = struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png_bytes), 22)
+def write_ico(path, entries):
+    """entries: [(size, png_bytes)]. ICO carries PNG payloads, which every modern Windows reads."""
+    count = len(entries)
+    header = struct.pack("<HHH", 0, 1, count)
+    offset = 6 + 16 * count
+    dir_entries = b""
+    blobs = b""
+    for size, png in entries:
+        dim = 0 if size >= 256 else size
+        dir_entries += struct.pack("<BBBBHHII", dim, dim, 0, 0, 1, 32, len(png), offset)
+        offset += len(png)
+        blobs += png
     with open(path, "wb") as f:
-        f.write(header + entry + png_bytes)
+        f.write(header + dir_entries + blobs)
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    png512 = write_png(os.path.join(OUT, "reidm-512.png"), 512, render(512))
-    print("wrote", os.path.join(OUT, "reidm-512.png"))
-    write_png(os.path.join(OUT, "reidm-256.png"), 256, render(256))
-    print("wrote", os.path.join(OUT, "reidm-256.png"))
-    write_ico(os.path.join(OUT, "reidm.ico"), png512, 512)
-    print("wrote", os.path.join(OUT, "reidm.ico"))
+    pngs = {}
+    for s in PNG_SIZES:
+        data = write_png(os.path.join(OUT, f"reidm-{s}.png"), s, render(s))
+        pngs[s] = data
+        print(f"wrote {os.path.join(OUT, f'reidm-{s}.png')}")
+    write_ico(os.path.join(OUT, "reidm.ico"), [(s, pngs[s]) for s in ICO_SIZES])
+    print(f"wrote {os.path.join(OUT, 'reidm.ico')} (sizes: {', '.join(map(str, ICO_SIZES))})")
 
 
 if __name__ == "__main__":
