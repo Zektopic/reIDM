@@ -49,11 +49,31 @@ POST-body replay (key 14/19), the IDM GUI.
 
 ## Verification
 
-1. `cargo test` – codec round-trips including a hello frame shaped exactly like the extension's.
-2. Real extension (6.43.1, locally patched – see `EXTENSION.md`) loaded in Thorium/Chromium under Xvfb:
-   daemon log shows `extension hello (args=[113, 93, 1031, 0, 16845059, 0, 15, 3])`.
-3. Navigating that browser to a `.zip` URL: the extension paused the browser download, sent type 13/129, reIDM
-   downloaded the file (SHA-256 identical to the server's copy) and the browser saved nothing to `~/Downloads`.
-4. A page-origin WebSocket (`Origin: https://evil.example`) receives `403`; extension origins and origin-less local clients get `101`.
+Reproducible from the tree:
 
-Not verified: Windows, macOS, Firefox, Edge, and the native-messaging path with the real extension (only a hand-built frame through `reidm-host`).
+1. `cargo test --workspace` — the codec, including a hello frame shaped exactly like the extension's,
+   hostile-length rejection, and byte-length (not character-length) string values.
+2. `cargo test -p reidm-core` — the engine against a real in-process HTTP server: segmented and
+   resumed downloads are byte-identical, resume from a server that ignores `Range` is not corrupt,
+   a lost part file restarts rather than leaving a hole, zero-byte files download, purge deletes the
+   file, and concurrent `list`/`resume` does not deadlock.
+3. `tools/extension-flow-test.py` — drives a live daemon over its WebSocket with the frames the
+   extension actually sends: hello → ack + settings, then a type-13 capture frame → a `[id, 3]`
+   "taken" reply, then the file must arrive byte-for-byte. Run against a daemon on Linux and on
+   Windows; both pass with `manager_version` = `6<<24|43<<16|15<<8` = `103485184` (0x062B0F00).
+
+Observed once, by hand, and not re-run by the test suite:
+
+4. The real extension (6.43.1, locally patched per `EXTENSION.md`) loaded in Chromium under Xvfb:
+   navigating to a `.zip` URL made the extension hand the download over, the browser saved nothing to
+   `~/Downloads`, and the file reIDM produced was SHA-256-identical to the server's copy.
+
+Checked directly, both platforms:
+
+5. A page-origin WebSocket (`Origin: https://evil.example`) receives `403`; `chrome-extension://`,
+   `moz-extension://` and origin-less local clients are accepted. On Windows the daemon binds the
+   extension's default port 1001 when it is free, and logs a clear warning when another program
+   (such as an installed IDM) holds it.
+
+Not verified: macOS, Firefox, Edge with the real extension, and the native-messaging path with a real
+browser (only `reidm-host` relaying a hand-built frame).
