@@ -22,10 +22,14 @@ fn window_icon() -> Option<egui::IconData> {
     // egui wants straight RGBA8.
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
-        png::ColorType::Rgb => buf[..info.buffer_size()]
-            .chunks_exact(3)
-            .flat_map(|c| [c[0], c[1], c[2], 255])
-            .collect(),
+        png::ColorType::Rgb => {
+            let n = info.buffer_size() / 3;
+            let mut out = Vec::with_capacity(n * 4);
+            for i in 0..n {
+                out.extend_from_slice(&[buf[i * 3], buf[i * 3 + 1], buf[i * 3 + 2], 255]);
+            }
+            out
+        }
         _ => return None,
     };
     Some(egui::IconData { rgba, width: info.width, height: info.height })
