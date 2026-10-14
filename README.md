@@ -1,71 +1,133 @@
-# reIDM
+<p align="center">
+  <img src="packaging/icon/reidm-128.png" width="112" height="112" alt="reIDM logo">
+</p>
 
-A cross-platform (Windows · macOS · Linux) download manager written in Rust that speaks the **IDM browser-integration protocol**,
-so the *official* "IDM Integration Module" extension can hand downloads to it.
+<h1 align="center">reIDM</h1>
 
-* Segmented parallel downloads (default 8 connections), resume after restart/crash, retry with back-off
-* Browser-download capture via the IDM extension (WebSocket `:1001`/`:61001` or native messaging host `com.tonec.idm`)
-* A native desktop window (menu bar, icon toolbar, category tree, sortable download table, status bar) — no browser needed
-* **Batch downloads**: paste a list, import a text file, or scan a page and pick
-* **Site grabber**: find every file a page links to, filter by type/host/pattern, follow links to a chosen depth
-* **Re-adding a link resumes it** rather than starting a second copy
-* A queue, so adding a hundred links does not open a hundred connections
-* **Our own browser extension** (`extension/`) — takes over downloads, finds media, needs nothing from Tonec
-* Update checking against GitHub Releases (`reidm update-check`, or Help → Check for updates)
-* CLI: `reidm get|add|import|export|grab|list|pause|resume|rm|daemon|ui|update-check|install-host|patch-extension`
-* No telemetry, no licensing logic — see `NOTICE.md`
+<p align="center">
+  <b>A fast, cross-platform download manager that takes over your browser's downloads.</b><br>
+  Windows · macOS · Linux — written in Rust, with a native desktop app and its own browser extension.
+</p>
 
-## The window
+<p align="center">
+  <a href="https://github.com/Zektopic/reIDM/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Zektopic/reIDM?sort=semver"></a>
+  <a href="https://github.com/Zektopic/reIDM/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Zektopic/reIDM/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-informational">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/Zektopic/reIDM"></a>
+</p>
 
-**reIDM** (Start Menu / desktop shortcut on Windows, `reIDM.app` on macOS, `reidm-gui` on Linux) is a desktop
-front-end for the background service. It starts the service if it is not already running, so downloads continue
-after the window is closed.
+<p align="center">
+  <img src="docs/images/main-window.png" alt="The reIDM window: a toolbar, a category tree, and a list of downloads with progress, rate and time left" width="860">
+</p>
 
-The same list is also reachable as a local web page via `reidm ui` (`http://127.0.0.1:61002/`), which is handy
-over SSH or on a headless box. That page only answers to its own `127.0.0.1` host and needs a per-run token, so
-no other website can drive it.
+---
 
-> Status: **0.1, early.** The download engine, the extension handshake/capture and the window are tested
-> (see `docs/PROTOCOL.md` → Verification). There is no scheduler, no video/media grabber, no FTP, and no
-> authentication prompts.
+reIDM does what a classic download manager does — splits each download across many connections,
+resumes after a crash or a dropped link, queues and schedules — and adds the part that matters
+most day to day: **when you click a download link in your browser, reIDM downloads it instead.**
+The browser shows nothing and keeps nothing, and if reIDM ever can't fetch a file, the browser
+quietly carries on as if reIDM weren't there.
+
+It is an independent project that also speaks the *IDM browser-extension protocol*, so Tonec's
+official "IDM Integration Module" extension can hand downloads to it too.
+
+## Highlights
+
+**Browser takeover**
+- Holds the browser's download *before* it is saved — no download bubble, no "Save as" dialog, no partial file — and lets go only after reIDM has fetched the first byte with your cookies.
+- Clicks on file links go straight to reIDM without the browser requesting them at all.
+- Starts reIDM by itself if it isn't running. Form submissions, page-generated files, Alt-clicks and sites you exclude stay with the browser.
+- Finds video and audio on a page (HLS, DASH, progressive), lists every quality, and grabs every link, image, video and file a page offers.
+
+**Download engine**
+- Up to 32 connections per download with **dynamic segmentation**: a connection that finishes early takes over half of the slowest one's remaining part.
+- Survives crashes, restarts and servers that cap connections; never splices a file that changed on the server (`If-Range` and size checks).
+- Global and per-download **speed limiter**, a **queue** and a **scheduler** (start and stop times, weekdays).
+- **Refresh an expired link** and carry on where it stopped — by pasting the new address, or by clicking the link in the browser again.
+
+**Everything else IDM users expect**
+- *Download Later*, batch downloads from `*` patterns (`img001.jpg` … `img250.jpg`), site grabber, IDM `.ef2` import and export, "Download complete" window, keyboard shortcuts, dark theme.
+- A command line and a local JSON API for scripting; a web view for headless machines.
+- No telemetry, no accounts, no ads. It checks GitHub for a new release once at start-up and tells you; it never downloads or installs anything by itself.
+
+<p align="center">
+  <img src="docs/images/properties.png" alt="A download's properties: addresses, size, rate, and a segment map showing eight connections" width="49%">
+  <img src="docs/images/resource-grabber.png" alt="The browser extension's resource grabber listing images, video and files on a page" width="49%">
+</p>
 
 ## Install
 
-Grab a package from the Releases page:
+Download the latest release for your system from the [Releases page](https://github.com/Zektopic/reIDM/releases/latest).
 
-| OS | File | Notes |
+| System | Package | |
 |---|---|---|
-| Windows | `reIDM-setup-*.exe` | per-user install, registers native host for Chrome/Edge/Brave/Firefox, daemon at login |
-| Debian/Ubuntu | `reidm_*_amd64.deb` | `systemctl --user enable --now reidm` |
-| macOS | `reIDM-*-universal.dmg` | open it, run **Install reIDM.command**. Unsigned: right-click → Open the first time |
+| **Windows** 10/11 (x64) | `reIDM-setup-<version>.exe` | Per-user install, no admin rights. Starts with Windows. |
+| **macOS** 11+ (Intel and Apple silicon) | `reIDM-<version>-universal.dmg` | Open it and run **Install reIDM.command**, then drag reIDM to Applications. |
+| **Debian / Ubuntu** (x64) | `reidm_<version>-1_amd64.deb` | `sudo apt install ./reidm_*.deb` |
+| Any | `reidm-extension-<version>.zip` | The browser extension on its own. |
 
-Or: `cargo build --release` and run `target/release/reidm daemon`.
+Then connect your browser once — it takes a minute:
 
-## Using the official extension
+1. Open reIDM and choose **Help › Browser integration**. It shows a folder.
+2. In Chrome, Edge, Brave, Vivaldi or Opera, open the extensions page (`chrome://extensions`, `edge://extensions`, …), turn on **Developer mode**, choose **Load unpacked**, and pick that folder.
 
-Short version: **Windows – works as shipped. Linux/macOS – the vendor extension blocks itself, so you need `reidm patch-extension`.**
-Details and the exact reason are in [`docs/EXTENSION.md`](docs/EXTENSION.md).
+That's it: the status bar now says *Browser: Chrome 1xx*, and downloads you start in the browser go to reIDM.
+The full walkthrough, including every browser and what to do when something doesn't connect, is in
+[docs/BROWSER_INTEGRATION.md](docs/BROWSER_INTEGRATION.md).
 
-## CLI
+> **macOS:** builds are ad-hoc signed unless the project's Developer ID is configured, so the first time,
+> right-click the app and choose **Open**. **Windows:** SmartScreen may warn about an unknown publisher.
+> See [docs/PACKAGING.md](docs/PACKAGING.md) for why, and how signing is set up.
+
+## Quick start
+
+- **From the browser** — just click download links. Hold **Alt** while clicking to let the browser have one.
+- **In the window** — *Add URL* (Ctrl+N) accepts one address or a whole pasted list; *Download later* puts it in the scheduled queue.
+- **From a terminal:**
 
 ```sh
-reidm get https://example.com/big.iso -c 16 -d ~/Downloads
-reidm daemon &                       # for the extension
-reidm add https://example.com/a.zip
+reidm add https://example.com/big.iso                 # queue it in the running service
+reidm batch 'https://example.com/photos/img*.jpg' --from 1 --to 250 --width 3
+reidm limit 2M                                         # cap the total speed at 2 MiB/s
 reidm list
+reidm get https://example.com/file.zip -c 16           # one-off download, no service needed
 ```
 
-## Layout
+## Documentation
 
-| Path | Purpose |
+| | |
 |---|---|
-| `crates/reidm-proto` | `MSG#…;` wire codec |
-| `crates/reidm-core` | download engine |
-| `crates/reidm` | daemon + CLI |
-| `crates/reidm-host` | native-messaging host (`com.tonec.idm`) |
-| `decomp/` | Ghidra output of the analysed vendor binaries (**private repo only**, see `NOTICE.md`) |
-| `docs/` | protocol, extension, packaging and reverse-engineering notes |
-| `extension/` | reIDM's own MV3 browser extension — see its [README](extension/README.md) |
-| `tools/` | installer unpacker, bulk-decompile script, icon generator, extension hand-off test |
+| [User guide](docs/USER_GUIDE.md) | Every window, dialog and setting, the queue and scheduler, refreshing links, shortcuts |
+| [Browser integration](docs/BROWSER_INTEGRATION.md) | Installing the extension, how takeover works, capture rules, media and the resource grabber |
+| [Command line](docs/CLI.md) | Every `reidm` command and option |
+| [HTTP API](docs/API.md) | The local JSON API, for scripts and other front-ends |
+| [Architecture](docs/ARCHITECTURE.md) | How the engine, service, window and extension fit together, and the security model |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | When a download or the browser connection doesn't behave |
+| [Building](docs/BUILDING.md) | Building from source, running the test suites, packaging |
+| [IDM extension](docs/EXTENSION.md) · [Protocol](docs/PROTOCOL.md) · [Reverse engineering](docs/REVERSE_ENGINEERING.md) | Using Tonec's official extension with reIDM, and how that was worked out |
 
-reIDM is not affiliated with Tonec. Use it only for content you are entitled to download.
+## Building from source
+
+```sh
+git clone https://github.com/Zektopic/reIDM && cd reIDM
+cargo build --release          # target/release/{reidm, reidm-gui, reidm-host}
+cargo test --workspace
+```
+
+Linux needs the usual windowing headers (`libxkbcommon-dev libwayland-dev libxcb1-dev libx11-dev libgl1-mesa-dev libfontconfig1-dev`).
+See [docs/BUILDING.md](docs/BUILDING.md) for the real-browser test suite and the installers.
+
+## Status and limits
+
+reIDM is young and moving quickly; see the [changelog](CHANGELOG.md). Things it does not do (yet), stated plainly:
+
+- The browser extension runs in **Chromium-based browsers**. Firefox is not supported by it (Firefox users can use Tonec's extension, see [docs/EXTENSION.md](docs/EXTENSION.md)).
+- Video streams are found and listed, but reIDM does not merge HLS/DASH segments into one file, and protected YouTube formats need a resolver reIDM doesn't have. DRM-protected media cannot be downloaded by any tool.
+- No FTP, no BitTorrent, no HTTP authentication prompts.
+- The extension isn't on the Chrome Web Store yet, hence *Load unpacked*.
+
+## Legal
+
+reIDM is not affiliated with, endorsed by, or derived from the source code of Tonec Inc.; "Internet Download Manager" and
+"IDM" are their trademarks. `decomp/` holds decompiler output kept as interoperability reference — read [NOTICE.md](NOTICE.md).
+Use reIDM only for content you are entitled to download. Licensed under the [MIT license](LICENSE).
