@@ -24,6 +24,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 png = "0.18"
 # Native folder/file pickers. On Linux the portal backend avoids a GTK3 build dependency.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+arboard = { version = "3.6.1", default-features = false }
 
 [build-dependencies]
 # Only used on Windows; the build script no-ops elsewhere.

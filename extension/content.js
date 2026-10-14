@@ -29,6 +29,129 @@
     }
   };
 
+  // ── download links, taken before the browser asks for them ────────────
+  //
+  // A plain click on a link whose address names a file type on the capture list (or whose
+  // `download` attribute does) is stopped here and handed to reIDM, so the browser never even
+  // requests the file. Everything else — and anything reIDM declines — goes on to the browser,
+  // where the service worker's download hook still has its say.
+  //
+  // The listener sits on `window` in the bubbling phase, so the page's own handlers run first:
+  // a link the page handles itself (an SPA route, a script that builds the real URL) arrives
+  // here with `defaultPrevented` set and is left alone.
+
+  const CAPTURE_DEFAULTS = { capture: true, interceptClicks: true, fileTypes: '', skipHosts: [] };
+  const cap = { ...CAPTURE_DEFAULTS };
+  let reidmUp = false;
+  chrome.storage.sync.get(CAPTURE_DEFAULTS).then((s) => Object.assign(cap, s)).catch(() => {});
+  chrome.storage.local
+    .get('reidm-status')
+    .then((o) => (reidmUp = !!(o['reidm-status'] && o['reidm-status'].up)))
+    .catch(() => {});
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'sync') {
+      for (const [k, v] of Object.entries(changes)) if (k in CAPTURE_DEFAULTS) cap[k] = v.newValue;
+    } else if (area === 'local' && changes['reidm-status']) {
+      const s = changes['reidm-status'].newValue;
+      reidmUp = !!(s && s.up);
+    }
+  });
+
+  const extOf = (s) => {
+    const m = /\.([a-z0-9]{1,8})$/i.exec(String(s || '').split(/[?#]/)[0]);
+    return m ? m[1].toUpperCase() : '';
+  };
+  const listed = (s) => {
+    const ext = extOf(s);
+    if (!ext) return false;
+    // An empty list means the extension has not stored one yet: fall back to IDM's own.
+    const raw = cap.fileTypes || '3GP 7Z AAC APK AVI BIN BZ2 DEB DMG EXE FLAC GZ ISO M4A M4V MKV MOV MP3 MP4 MPG MSI OGG PDF PKG RAR RPM TAR TGZ WAV WEBM WMA WMV XZ ZIP ZST';
+    return String(raw).toUpperCase().split(/[\s,;|]+/).some((t) => t && (t.endsWith('*') ? ext.startsWith(t.slice(0, -1)) : t === ext));
+  };
+  const skippedHost = (href) => {
+    let h = '';
+    try {
+      h = new URL(href).hostname.toLowerCase();
+    } catch {
+      return true;
+    }
+    return (cap.skipHosts || []).some((s) => {
+      const e = String(s).trim().toLowerCase().replace(/^\*\./, '');
+      return e && (h === e || h.endsWith(`.${e}`));
+    });
+  };
+  const linkOf = (ev) => {
+    for (const el of ev.composedPath ? ev.composedPath() : [ev.target]) {
+      if (el && (el.tagName === 'A' || el.tagName === 'AREA') && el.href) return el;
+    }
+    return null;
+  };
+  /** The file name a link promises: its `download` attribute, else the last path segment. */
+  const promisedName = (a) => {
+    const d = a.getAttribute('download');
+    if (d) return d;
+    try {
+      return decodeURIComponent(new URL(a.href).pathname.split('/').filter(Boolean).pop() || '');
+    } catch {
+      return '';
+    }
+  };
+
+  const handedBack = new WeakSet();
+
+  /** reIDM declined, or could not be reached: do what the click would have done. */
+  function handBack(a, href) {
+    chrome.runtime
+      .sendMessage({ type: 'bypass', url: href })
+      .catch(() => {})
+      .finally(() => {
+        const target = (a.getAttribute('target') || '').toLowerCase();
+        if (target === '_blank' && !a.hasAttribute('download')) {
+          // The click's user activation may have lapsed while reIDM was asked, and a script
+          // `window.open` would then be blocked as a pop-up; the worker can open the tab.
+          chrome.runtime.sendMessage({ type: 'open-tab', url: href }).catch(() => {});
+        } else {
+          handedBack.add(a);
+          a.click();
+        }
+      });
+  }
+
+  window.addEventListener(
+    'click',
+    (ev) => {
+      if (!ev.isTrusted || ev.button !== 0) return;
+      const a = linkOf(ev);
+      if (!a) return;
+      const href = a.href;
+      if (!isHttp(href)) return;
+      // IDM's convention: Alt+click means "let the browser have this one".
+      if (ev.altKey) {
+        chrome.runtime.sendMessage({ type: 'bypass', url: href }).catch(() => {});
+        return;
+      }
+      if (ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+      if (!cap.capture || !cap.interceptClicks || !reidmUp || skippedHost(href)) return;
+      const name = promisedName(a);
+      if (!listed(href) && !listed(name)) return;
+
+      ev.preventDefault();
+      chrome.runtime
+        .sendMessage({ type: 'capture-link', url: href, referer: location.href, filename: a.getAttribute('download') || null })
+        .then((r) => {
+          if (!r || !r.ok) handBack(a, href);
+        })
+        .catch(() => handBack(a, href));
+    },
+    false,
+  );
+
+  // Our own replay of a declined click arrives untrusted and is ignored above; forget it.
+  window.addEventListener('click', (ev) => {
+    const a = !ev.isTrusted && linkOf(ev);
+    if (a && handedBack.has(a)) handedBack.delete(a);
+  }, false);
+
   // Two independent sources feed the picker, and neither may clobber the other:
   //   * the page hook (inject.js) sees player responses and manifests the page fetched itself;
   //   * the worker parses manifests it saw through webRequest, which is the only way to catch
