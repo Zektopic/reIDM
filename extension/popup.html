@@ -4,57 +4,48 @@
 <meta charset="utf-8">
 <style>
   :root {
-    --bg: #ffffff; --fg: #1a1a1a; --mut: #6c6c6c; --line: #d8d8d8;
-    --accent: #0a60c8; --ok: #2ea053; --warn: #b06a00; --err: #c02828;
+    --bg: #ffffff; --fg: #1b1d21; --mut: #69707d; --line: #e3e6eb; --soft: #f4f6f9;
+    --accent: #1565d8; --ok: #1f8f4e; --warn: #a96800; --err: #c0392b;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #242427; --fg: #e6e6e6; --mut: #9a9a9a; --line: #3c3c3c; --accent: #2a84e0; }
+    :root { --bg: #1f2125; --fg: #e7e9ee; --mut: #9aa1ad; --line: #33363d; --soft: #272a30; --accent: #3b8cff; }
   }
   * { box-sizing: border-box; }
-  body {
-    width: 420px; max-height: 560px; margin: 0; background: var(--bg); color: var(--fg);
-    font: 13px/1.45 system-ui, "Segoe UI", sans-serif;
-  }
-  header {
-    display: flex; align-items: center; gap: 8px; padding: 10px 12px;
-    border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg);
-  }
-  header img { width: 18px; height: 18px; }
-  header .name { font-weight: 600; }
-  header .sp { flex: 1; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  body { width: 430px; max-height: 590px; margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 system-ui, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 9px; padding: 11px 14px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2; }
+  header img { width: 22px; height: 22px; }
+  header .name { font-weight: 650; font-size: 14px; }
+  .sp { flex: 1; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: #9aa1ad; }
   .status { display: flex; align-items: center; gap: 6px; color: var(--mut); font-size: 12px; }
-  main { padding: 8px 12px 12px; }
+  main { padding: 10px 14px 14px; }
+  section + section { margin-top: 12px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--mut); margin: 0 0 6px; font-weight: 600; display: flex; align-items: center; }
+  .card { background: var(--soft); border-radius: 9px; padding: 9px 11px; }
+  .toggles { display: flex; flex-direction: column; gap: 7px; }
+  label.toggle { display: flex; align-items: center; gap: 8px; }
+  label.toggle .d { color: var(--mut); font-size: 11.5px; }
   .row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
   .row:last-child { border-bottom: 0; }
-  .row input[type=checkbox] { flex: none; }
   .row .meta { min-width: 0; flex: 1; }
-  .row .fn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .row .url { color: var(--mut); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .kind {
-    font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 1px 6px;
-    border: 1px solid currentColor; border-radius: 99px; flex: none;
-  }
-  .kind.stream { color: #8b5cf6; } .kind.video, .kind.media { color: var(--accent); }
-  .kind.audio { color: #e04a9b; } .kind.link { color: var(--ok); }
-  .kind.segment { color: var(--mut); } .kind.mse { color: var(--warn); }
-  .empty { color: var(--mut); text-align: center; padding: 26px 10px; }
-  .actions { display: flex; gap: 8px; margin-top: 10px; }
-  button {
-    font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px;
-    background: transparent; color: var(--fg); cursor: pointer;
-  }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button:hover { filter: brightness(0.95); }
+  .fn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub { color: var(--mut); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .kind { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; padding: 1px 6px; border: 1px solid currentColor; border-radius: 99px; flex: none; }
+  .kind.stream { color: #8a3ffc; } .kind.video, .kind.media { color: var(--accent); }
+  .kind.audio { color: #d12771; } .kind.link { color: var(--ok); } .kind.mse { color: var(--warn); }
+  .res { font-size: 11px; flex: none; }
+  .res.ok { color: var(--ok); } .res.err { color: var(--err); }
+  .empty { color: var(--mut); text-align: center; padding: 14px 8px; font-size: 12px; }
+  .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.link { border: 0; padding: 0; background: none; color: var(--accent); font-size: 12px; }
   button:disabled { opacity: .5; cursor: default; }
   .add { display: flex; gap: 8px; margin-top: 10px; }
-  .add input {
-    flex: 1; font: inherit; padding: 6px 9px; border: 1px solid var(--line);
-    border-radius: 6px; background: transparent; color: var(--fg);
-  }
+  .add input { flex: 1; font: inherit; padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--fg); }
   .msg { margin-top: 8px; font-size: 12px; color: var(--mut); min-height: 16px; }
   .msg.err { color: var(--err); } .msg.ok { color: var(--ok); }
-  label.toggle { display: flex; align-items: center; gap: 6px; color: var(--mut); font-size: 12px; }
+  #mediaList { max-height: 190px; overflow: auto; }
 </style>
 </head>
 <body>
@@ -62,29 +53,33 @@
   <img src="icons/48.png" alt="">
   <span class="name">reIDM</span>
   <span class="sp"></span>
-  <span class="status"><span id="dot" class="dot" style="background:#9a9a9a"></span><span id="statusText">checking…</span></span>
+  <span class="status"><span id="dot" class="dot"></span><span id="statusText">checking…</span></span>
+  <button id="start" class="primary" hidden>Start reIDM</button>
 </header>
 <main>
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
-    <label class="toggle"><input type="checkbox" id="capture"> Capture downloads</label>
-    <span class="sp" style="flex:1"></span>
-    <button id="clear" title="Forget the media found on this page">Clear</button>
-  </div>
+  <section class="card toggles">
+    <label class="toggle"><input type="checkbox" id="capture"> <span>Take over browser downloads</span></label>
+    <label class="toggle"><input type="checkbox" id="siteSkip"> <span>Never on <b id="host">this site</b></span></label>
+  </section>
 
-  <div id="list"></div>
+  <section>
+    <h2>Just now <span class="sp"></span><button class="link" id="openOptions">Options</button></h2>
+    <div id="recent"></div>
+  </section>
 
-  <div class="actions">
-    <button class="primary" id="downloadSelected">Download selected</button>
-    <button id="downloadAll">Download all</button>
-    <span class="sp" style="flex:1"></span>
-    <button id="options">Options</button>
-  </div>
+  <section>
+    <h2>Media on this page <span class="sp"></span><button class="link" id="clear" title="Forget what was found on this page">Clear</button></h2>
+    <div id="mediaList"></div>
+    <div class="actions">
+      <button class="primary" id="downloadSelected">Download selected</button>
+      <button id="grab" title="Every link, image, video and file on the page, with filters">Grab resources…</button>
+    </div>
+  </section>
 
   <div class="add">
-    <input id="url" type="text" placeholder="…or paste a link and press Enter" spellcheck="false">
+    <input id="url" type="text" placeholder="Paste a link and press Enter" spellcheck="false">
     <button id="addUrl">Add</button>
   </div>
-
   <div id="msg" class="msg"></div>
 </main>
 <script src="popup.js"></script>

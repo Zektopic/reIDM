@@ -201,11 +201,11 @@ async function send(details) {
   return r;
 }
 
-async function sendBatch(items, referer) {
+async function sendBatch(items, referer, later = false) {
   const withCookies = await Promise.all(
     items.map(async (it) => ({ ...it, referer: it.referer || referer, cookie: await cookieHeader(it.url) })),
   );
-  const body = { items: withCookies, user_agent: navigator.userAgent };
+  const body = { items: withCookies, user_agent: navigator.userAgent, later: !!later };
   let r = await post('/ext/add-batch', body, 60000);
   if (!r.ok && r.unreachable && (await launchReidm())) r = await post('/ext/add-batch', body, 60000);
   return r;
@@ -792,7 +792,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       return true;
     }
     case 'add-batch':
-      sendBatch(msg.items || [], msg.referer).then(reply);
+      sendBatch(msg.items || [], msg.referer, msg.later).then(reply);
       return true;
     case 'download-format':
       downloadFormat(msg, sender).then(reply);

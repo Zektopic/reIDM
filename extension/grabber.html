@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>reIDM — Resource grabber</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --fg: #1b1d21; --mut: #69707d; --line: #e1e4ea;
+    --accent: #1565d8; --accent-fg: #ffffff; --ok: #1f8f4e; --warn: #a96800; --err: #c0392b;
+    --chip: #eef1f6; --row-hover: #f2f6fd; --sel: #e6efff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181b; --panel: #1f2125; --fg: #e7e9ee; --mut: #9aa1ad; --line: #30333a;
+      --accent: #3b8cff; --chip: #2a2d33; --row-hover: #262a31; --sel: #1d2c45;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 system-ui, "Segoe UI", Roboto, sans-serif; }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 18px;
+    background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 3;
+  }
+  header img { width: 26px; height: 26px; }
+  header .title { font-weight: 650; font-size: 15px; }
+  header .page { color: var(--mut); font-size: 12px; max-width: 60vw; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  header .sp { flex: 1; }
+  .status { display: flex; align-items: center; gap: 6px; color: var(--mut); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #9aa1ad; }
+
+  .bar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 18px;
+    background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 51px; z-index: 2;
+  }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    border: 1px solid transparent; background: var(--chip); color: var(--fg); border-radius: 999px;
+    padding: 4px 11px; cursor: pointer; font: inherit; font-size: 12px; display: inline-flex; gap: 6px; align-items: center;
+  }
+  .chip .n { color: var(--mut); font-variant-numeric: tabular-nums; }
+  .chip.on { background: var(--accent); color: var(--accent-fg); }
+  .chip.on .n { color: rgba(255,255,255,.8); }
+  .chip:disabled { opacity: .45; cursor: default; }
+  input[type=search], input[type=number] {
+    font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--bg); color: var(--fg);
+  }
+  input[type=search] { width: 260px; }
+  input[type=number] { width: 72px; }
+  label.opt { display: inline-flex; align-items: center; gap: 5px; color: var(--mut); font-size: 12px; white-space: nowrap; }
+
+  main { padding: 0 18px 90px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; margin-top: 14px; }
+  thead th {
+    text-align: left; font-weight: 600; font-size: 11.5px; color: var(--mut); text-transform: uppercase; letter-spacing: .04em;
+    padding: 9px 10px; border-bottom: 1px solid var(--line); background: var(--panel); cursor: pointer; user-select: none; white-space: nowrap;
+  }
+  thead th.sorted::after { content: " ▾"; }
+  thead th.sorted.asc::after { content: " ▴"; }
+  tbody td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--row-hover); }
+  tbody tr.sel { background: var(--sel); }
+  td.check, th.check { width: 34px; text-align: center; }
+  td.type { width: 92px; }
+  td.name .fn { font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46vw; }
+  td.name .url { color: var(--mut); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46vw; }
+  td.dim, td.size { white-space: nowrap; color: var(--mut); font-variant-numeric: tabular-nums; }
+  td.src { color: var(--mut); font-size: 11.5px; white-space: nowrap; }
+  .thumb { width: 34px; height: 34px; border-radius: 5px; object-fit: cover; background: var(--chip); display: block; }
+  .tag { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; padding: 2px 7px; border-radius: 5px; background: var(--chip); }
+  .tag.video { color: #8a3ffc; } .tag.audio { color: #d12771; } .tag.image { color: #0f8a8a; }
+  .tag.document { color: #b85c00; } .tag.archive { color: #1565d8; } .tag.program { color: #c0392b; }
+  .tag.stream { color: #8a3ffc; } .tag.page, .tag.other, .tag.subtitle { color: var(--mut); }
+  .empty { text-align: center; color: var(--mut); padding: 60px 10px; }
+
+  footer {
+    position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 10px;
+    padding: 12px 18px; background: var(--panel); border-top: 1px solid var(--line); z-index: 3;
+  }
+  footer .sp { flex: 1; }
+  #msg { color: var(--mut); font-size: 12px; }
+  #msg.ok { color: var(--ok); } #msg.err { color: var(--err); }
+  button.btn {
+    font: inherit; padding: 7px 14px; border: 1px solid var(--line); border-radius: 7px;
+    background: var(--panel); color: var(--fg); cursor: pointer;
+  }
+  button.btn:hover { filter: brightness(.97); }
+  button.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); font-weight: 600; }
+  button.btn:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <img src="icons/48.png" alt="">
+  <div>
+    <div class="title">Resource grabber</div>
+    <div class="page" id="page">reading the page…</div>
+  </div>
+  <span class="sp"></span>
+  <span class="status"><span class="dot" id="dot"></span><span id="statusText">checking reIDM…</span></span>
+</header>
+
+<div class="bar">
+  <div class="chips" id="chips"></div>
+  <span style="flex:1"></span>
+  <input type="search" id="filter" placeholder="Filter by name or address  (/regex/ allowed)" spellcheck="false">
+  <label class="opt"><input type="checkbox" id="sameSite"> This site only</label>
+  <label class="opt"><input type="checkbox" id="showPages"> Links to pages</label>
+  <label class="opt" title="Hide icons, spacers and thumbnails">Images ≥ <input type="number" id="minPx" min="0" step="10" value="64"> px</label>
+</div>
+
+<main>
+  <table>
+    <thead>
+      <tr>
+        <th class="check"><input type="checkbox" id="all" title="Select every row shown"></th>
+        <th data-sort="type">Type</th>
+        <th data-sort="name">Name</th>
+        <th data-sort="dim">Dimensions</th>
+        <th data-sort="size">Size</th>
+        <th data-sort="src">Found as</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" hidden>Nothing matches the current filters.</div>
+</main>
+
+<footer>
+  <button class="btn primary" id="download" disabled>Download with reIDM</button>
+  <button class="btn" id="later" disabled title="Add to reIDM's scheduled queue without starting">Download later</button>
+  <button class="btn" id="sizes">Get sizes</button>
+  <button class="btn" id="copy" disabled>Copy addresses</button>
+  <button class="btn" id="export" disabled>Export…</button>
+  <button class="btn" id="rescan">Rescan</button>
+  <span class="sp"></span>
+  <span id="msg"></span>
+</footer>
+
+<script src="grabber.js"></script>
+</body>
+</html>

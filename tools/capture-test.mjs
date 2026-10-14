@@ -85,8 +85,39 @@ const PAGE = `<!doctype html><html><head><title>capture test</title>
 <button id="post" type="submit">POST export</button></form>
 </body></html>`;
 
+const svg = (w, h) => `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}"><rect width="100%" height="100%" fill="#3b8cff"/></svg>`;
+const GALLERY = `<!doctype html><html><head><title>gallery</title>
+<meta property="og:image" content="/img/card.svg"></head><body>
+<img id="big" src="/img/big.svg" alt="big picture">
+<img src="/img/icon.svg" alt="icon">
+<img srcset="/img/a-480.svg 480w, /img/a-1080.svg 1080w" src="/img/a-480.svg" sizes="200px" alt="responsive">
+<img data-src="/img/lazy.svg" src="/img/icon.svg" alt="lazy">
+<div style="width:200px;height:100px;background-image:url('/img/bg.svg')"></div>
+<video src="/media/clip.mp4" poster="/img/poster.svg"><track src="/media/subs.vtt" srclang="en"></video>
+<a href="/files/doc.pdf">the manual</a>
+<a href="/files/app.zip">the app</a>
+<a href="/about">about us</a>
+<script>fetch('/api/data.json').catch(() => {});</script>
+</body></html>`;
+const SVGS = { '/img/big.svg': svg(800, 600), '/img/icon.svg': svg(16, 16), '/img/a-480.svg': svg(480, 320), '/img/a-1080.svg': svg(1080, 720),
+  '/img/lazy.svg': svg(640, 480), '/img/bg.svg': svg(400, 200), '/img/poster.svg': svg(1280, 720), '/img/card.svg': svg(1200, 630) };
+
 const site = http.createServer((req, res) => {
   const u = new URL(req.url, `http://127.0.0.1:${SITE_PORT}`);
+  if (u.pathname === '/gallery') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    return res.end(GALLERY);
+  }
+  if (SVGS[u.pathname]) {
+    res.writeHead(200, { 'Content-Type': 'image/svg+xml' });
+    return res.end(SVGS[u.pathname]);
+  }
+  if (['/media/clip.mp4', '/media/subs.vtt', '/files/doc.pdf', '/api/data.json', '/about'].includes(u.pathname)) {
+    const type = { '.mp4': 'video/mp4', '.vtt': 'text/vtt', '.pdf': 'application/pdf', '.json': 'application/json' }[path.extname(u.pathname)] || 'text/html';
+    const data = body(u.pathname === '/media/clip.mp4' ? 300 << 10 : 4096, 9);
+    res.writeHead(200, { 'Content-Type': type, 'Content-Length': data.length, 'Accept-Ranges': 'bytes' });
+    return res.end(data);
+  }
   log.push({ method: req.method, path: u.pathname, range: req.headers.range, cookie: req.headers.cookie || '', mode: req.headers['sec-fetch-mode'] || '' });
   if (u.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html', 'Set-Cookie': 'session=ok; Path=/; HttpOnly' });
@@ -209,7 +240,10 @@ let worker = null; // session id
 async function launchChrome() {
   fs.writeFileSync(
     path.join(PROFILE, 'Default', 'Preferences'),
-    JSON.stringify({ download: { default_directory: BROWSER_DL, prompt_for_download: false, directory_upgrade: true }, savefile: { default_directory: BROWSER_DL } }),
+    JSON.stringify({
+      download: { default_directory: BROWSER_DL, prompt_for_download: !!process.env.REIDM_PROMPT, directory_upgrade: true },
+      savefile: { default_directory: BROWSER_DL },
+    }),
   );
   chrome = spawn(
     CHROME,
@@ -290,6 +324,16 @@ async function click(selector, modifiers = 0) {
   }
 }
 
+/** Optional: `REIDM_SHOT_CMD="python3 shot.py"` saves a screenshot of the whole display, to see
+ *  whether the browser's own download UI ever appears. */
+function shot(name) {
+  const cmd = process.env.REIDM_SHOT_CMD;
+  if (!cmd) return;
+  const out = path.join(process.env.REIDM_SHOT_DIR || WORK, `${name}.png`);
+  const [exe, ...rest] = cmd.split(' ');
+  spawnSync(exe, [...rest, out], { env });
+}
+
 const browserFiles = () => fs.readdirSync(BROWSER_DL).filter((f) => !f.startsWith('.'));
 const browserRequested = (p) => log.some((l) => l.path === p && l.mode === 'navigate');
 
@@ -305,6 +349,45 @@ async function waitFor(what, fn, ms = 20000) {
 
 // ── the checks ──────────────────────────────────────────────────────────
 
+async function grabberChecks() {
+  await openPage(`http://127.0.0.1:${SITE_PORT}/gallery`);
+  await sleep(1000);
+  const tabId = await inWorker(`chrome.tabs.query({}).then(t => t.find(x => x.url.endsWith('/gallery')).id)`);
+  const { targetId } = await cdp.send('Target.createTarget', { url: `chrome-extension://${EXT_ID}/grabber.html?tab=${tabId}` });
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+  await cdp.send('Runtime.enable', {}, sessionId);
+  const inGrabber = async (expression) => (await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId)).result.value;
+  const rows = await waitFor('grabber rows', async () => {
+    const r = await inGrabber(`[...document.querySelectorAll('#rows .url')].map(e => e.textContent)`);
+    return r && r.length ? r : null;
+  });
+  const shown = new Set((rows || []).map((u) => new URL(u).pathname));
+  for (const p of ['/img/big.svg', '/img/a-1080.svg', '/img/lazy.svg', '/img/bg.svg', '/img/poster.svg', '/img/card.svg', '/media/clip.mp4', '/media/subs.vtt', '/files/doc.pdf', '/files/app.zip']) {
+    check(`grabber lists ${p}`, shown.has(p));
+  }
+  check('grabber hides a 16 px icon by default', !shown.has('/img/icon.svg'));
+  check('grabber hides links to pages by default', !shown.has('/about'));
+  check('grabber hides the page’s own API calls', !shown.has('/api/data.json'));
+  shot('grabber');
+  // Pick the documents and archives, and hand them over.
+  await inGrabber(`(() => {
+    for (const tr of document.querySelectorAll('#rows tr')) {
+      const u = tr.querySelector('.url').textContent;
+      if (/doc\.pdf$|clip\.mp4$/.test(u)) tr.querySelector('input').click();
+    }
+    document.getElementById('download').click();
+  })()`);
+  const msg = await waitFor('grabber result', async () => {
+    const m = await inGrabber(`document.getElementById('msg').textContent`);
+    return /queued|already|refused/.test(m || '') ? m : null;
+  });
+  check('grabber hands the selection to reIDM', /2 queued/.test(msg || ''), msg || 'no answer');
+  const got = await reidmItems();
+  check('reIDM has the grabbed files', !!itemFor(got, '/files/doc.pdf') && !!itemFor(got, '/media/clip.mp4'));
+  check('grabbed files carry the page as referer', (itemFor(got, '/files/doc.pdf') || { request: {} }).request.referer?.endsWith('/gallery'));
+  await cdp.send('Target.closeTarget', { targetId });
+}
+
 async function main() {
   await new Promise((r) => site.listen(SITE_PORT, '127.0.0.1', r));
   await startDaemon();
@@ -314,6 +397,7 @@ async function main() {
   check('the extension has the fixed ID', !!sw && sw.includes(EXT_ID));
   // Let the worker publish reIDM's status for the content scripts.
   await inWorker('reidm.ping().then(i => !!i)');
+  if (process.env.REIDM_ONLY_GRABBER) return grabberChecks();
 
   await openPage(`http://127.0.0.1:${SITE_PORT}/`);
 
@@ -332,6 +416,10 @@ async function main() {
   // 2. downloads only recognisable from their headers: taken from the browser
   for (const [sel, p] of [['#report', '/dl/report'], ['#tiny', '/dl/tiny']]) {
     await click(sel);
+    for (const ms of [150, 400, 900]) {
+      await sleep(ms === 150 ? 150 : ms - 150);
+      shot(`${p.split('/').pop()}-${ms}ms`);
+    }
     const got = await waitFor(`${p} done`, async () => {
       const i = itemFor(await reidmItems(), p);
       return i && i.status.state === 'Done' && i;
@@ -344,6 +432,9 @@ async function main() {
   const kept = await inWorker('chrome.downloads.search({}).then(d => d.map(x => x.url + " " + x.state))');
   check('the browser kept no download entries', kept.length === 0, kept.join(', '));
   check('the browser wrote no files', browserFiles().length === 0, browserFiles().join(', '));
+  // With "Ask where to save each file" on, the checks below would stop at the browser's own
+  // Save dialog; the point of that run is only that captured downloads never open one.
+  if (process.env.REIDM_PROMPT) return;
 
   // 3. cookies
   await click('#private');
@@ -362,6 +453,8 @@ async function main() {
 
   // 5. Alt+click
   await click('#alt', 1);
+  await sleep(1200);
+  shot('alt-click-browser-download');
   const altFile = await waitFor('alt.zip in the browser folder', async () => browserFiles().find((f) => f.startsWith('alt')));
   check('Alt+click: the browser downloaded it', !!altFile);
   check('Alt+click: reIDM did not take it', !itemFor(await reidmItems(), '/files/alt.zip'));
@@ -393,6 +486,9 @@ async function main() {
   }, 30000);
   check('reIDM not running: the extension started it and it took the download', !!launched);
   check('reIDM not running: the browser kept nothing', !browserFiles().some((f) => f.startsWith('launched')), browserFiles().join(', '));
+
+  // the in-browser resource grabber
+  await grabberChecks();
 
   // 8. reIDM stopped and no host: the browser keeps the download
   fs.rmSync(path.join(hostDir, 'com.zektopic.reidm.json'));
