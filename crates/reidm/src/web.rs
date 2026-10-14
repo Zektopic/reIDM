@@ -352,7 +352,9 @@ async fn ext_ping(State(app): State<App>, h: HeaderMap, Query(q): Query<PingQuer
     if let Err(c) = extension_caller(&h) {
         return c.into_response();
     }
-    if is_extension_origin(&h) {
+    // Chrome attaches `Origin` to an extension's POSTs but not to its GETs, so the version
+    // parameter, which only reIDM's extension sends, is what identifies the ping.
+    if q.v.is_some() || is_extension_origin(&h) {
         let browser = h.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(browser_name).unwrap_or_default();
         *app.ext.lock().unwrap() = Some(ExtSeen {
             at: std::time::SystemTime::now(),
@@ -562,7 +564,7 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
     Json(serde_json::json!({ "results": results })).into_response()
 }
 
-/// Backwards-compatible alias used by the engine CLI: `POST /api/downloads?batch=1`.
+/// A page to scan, and how.
 #[derive(Deserialize)]
 struct GrabBody {
     url: String,

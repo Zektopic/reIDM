@@ -415,10 +415,13 @@ impl App {
         if ids.is_empty() {
             return self.toast("Select a download first");
         }
-        for id in &ids {
-            self.api.action(*id, if queued { "schedule" } else { "unschedule" });
-        }
-        self.toast(if queued { format!("{} added to the scheduled queue", ids.len()) } else { format!("{} removed from the scheduled queue", ids.len()) });
+        // The service refuses to queue a finished download, so count what it accepted.
+        let n = ids.iter().filter(|id| self.api.try_action(**id, if queued { "schedule" } else { "unschedule" }).is_ok()).count();
+        self.toast(match (queued, n) {
+            (true, 0) => "Finished downloads can't be added to the scheduled queue".to_string(),
+            (true, n) => format!("{n} added to the scheduled queue"),
+            (false, n) => format!("{n} removed from the scheduled queue"),
+        });
     }
 
     fn queue_now(&mut self, start: bool) {
@@ -1155,14 +1158,14 @@ impl App {
                         for c in CATEGORIES.into_iter().filter(|c| *c != Category::All) {
                             let v = View::Category(c);
                             let dark = self.prefs.dark;
-                            if tree_row(ui, p, 34.0, c.label(), self.count(v), self.view == v, |pt, r| icons::file_card(pt, r, c, dark)) {
+                            if tree_row(ui, p, 34.0, c.label(), Some(self.count(v)), self.view == v, |pt, r| icons::file_card(pt, r, c, dark)) {
                                 self.view = v;
                             }
                         }
                     }
                     for (v, done) in [(View::Unfinished, false), (View::Finished, true)] {
                         let col = if done { p.ok } else { p.accent };
-                        if tree_row(ui, p, 16.0, v.label(), self.count(v), self.view == v, |pt, r| {
+                        if tree_row(ui, p, 16.0, v.label(), Some(self.count(v)), self.view == v, |pt, r| {
                             if done {
                                 icons::dot(pt, r, col)
                             } else {
@@ -1178,13 +1181,13 @@ impl App {
                 ui.label(RichText::new("QUEUES").size(10.0).color(p.text_dim).strong());
                 let q = View::Queue;
                 let qcol = p.text_dim;
-                if tree_row(ui, p, 4.0, q.label(), self.count(q), self.view == q, |pt, r| icons::clock(pt, r, qcol)) {
+                if tree_row(ui, p, 4.0, q.label(), Some(self.count(q)), self.view == q, |pt, r| icons::clock(pt, r, qcol)) {
                     self.view = q;
                 }
                 ui.add_space(8.0);
                 ui.label(RichText::new("GRABBER").size(10.0).color(p.text_dim).strong());
                 let gcol = p.text_dim;
-                if tree_row(ui, p, 4.0, "Site grabber…", 0, false, |pt, r| icons::grabber(pt, r, gcol)) {
+                if tree_row(ui, p, 4.0, "Site grabber…", None, false, |pt, r| icons::grabber(pt, r, gcol)) {
                     self.show_grabber = true;
                 }
             });
@@ -1270,7 +1273,7 @@ impl App {
 }
 
 /// One row of the category tree. Returns whether it was clicked.
-fn tree_row(ui: &mut egui::Ui, p: &Palette, indent: f32, label: &str, n: usize, on: bool, icon: impl FnOnce(&egui::Painter, egui::Rect)) -> bool {
+fn tree_row(ui: &mut egui::Ui, p: &Palette, indent: f32, label: &str, n: Option<usize>, on: bool, icon: impl FnOnce(&egui::Painter, egui::Rect)) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 23.0), egui::Sense::click());
     if on {
         ui.painter().rect_filled(rect, 3.0, p.accent.gamma_multiply(0.22));
@@ -1279,7 +1282,9 @@ fn tree_row(ui: &mut egui::Ui, p: &Palette, indent: f32, label: &str, n: usize, 
     }
     icon(ui.painter(), egui::Rect::from_min_size(rect.min + Vec2::new(indent, 4.0), Vec2::splat(15.0)));
     ui.painter().text(rect.min + Vec2::new(indent + 22.0, 11.5), egui::Align2::LEFT_CENTER, label, egui::FontId::proportional(12.5), if on { p.accent } else { p.text });
-    ui.painter().text(rect.right_center() - Vec2::new(8.0, 0.0), egui::Align2::RIGHT_CENTER, n.to_string(), egui::FontId::proportional(11.5), p.text_dim);
+    if let Some(n) = n {
+        ui.painter().text(rect.right_center() - Vec2::new(8.0, 0.0), egui::Align2::RIGHT_CENTER, n.to_string(), egui::FontId::proportional(11.5), p.text_dim);
+    }
     resp.clicked()
 }
 

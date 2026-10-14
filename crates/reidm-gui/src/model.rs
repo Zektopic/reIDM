@@ -197,7 +197,7 @@ impl View {
             View::Category(c) => c.matches(it),
             View::Unfinished => it.status != Status::Done,
             View::Finished => it.status == Status::Done,
-            View::Queue => it.scheduled,
+            View::Queue => it.scheduled && it.status != Status::Done,
         }
     }
 

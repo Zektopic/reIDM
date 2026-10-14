@@ -17,7 +17,11 @@
 //   5. Alt+click leaves the download to the browser;
 //   6. a "file" link that is really a web page opens in the browser instead of being saved;
 //   7. with reIDM stopped, the extension starts it through the native host and still takes over;
-//   8. with reIDM stopped and no native host, the browser simply downloads the file.
+//   8. with reIDM stopped and no native host, the browser simply downloads the file;
+//   9. the resource grabber lists what the page offers, hides noise, and hands the selection over.
+//
+// REIDM_PROMPT=1 turns on the browser's "Ask where to save each file" and runs checks 1–2 only;
+// REIDM_ONLY_GRABBER=1 runs check 9 only; KEEP=1 keeps the temporary profile and logs.
 //
 // Usage (needs a display; use xvfb-run on a headless machine):
 //   cargo build -p reidm -p reidm-host
@@ -318,7 +322,8 @@ async function evalPage(expression) {
 
 /** A real, trusted click in the middle of the element. `modifiers`: 1 Alt, 2 Ctrl, 4 Meta, 8 Shift. */
 async function click(selector, modifiers = 0) {
-  const box = await evalPage(`(() => { const r = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+  const box = await evalPage(`(() => { const e = document.querySelector(${JSON.stringify(selector)}); if (!e) return null; const r = e.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+  if (!box) throw new Error(`no ${selector} on ${await evalPage('location.href')}`);
   for (const type of ['mousePressed', 'mouseReleased']) {
     await cdp.send('Input.dispatchMouseEvent', { type, x: box.x, y: box.y, button: 'left', clickCount: 1, modifiers }, page);
   }
@@ -489,6 +494,7 @@ async function main() {
 
   // the in-browser resource grabber
   await grabberChecks();
+  await openPage(`http://127.0.0.1:${SITE_PORT}/`);
 
   // 8. reIDM stopped and no host: the browser keeps the download
   fs.rmSync(path.join(hostDir, 'com.zektopic.reidm.json'));

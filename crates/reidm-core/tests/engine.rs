@@ -405,6 +405,10 @@ async fn download_later_waits_for_the_queue() {
     assert_eq!(m.start_queue(), 1);
     wait_until("queue completes", || state(&m, o.id) == Status::Done);
     assert_eq!(std::fs::read(dl.join("later.bin")).unwrap(), data);
+
+    // Finished, it leaves the queue, and cannot be put back in it.
+    assert!(!m.get(o.id).unwrap().scheduled);
+    assert!(m.set_scheduled(o.id, true).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1002,6 +1002,9 @@ impl Manager {
         {
             let mut db = self.0.db.lock().unwrap();
             let it = db.items.get_mut(&id).ok_or_else(|| anyhow!("no such download {id}"))?;
+            if scheduled && it.status == Status::Done {
+                bail!("that download is already complete");
+            }
             it.scheduled = scheduled;
         }
         self.save();
@@ -1202,6 +1205,8 @@ impl Manager {
                     it.downloaded = live.progress.load(Ordering::Relaxed);
                     if st == Status::Done {
                         it.finished_at = Some(now_secs());
+                        // A finished download leaves the scheduled queue, as in IDM.
+                        it.scheduled = false;
                     }
                     it.status = st;
                 }

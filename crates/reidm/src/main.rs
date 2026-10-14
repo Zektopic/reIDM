@@ -36,24 +36,33 @@ enum Cmd {
     },
     /// Download a URL right now in this terminal (no daemon needed).
     Get {
+        /// The address to download.
         url: String,
+        /// Parallel connections.
         #[arg(short, long, default_value_t = 8)]
         connections: usize,
+        /// Folder to save into (default: your Downloads folder).
         #[arg(short, long)]
         dir: Option<PathBuf>,
+        /// File name to save as (default: the server's name).
         #[arg(short, long)]
         output: Option<String>,
+        /// Referer header to send.
         #[arg(long)]
         referer: Option<String>,
+        /// Cookie header to send, e.g. "session=abc; theme=dark".
         #[arg(long)]
         cookie: Option<String>,
     },
     /// Queue one or more URLs in the running daemon. Re-adding a URL resumes it.
     Add {
+        /// One or more addresses.
         #[arg(required = true)]
         urls: Vec<String>,
+        /// Referer header to send with every address.
         #[arg(long)]
         referer: Option<String>,
+        /// File name to save as (a single address only).
         #[arg(short, long)]
         output: Option<String>,
         /// Add to the scheduled queue without starting (IDM's "Download Later").
@@ -76,20 +85,25 @@ enum Cmd {
         /// Only print the addresses.
         #[arg(long)]
         dry_run: bool,
+        /// Add to the scheduled queue without starting.
         #[arg(long)]
         later: bool,
     },
     /// Queue every URL in a text file (one per line, `#` comments) or an IDM `.ef2` export;
     /// `-` reads stdin.
     Import {
+        /// The list or `.ef2` file; `-` reads stdin.
         file: String,
+        /// Folder to save into (default: reIDM's download folder).
         #[arg(short, long)]
         dir: Option<PathBuf>,
+        /// Add to the scheduled queue without starting.
         #[arg(long)]
         later: bool,
     },
     /// Write the current list to a file (`-` for stdout): plain URLs, or IDM's `.ef2` format.
     Export {
+        /// Where to write; `-` writes to stdout.
         #[arg(default_value = "-")]
         file: String,
         /// `txt` or `ef2`; by default taken from the file's extension.
@@ -107,9 +121,17 @@ enum Cmd {
         action: String,
     },
     /// Give an unfinished download a new address for the same file (an expired link, a mirror).
-    Refresh { id: u64, url: String },
+    Refresh {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+        /// The file's new address.
+        url: String,
+    },
     /// Start a download again from the first byte.
-    Restart { id: u64 },
+    Restart {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+    },
     /// Print where reIDM's browser extension is, for the browser's "Load unpacked".
     Extension,
     /// Scan a page for downloadable files without downloading anything.
@@ -142,19 +164,40 @@ enum Cmd {
     },
     /// List downloads known to the daemon.
     List,
-    Pause { id: u64 },
-    Resume { id: u64 },
+    /// Pause a download.
+    Pause {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+    },
+    /// Resume a paused or failed download.
+    Resume {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+    },
     /// Remove a download from the list (add --purge to delete its files).
-    Rm { id: u64, #[arg(long)] purge: bool },
+    Rm {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+        /// Also delete the file, finished or partial.
+        #[arg(long)]
+        purge: bool,
+    },
     /// Open the web UI in your browser (starts the daemon if needed).
     Ui,
     /// Check GitHub for a newer release.
     UpdateCheck,
-    /// Register the native-messaging host (com.tonec.idm) with installed browsers.
+    /// Register the native-messaging hosts (com.zektopic.reidm for reIDM's extension,
+    /// com.tonec.idm for Tonec's) with the installed browsers.
     InstallHost,
+    /// Remove the native-messaging host registrations.
     UninstallHost,
     /// Make a local copy of the official IDM extension usable on this OS (see docs/EXTENSION.md).
-    PatchExtension { src: PathBuf, dst: PathBuf },
+    PatchExtension {
+        /// The unpacked official extension.
+        src: PathBuf,
+        /// Where to write the patched copy (a new folder).
+        dst: PathBuf,
+    },
 }
 
 fn human(n: u64) -> String {
@@ -607,15 +650,27 @@ async fn main() -> Result<()> {
         Cmd::List => {
             let path = default_data_dir().join("downloads.json");
             let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no downloads yet ({})", path.display()))?)?;
-            for (id, it) in v["items"].as_object().into_iter().flatten() {
+            let items = v["items"].as_object().filter(|m| !m.is_empty());
+            if items.is_none() {
+                println!("no downloads");
+            }
+            for (id, it) in items.into_iter().flatten() {
+                let state = match it["status"]["state"].as_str().unwrap_or("?") {
+                    // Download Later: stopped, but waiting for the queue rather than for the user.
+                    "Paused" if it["scheduled"].as_bool() == Some(true) => "Scheduled",
+                    s => s,
+                };
                 println!(
                     "{:>4}  {:<10} {:>10}/{:<10}  {}",
                     id,
-                    it["status"]["state"].as_str().unwrap_or("?"),
+                    state,
                     human(it["downloaded"].as_u64().unwrap_or(0)),
                     it["size"].as_u64().map(human).unwrap_or("?".into()),
                     it["path"].as_str().unwrap_or("")
                 );
+                if let Some(e) = it["status"]["error"].as_str() {
+                    println!("      {e}");
+                }
             }
         }
         Cmd::Pause { id } => drop(send_to_daemon(vec![ctl(session::T_CTL_PAUSE, id, None)]).await?),
