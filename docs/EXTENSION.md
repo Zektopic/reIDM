@@ -1,4 +1,16 @@
-# Using the official IDM extension with reIDM
+# Browser integration
+
+reIDM works with **either** of two extensions:
+
+* **reIDM's own extension** (`extension/`, in this repository) — takes over browser downloads, finds
+  media on a page, and adds right-click entries. Works on every platform, needs nothing from Tonec,
+  and is the recommended path. See [its README](../extension/README.md).
+* **Tonec's official "IDM Integration Module"** — but only unmodified on Windows, and only when its
+  port is free. The rest of this document is about that path.
+
+You can install both; they do not conflict.
+
+## Using the official IDM extension with reIDM
 
 **The extension is Tonec's and is not bundled here.** Install it from the Chrome Web Store
 (`ngpampappnmepgilojfohadhhmbhlaek`), Edge Add-ons, or Firefox Add-ons as usual.
@@ -8,6 +20,9 @@
 1. Install reIDM (`reIDM-setup-*.exe`). The installer registers the native-messaging host `com.tonec.idm` for Chrome, Edge, Brave and Firefox (HKCU) and starts the daemon at login.
 2. Do **not** run the original IDM at the same time (both want port 1001).
 3. The unmodified extension connects to `ws://127.0.0.1:1001` or the native host. Nothing else to do.
+
+When it hands a download over it *pauses* the browser's copy first and only cancels once reIDM's reply says it took
+the URL; a refusal resumes the download. See `PROTOCOL.md` → "The browser hand-off is pause-then-decide".
 
 ## Linux / macOS
 

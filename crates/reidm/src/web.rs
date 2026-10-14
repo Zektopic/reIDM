@@ -143,12 +143,181 @@ async fn act(State(app): State<App>, h: HeaderMap, Path((id, what)): Path<(u64, 
     StatusCode::NO_CONTENT.into_response()
 }
 
+// ── endpoints for reIDM's own browser extension ──────────────────────────
+//
+// These are reached from an extension service worker, which has no API token. The origin check
+// is the authorisation instead, exactly as on the WebSocket: a page cannot forge `Origin`, and a
+// page cannot add a custom header here either, because we never answer a CORS preflight.
+// Extension requests with `host_permissions` are not subject to CORS, so nothing is needed for
+// the extension itself to read the responses.
+
+/// Is this an extension origin? Browsers set `Origin` themselves and page script cannot forge
+/// it, so this is a reliable discriminator — a web page always arrives with its own http(s)
+/// origin. It is not a *credential*: any local process can send the header, but such a process
+/// could already read the daemon's token file.
+fn is_extension_origin(h: &HeaderMap) -> bool {
+    matches!(
+        h.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
+        Some(o) if o.starts_with("chrome-extension://")
+            || o.starts_with("moz-extension://")
+            || o.starts_with("safari-web-extension://")
+    )
+}
+
+fn extension_caller(h: &HeaderMap) -> Result<(), StatusCode> {
+    match h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        Some(_) if is_extension_origin(h) => Ok(()),
+        // No Origin: a local process (curl, a script). It could already read the token file, so
+        // this grants nothing new.
+        None => Ok(()),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+    }
+}
+
+/// Answer a CORS preflight.
+///
+/// Chrome may preflight the extension's JSON POST even though host permissions normally lift
+/// the response check, so refusing every preflight would break the extension. The reply is
+/// scoped to the asking extension origin, which a web page cannot obtain: it would have to send
+/// `Origin: chrome-extension://…`, and browsers do not let page script set that header.
+async fn ext_preflight(h: HeaderMap) -> Response {
+    if !is_extension_origin(&h) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let origin = h.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    let mut r = StatusCode::NO_CONTENT.into_response();
+    let hdrs = r.headers_mut();
+    if let Ok(v) = origin.parse() {
+        hdrs.insert("access-control-allow-origin", v);
+    }
+    hdrs.insert("access-control-allow-methods", "POST, GET, OPTIONS".parse().unwrap());
+    hdrs.insert("access-control-allow-headers", "Content-Type".parse().unwrap());
+    hdrs.insert("access-control-max-age", "600".parse().unwrap());
+    hdrs.insert("vary", "Origin".parse().unwrap());
+    r
+}
+
+/// What the extension answers on start-up to decide whether reIDM is running.
+async fn ext_ping(State(app): State<App>, h: HeaderMap) -> Response {
+    if let Err(c) = extension_caller(&h) {
+        return c.into_response();
+    }
+    let s = app.mgr.settings();
+    Json(serde_json::json!({
+        "app": "reIDM",
+        "version": env!("CARGO_PKG_VERSION"),
+        "default_dir": s.default_dir.to_string_lossy(),
+        "connections": s.connections,
+        "max_concurrent": s.max_concurrent,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct ExtAdd {
+    url: String,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    referer: Option<String>,
+    #[serde(default)]
+    cookie: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+}
+
+async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) -> Response {
+    if let Err(c) = extension_caller(&h) {
+        return c.into_response();
+    }
+    let req = Request {
+        url: b.url.trim().to_string(),
+        filename: b.filename,
+        referer: b.referer,
+        cookie: b.cookie,
+        user_agent: b.user_agent,
+        dir: None,
+    };
+    match app.mgr.add_detailed(req) {
+        Ok(o) => Json(serde_json::json!({ "ok": true, "id": o.id, "outcome": o.outcome })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "error": format!("{e:#}") }))).into_response(),
+    }
+}
+
+// ── batch and grabber ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct BatchBody {
+    urls: Vec<String>,
+    #[serde(default)]
+    dir: Option<String>,
+    /// Applied to every URL in the batch.
+    #[serde(default)]
+    referer: Option<String>,
+    /// Only meaningful for a single URL.
+    #[serde(default)]
+    filename: Option<String>,
+}
+
+/// Queue many URLs at once. Answers per URL, so the caller can say what happened to each.
+async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let dir = b.dir.map(std::path::PathBuf::from);
+    let single = b.urls.len() == 1;
+    let reqs: Vec<Request> = b
+        .urls
+        .into_iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .map(|url| Request {
+            url,
+            dir: dir.clone(),
+            referer: b.referer.clone(),
+            filename: if single { b.filename.clone() } else { None },
+            ..Default::default()
+        })
+        .collect();
+    let results: Vec<serde_json::Value> = app
+        .mgr
+        .add_many(reqs)
+        .into_iter()
+        .map(|(url, r)| match r {
+            Ok(o) => serde_json::json!({ "url": url, "id": o.id, "outcome": o.outcome }),
+            Err(e) => serde_json::json!({ "url": url, "error": format!("{e:#}") }),
+        })
+        .collect();
+    Json(serde_json::json!({ "results": results })).into_response()
+}
+
+/// Backwards-compatible alias used by the engine CLI: `POST /api/downloads?batch=1`.
+#[derive(Deserialize)]
+struct GrabBody {
+    url: String,
+    #[serde(default)]
+    options: reidm_core::grabber::Options,
+}
+
+/// Scan a page for downloadable files. Read-only: nothing is queued by this call.
+async fn grab(State(_app): State<App>, h: HeaderMap, Json(b): Json<GrabBody>) -> Response {
+    if let Err(c) = guard(&_app, &h, true) {
+        return c.into_response();
+    }
+    match reidm_core::grabber::grab_page(&b.url, &b.options).await {
+        Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct SettingsBody {
     #[serde(default)]
     default_dir: Option<String>,
     #[serde(default)]
     connections: Option<usize>,
+    #[serde(default)]
+    max_concurrent: Option<usize>,
 }
 
 /// What the daemon is actually able to offer right now.
@@ -174,6 +343,7 @@ async fn settings(State(app): State<App>, h: HeaderMap) -> Response {
     Json(serde_json::json!({
         "default_dir": s.default_dir.to_string_lossy(),
         "connections": s.connections,
+        "max_concurrent": s.max_concurrent,
     }))
     .into_response()
 }
@@ -183,7 +353,7 @@ async fn set_settings(State(app): State<App>, h: HeaderMap, Json(b): Json<Settin
         return c.into_response();
     }
     let dir = b.default_dir.map(std::path::PathBuf::from).filter(|d| !d.as_os_str().is_empty());
-    match app.mgr.set_settings(dir, b.connections) {
+    match app.mgr.set_settings(dir, b.connections, b.max_concurrent) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
@@ -252,6 +422,10 @@ pub async fn serve(mgr: Manager, idm_port: Arc<std::sync::atomic::AtomicBool>) -
         .route("/api/downloads/:id/:what", post(act))
         .route("/api/settings", get(settings).post(set_settings))
         .route("/api/status", get(status))
+        .route("/api/downloads/batch", post(add_batch))
+        .route("/api/grab", post(grab))
+        .route("/ext/ping", get(ext_ping).options(ext_preflight))
+        .route("/ext/add", post(ext_add).options(ext_preflight))
         .with_state(app);
     tracing::info!("web UI at http://127.0.0.1:{UI_PORT}/");
     let r = axum::serve(l, router).await;

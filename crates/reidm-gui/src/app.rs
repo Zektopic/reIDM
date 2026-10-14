@@ -7,7 +7,7 @@
 
 use crate::api::{Api, Snapshot};
 use crate::icons;
-use crate::model::{eta_human, now_secs, rate_human, since_human, size_human, Category, Item, Status, CATEGORIES};
+use crate::model::{eta_human, now_secs, rate_human, since_human, size_human, Category, Found, GrabOptions, Item, Status, CATEGORIES};
 use crate::theme::{self, Palette};
 use egui::{Align, Layout, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
@@ -55,7 +55,6 @@ pub struct App {
     show_add: bool,
     add_url: String,
     add_name: String,
-    add_start: bool,
     show_options: bool,
     opt_dir: String,
     opt_conn: usize,
@@ -70,7 +69,33 @@ pub struct App {
     downloads_open: bool,
     /// An update check is kicked off once, a moment after startup.
     checked_on_start: bool,
+
+    // site grabber
+    show_grabber: bool,
+    grab: GrabState,
 }
+
+/// The site-grabber window's state. Every field defaults to empty/off, so the derive is
+/// exactly what the hand-written `Default` said.
+#[derive(Default)]
+struct GrabState {
+    url: String,
+    depth: u32,
+    /// Comma-separated; empty means the built-in list of common file types.
+    types: String,
+    same_host: bool,
+    include: String,
+    exclude: String,
+    sizes: bool,
+    scanning: bool,
+    error: Option<String>,
+    found: Vec<Found>,
+    /// Parallel to `found`.
+    selected: Vec<bool>,
+    /// A scan runs on its own thread because it is network-bound and can take a while.
+    rx: Option<std::sync::mpsc::Receiver<Result<Vec<Found>, String>>>,
+}
+
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, dark: bool) -> Self {
@@ -90,7 +115,6 @@ impl App {
             show_add: false,
             add_url: String::new(),
             add_name: String::new(),
-            add_start: true,
             show_options: false,
             opt_dir: String::new(),
             opt_conn: 8,
@@ -101,6 +125,8 @@ impl App {
             cats_open: true,
             downloads_open: true,
             checked_on_start: false,
+            show_grabber: false,
+            grab: GrabState::default(),
         }
     }
 
@@ -274,6 +300,142 @@ impl App {
         self.toast(if purge { "Download and file removed" } else { "Download removed from the list" });
     }
 
+    /// Queue every URL in a line- or file-shaped list, and say what happened.
+    fn queue_urls(&mut self, urls: Vec<String>) {
+        if urls.is_empty() {
+            return self.toast("No URLs to add");
+        }
+        match self.api.add_batch(&urls) {
+            Ok(results) => {
+                let count = |k: &str| results.iter().filter(|r| r.outcome.as_deref() == Some(k)).count();
+                let new = count("new");
+                let resumed = count("existing");
+                let have = count("already_complete");
+                let failed = results.iter().filter(|r| r.error.is_some()).count();
+                let mut parts = Vec::new();
+                if new > 0 {
+                    parts.push(format!("{new} queued"));
+                }
+                if resumed > 0 {
+                    parts.push(format!("{resumed} resumed"));
+                }
+                if have > 0 {
+                    parts.push(format!("{have} already downloaded"));
+                }
+                if failed > 0 {
+                    parts.push(format!("{failed} failed"));
+                }
+                if let Some(first) = results.iter().find(|r| r.error.is_some()) {
+                    parts.push(format!("— {}: {}", first.url, first.error.clone().unwrap_or_default()));
+                }
+                self.toast(parts.join(", "));
+            }
+            Err(e) => self.toast(format!("could not queue: {e}")),
+        }
+    }
+
+    fn queue_url_list(&mut self, text: &str) {
+        let urls: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| l.starts_with("http://") || l.starts_with("https://") || l.starts_with("ftp://"))
+            .map(str::to_string)
+            .collect();
+        self.queue_urls(urls);
+    }
+
+    /// Read URLs from a text file (or a clipboard paste is just typed into the dialog).
+    fn import_from_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("URL list", &["txt", "list", "csv"])
+            .set_title("Import a list of URLs")
+            .pick_file()
+        else {
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => self.queue_url_list(&text),
+            Err(e) => self.toast(format!("could not read {}: {e}", path.display())),
+        }
+    }
+
+    /// Write the URLs of every download in the list to a text file.
+    fn export_download_list(&mut self) {
+        let mut urls: Vec<String> = self.snap.items.iter().map(|i| i.request.url.clone()).collect();
+        urls.sort();
+        urls.dedup();
+        if urls.is_empty() {
+            return self.toast("There is nothing to export");
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("URL list", &["txt"])
+            .set_file_name("reidm-urls.txt")
+            .set_title("Export the download list")
+            .save_file()
+        else {
+            return;
+        };
+        let mut text = String::from("# reIDM download list\n");
+        for u in &urls {
+            text.push_str(u);
+            text.push('\n');
+        }
+        match std::fs::write(&path, text) {
+            Ok(()) => self.toast(format!("Exported {} URL(s)", urls.len())),
+            Err(e) => self.toast(format!("could not write {}: {e}", path.display())),
+        }
+    }
+
+    // ── site grabber ─────────────────────────────────────────────────────
+
+    fn start_grab(&mut self) {
+        let url = self.grab.url.trim().to_string();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            self.grab.error = Some("Enter an http or https page address".into());
+            return;
+        }
+        let opts = GrabOptions {
+            depth: self.grab.depth,
+            types: self
+                .grab
+                .types
+                .split(',')
+                .map(|t| t.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect(),
+            same_host_only: self.grab.same_host,
+            include: self.grab.include.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
+            exclude: self.grab.exclude.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
+            sizes: self.grab.sizes,
+        };
+        self.grab.rx = Some(self.api.grab_async(&url, &opts));
+        self.grab.scanning = true;
+        self.grab.error = None;
+    }
+
+    fn poll_grab(&mut self) {
+        let Some(rx) = &self.grab.rx else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.grab.rx = None;
+        self.grab.scanning = false;
+        match result {
+            Ok(files) => {
+                self.grab.selected = vec![true; files.len()];
+                self.grab.found = files;
+                if self.grab.found.is_empty() {
+                    self.grab.error = Some("No downloadable files found on that page".into());
+                }
+            }
+            Err(e) => {
+                self.grab.found.clear();
+                self.grab.selected.clear();
+                self.grab.error = Some(e);
+            }
+        }
+    }
+
+
     fn open_selected(&mut self, reveal: bool) {
         let Some(id) = self.selected.last().copied() else {
             return self.toast("Select a download first");
@@ -292,6 +454,7 @@ impl eframe::App for App {
             self.snap = s;
         }
         self.poll_update();
+        self.poll_grab();
         // One check shortly after launch, so a new release is noticed without the user going
         // looking. It is a single GET to api.github.com and reports nothing back to us.
         if !self.checked_on_start && self.snap.connected {
@@ -320,6 +483,7 @@ impl eframe::App for App {
         self.options_dialog(&ctx, &p);
         self.about_dialog(&ctx);
         self.confirm_dialog(&ctx);
+        self.grabber_window(&ctx, &p);
 
         if let Some(t) = &self.toast {
             if Instant::now() < t.until {
@@ -437,6 +601,15 @@ impl App {
                             self.delete_completed();
                             ui.close();
                         }
+                        ui.separator();
+                        if ui.button("Import URL list…").clicked() {
+                            self.import_from_file();
+                            ui.close();
+                        }
+                        if ui.button("Export URL list…").clicked() {
+                            self.export_download_list();
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Downloads", |ui| {
                         if ui.button("Start").clicked() {
@@ -459,6 +632,11 @@ impl App {
                         ui.checkbox(&mut self.dark, "Dark theme");
                         ui.separator();
                         ui.checkbox(&mut self.cats_open, "Show categories");
+                        ui.separator();
+                        if ui.button("Site Grabber").clicked() {
+                            self.show_grabber = true;
+                            ui.close();
+                        }
                     });
                     ui.menu_button("Help", |ui| {
                         if ui.button("Check for updates").clicked() {
@@ -523,10 +701,12 @@ impl App {
                         }
                         self.show_options = true;
                     }
-                    // Drawn but not wired up: `tool` takes no click sense when disabled, so
-                    // there is nothing to handle and the tooltip says why.
+                    if tool(ui, p, "Site\nGrabber", Icon::Grabber, false, true).clicked() {
+                        self.show_grabber = true;
+                    }
+                    // Present in IDM, not implemented here; `tool` takes no click sense when
+                    // disabled, and the tooltip says so.
                     let _ = tool(ui, p, "Scheduler", Icon::Clock, false, false);
-                    let _ = tool(ui, p, "Site\nGrabber", Icon::Grabber, false, false);
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let mut s = std::mem::take(&mut self.search);
@@ -1034,35 +1214,51 @@ impl App {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.set_min_width(460.0);
-                ui.label(RichText::new("Address").color(p.text_dim).size(12.0));
-                let r = ui.add_sized(
-                    Vec2::new(440.0, 26.0),
-                    egui::TextEdit::singleline(&mut self.add_url).hint_text("https://example.com/file.zip"),
-                );
-                ui.add_space(8.0);
-                ui.label(RichText::new("Save as").color(p.text_dim).size(12.0));
+                ui.set_min_width(520.0);
+                ui.label(RichText::new("Addresses — one per line, so you can paste a whole batch").color(p.text_dim).size(12.0));
                 ui.add_sized(
-                    Vec2::new(440.0, 26.0),
+                    Vec2::new(500.0, 96.0),
+                    egui::TextEdit::multiline(&mut self.add_url)
+                        .hint_text("https://example.com/file.zip\nhttps://example.com/another.iso")
+                        .desired_rows(4),
+                );
+                let count = reidm_core::grabber::parse_url_list(&self.add_url).len();
+                if count > 1 {
+                    ui.label(RichText::new(format!("{count} URLs")).color(p.accent).size(11.0));
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Save as (single URL only)").color(p.text_dim).size(12.0));
+                ui.add_sized(
+                    Vec2::new(500.0, 26.0),
                     egui::TextEdit::singleline(&mut self.add_name).hint_text("(leave blank to use the name from the server)"),
                 );
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.add_start, "Start the download immediately");
-                ui.add_space(12.0);
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let ok = ui.add_sized(Vec2::new(110.0, 28.0), egui::Button::new("Start download"));
+                    if ui.button("Import list…").clicked() {
+                        self.import_from_file();
+                    }
+                    ui.label(RichText::new("Read URLs from a text file").color(p.text_dim).size(11.0));
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let ok = ui.add_sized(Vec2::new(140.0, 28.0), egui::Button::new(if count > 1 { "Queue all" } else { "Start download" }));
                     let cancel = ui.add_sized(Vec2::new(80.0, 28.0), egui::Button::new("Cancel"));
-                    if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) || ok.clicked() {
-                        let url = self.add_url.trim().to_string();
-                        if url.is_empty() {
-                            self.toast("Enter an address first");
-                        } else {
+                    if ok.clicked() {
+                        let text = self.add_url.clone();
+                        let urls = reidm_core::grabber::parse_url_list(&text);
+                        if urls.is_empty() {
+                            self.toast("Enter an http or https address first");
+                        } else if urls.len() == 1 {
                             let name = self.add_name.trim();
-                            self.api.add(&url, if name.is_empty() { None } else { Some(name.to_string()) });
+                            self.api.add(&urls[0], if name.is_empty() { None } else { Some(name.to_string()) });
                             self.add_url.clear();
                             self.add_name.clear();
                             self.show_add = false;
                             self.toast("Download queued");
+                        } else {
+                            self.queue_urls(urls);
+                            self.add_url.clear();
+                            self.show_add = false;
                         }
                     }
                     if cancel.clicked() {
@@ -1187,6 +1383,173 @@ impl App {
         }
         if !open {
             self.about = false;
+        }
+    }
+
+    /// The site-grabber window: scan a page, pick what you want, queue it.
+    fn grabber_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        if !self.show_grabber {
+            return;
+        }
+        let mut open = true;
+        let mut scan = false;
+        let mut export = false;
+        let mut import = false;
+        let found = std::mem::take(&mut self.grab.found);
+        let mut selected = std::mem::take(&mut self.grab.selected);
+
+        egui::Window::new("Site Grabber")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(760.0, 520.0))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Page address").color(p.text_dim).size(12.0));
+                ui.horizontal(|ui| {
+                    let r = ui.add_sized(
+                        Vec2::new(430.0, 26.0),
+                        egui::TextEdit::singleline(&mut self.grab.url).hint_text("https://example.com/downloads/"),
+                    );
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.add_enabled(!self.grab.scanning, egui::Button::new("Scan")).clicked() || enter)
+                        && !self.grab.scanning
+                    {
+                        scan = true;
+                    }
+                    if self.grab.scanning {
+                        ui.spinner();
+                    }
+                });
+
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("Filters")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Follow links").color(p.text_dim).size(12.0));
+                            ui.add(egui::DragValue::new(&mut self.grab.depth).range(0..=3));
+                            ui.label(
+                                RichText::new(if self.grab.depth == 0 { "this page only" } else { "levels deep" })
+                                    .color(p.text_dim)
+                                    .size(11.0),
+                            );
+                            ui.separator();
+                            ui.checkbox(&mut self.grab.same_host, "Same host only");
+                            ui.checkbox(&mut self.grab.sizes, "Ask for file sizes (slower)");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Types").color(p.text_dim).size(12.0));
+                            ui.add_sized(
+                                Vec2::new(300.0, 22.0),
+                                egui::TextEdit::singleline(&mut self.grab.types)
+                                    .hint_text("zip, iso, mp4 … (blank = all common file types)"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Include").color(p.text_dim).size(12.0));
+                            ui.add_sized(Vec2::new(230.0, 22.0), egui::TextEdit::singleline(&mut self.grab.include).hint_text("/pub/"));
+                            ui.label(RichText::new("Exclude").color(p.text_dim).size(12.0));
+                            ui.add_sized(Vec2::new(230.0, 22.0), egui::TextEdit::singleline(&mut self.grab.exclude).hint_text("sample"));
+                        });
+                    });
+
+                if let Some(e) = &self.grab.error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(e).color(p.err).size(12.0));
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                if found.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label(
+                            RichText::new("Scan a page to list the files it links to.\nNothing is downloaded until you say so.")
+                                .color(p.text_dim),
+                        );
+                    });
+                } else {
+                    let all_on = selected.iter().all(|s| *s);
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut all_on.clone(), format!("{} files found", found.len())).clicked() {
+                            for s in selected.iter_mut() {
+                                *s = !all_on;
+                            }
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Export list…").clicked() {
+                                export = true;
+                            }
+                            if ui.button("Import list…").clicked() {
+                                import = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        for (i, f) in found.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if i < selected.len() {
+                                    ui.checkbox(&mut selected[i], "");
+                                }
+                                let icon_rect = egui::Rect::from_min_size(ui.cursor().min, Vec2::splat(16.0));
+                                let cat = crate::model::Category::of(&f.ext.to_ascii_uppercase());
+                                icons::file_card(ui.painter(), icon_rect, cat, self.dark);
+                                ui.add_space(20.0);
+                                match f.size {
+                                    Some(sz) => ui.label(RichText::new(size_human(sz)).size(11.5).color(p.text_dim)),
+                                    None => ui.label(RichText::new("          ").size(11.5)),
+                                };
+                                ui.label(RichText::new(&f.filename).size(12.0).color(p.text)).on_hover_text(
+                                    if f.found_on.is_empty() { f.url.clone() } else { format!("{}\nfound on {}", f.url, f.found_on) },
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(RichText::new(&f.ext).size(10.5).color(p.text_dim));
+                                });
+                            });
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let chosen = selected.iter().filter(|s| **s).count();
+                    let all: Vec<String> = found.iter().map(|f| f.url.clone()).collect();
+                    if ui
+                        .add_enabled(chosen > 0, egui::Button::new(format!("Download {chosen} selected")))
+                        .clicked()
+                    {
+                        let urls: Vec<String> =
+                            found.iter().zip(selected.iter()).filter(|(_, s)| **s).map(|(f, _)| f.url.clone()).collect();
+                        self.queue_urls(urls);
+                    }
+                    if ui.add_enabled(!all.is_empty(), egui::Button::new("Download all")).clicked() {
+                        self.queue_urls(all.clone());
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            self.show_grabber = false;
+                        }
+                    });
+                });
+            });
+
+        self.grab.found = found;
+        self.grab.selected = selected;
+        if scan {
+            self.start_grab();
+        }
+        if export {
+            self.export_download_list();
+        }
+        if import {
+            self.import_from_file();
+        }
+        if !open {
+            self.show_grabber = false;
         }
     }
 

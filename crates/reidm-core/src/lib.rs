@@ -1,5 +1,6 @@
 //! Segmented, resumable download engine used by the reIDM daemon and CLI.
 
+pub mod grabber;
 pub mod update;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -40,6 +41,53 @@ pub enum Status {
     Paused,
     Done,
     Failed(String),
+}
+
+/// What `add` did with a URL that was already known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    /// A new entry was created.
+    New,
+    /// The URL was already listed; nothing new was created. If it had stopped, it is running again.
+    Existing,
+    /// The URL was already downloaded and the file is still on disk.
+    AlreadyComplete,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AddOutcome {
+    pub id: u64,
+    pub outcome: Outcome,
+}
+
+/// A stable identity for a URL, used to recognise a link we have already been given.
+///
+/// The fragment is dropped (it is not sent to the server) and the query is sorted, so
+/// `?b=2&a=1` and `?a=1&b=2` are the same download. Everything else is kept: two URLs that
+/// differ in host, path or query values really are different files.
+pub fn url_key(u: &url::Url) -> String {
+    let mut q: Vec<(String, String)> = u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    q.sort();
+    let query = if q.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::new();
+        for (i, (k, v)) in q.iter().enumerate() {
+            s.push(if i == 0 { '?' } else { '&' });
+            s.push_str(k);
+            s.push('=');
+            s.push_str(v);
+        }
+        s
+    };
+    let host = u.host_str().unwrap_or("").to_ascii_lowercase();
+    let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
+    format!("{}{host}{port}{}{query}", u.scheme(), u.path())
+}
+
+fn url_key_of(raw: &str) -> Option<String> {
+    url::Url::parse(raw).ok().map(|u| url_key(&u))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,11 +141,19 @@ struct Db {
     items: BTreeMap<u64, Item>,
 }
 
+fn default_max_concurrent() -> usize {
+    4
+}
+
 /// User-adjustable options, persisted next to the download list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub default_dir: PathBuf,
     pub connections: usize,
+    /// How many downloads may transfer at once. The rest wait as `Queued`, which is what
+    /// makes adding a hundred links at once reasonable.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
 }
 
 struct Inner {
@@ -237,7 +293,13 @@ fn part_path(p: &Path) -> PathBuf {
 }
 
 impl Manager {
+    /// Open with the default concurrency limit; see [`Manager::open_with`].
     pub fn open(data_dir: &Path, default_dir: PathBuf, connections: usize) -> Result<Self> {
+        Self::open_with(data_dir, default_dir, connections, default_max_concurrent())
+    }
+
+    /// `max_concurrent` is only the default for a first run; a saved `settings.json` wins.
+    pub fn open_with(data_dir: &Path, default_dir: PathBuf, connections: usize, max_concurrent: usize) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let db_path = data_dir.join("downloads.json");
         let mut db: Db = match std::fs::read(&db_path) {
@@ -259,7 +321,7 @@ impl Manager {
             .ok()
             .and_then(|b| serde_json::from_slice::<Settings>(&b).ok())
             .filter(|s| s.connections > 0);
-        let settings = saved.unwrap_or(Settings { default_dir: default_dir.clone(), connections });
+        let settings = saved.unwrap_or(Settings { default_dir: default_dir.clone(), connections, max_concurrent });
 
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(20))
@@ -273,6 +335,7 @@ impl Manager {
             settings: Mutex::new(Settings {
                 default_dir: settings.default_dir,
                 connections: settings.connections.clamp(1, 32),
+                max_concurrent: settings.max_concurrent.clamp(1, 64),
             }),
             http,
         })))
@@ -283,7 +346,7 @@ impl Manager {
     }
 
     /// Update the download folder and/or connection count. Persisted immediately.
-    pub fn set_settings(&self, dir: Option<PathBuf>, connections: Option<usize>) -> Result<()> {
+    pub fn set_settings(&self, dir: Option<PathBuf>, connections: Option<usize>, max_concurrent: Option<usize>) -> Result<()> {
         {
             let mut s = self.0.settings.lock().unwrap();
             if let Some(d) = dir {
@@ -293,8 +356,13 @@ impl Manager {
             if let Some(c) = connections {
                 s.connections = c.clamp(1, 32);
             }
+            if let Some(m) = max_concurrent {
+                s.max_concurrent = m.clamp(1, 64);
+            }
         }
         self.save_settings();
+        // Raising the limit should let waiting downloads start now, not at the next completion.
+        self.pump();
         Ok(())
     }
 
@@ -341,15 +409,57 @@ impl Manager {
     }
 
     /// Queue a download and start it immediately. Returns the new id.
+    /// Queue a download. Returns its id.
+    ///
+    /// Adding the same URL twice does not make a second copy: see [`Manager::add_detailed`].
     pub fn add(&self, req: Request) -> Result<u64> {
+        Ok(self.add_detailed(req)?.id)
+    }
+
+    /// Queue a download and say what actually happened to it.
+    ///
+    /// Re-adding a URL resumes the existing entry rather than starting a duplicate, which is what
+    /// makes "paste the link again" a sensible way to carry on an interrupted download.
+    pub fn add_detailed(&self, req: Request) -> Result<AddOutcome> {
         let u = url::Url::parse(&req.url).context("invalid URL")?;
         if !matches!(u.scheme(), "http" | "https") {
             bail!("unsupported scheme {:?} (only http/https)", u.scheme());
         }
+        let key = url_key(&u);
         let dir = req.dir.clone().unwrap_or_else(|| self.0.settings.lock().unwrap().default_dir.clone());
         std::fs::create_dir_all(&dir)?;
+
         let id = {
             let mut db = self.0.db.lock().unwrap();
+
+            // Already in the list?
+            if let Some(existing) = db.items.values().find(|i| url_key_of(&i.request.url).as_deref() == Some(key.as_str())) {
+                let (id, status) = (existing.id, existing.status.clone());
+                // `req.filename` may carry a better name than the one we guessed last time.
+                if let Some(name) = req.filename.as_deref().map(sanitize_filename) {
+                    if let Some(slot) = db.items.get_mut(&id) {
+                        if slot.request.filename.is_none() {
+                            slot.request.filename = Some(name);
+                        }
+                    }
+                }
+                let live = self.0.live.lock().unwrap().contains_key(&id);
+                if status == Status::Done && !live {
+                    return Ok(AddOutcome { id, outcome: Outcome::AlreadyComplete });
+                }
+                // Anything that had stopped is picked up again: re-adding the link is how you
+                // carry on an interrupted download.
+                if !live && matches!(status, Status::Paused | Status::Failed(_)) {
+                    if let Some(slot) = db.items.get_mut(&id) {
+                        slot.status = Status::Queued;
+                    }
+                    drop(db);
+                    self.save();
+                    self.pump();
+                }
+                return Ok(AddOutcome { id, outcome: Outcome::Existing });
+            }
+
             let id = db.next_id;
             db.next_id += 1;
             let hint = req.filename.as_deref().map(sanitize_filename).unwrap_or_else(|| sanitize_filename(&filename_from_url(&u)));
@@ -373,8 +483,47 @@ impl Manager {
             id
         };
         self.save();
-        self.start(id);
-        Ok(id)
+        self.pump();
+        Ok(AddOutcome { id, outcome: Outcome::New })
+    }
+
+    /// Queue many requests, skipping duplicates, and report per-URL what happened.
+    pub fn add_many(&self, reqs: Vec<Request>) -> Vec<(String, Result<AddOutcome>)> {
+        reqs.into_iter()
+            .map(|r| {
+                let url = r.url.clone();
+                (url, self.add_detailed(r))
+            })
+            .collect()
+    }
+
+    /// Start as many queued downloads as the concurrency limit allows.
+    ///
+    /// Called after anything that changes what is running: a new download, a pause, a removal, or
+    /// a transfer finishing.
+    pub fn pump(&self) {
+        let limit = self.0.settings.lock().unwrap().max_concurrent.max(1);
+        let mut to_start = Vec::new();
+        {
+            // db before live, like every other lock site in this type.
+            let mut db = self.0.db.lock().unwrap();
+            let live = self.0.live.lock().unwrap();
+            let free = limit.saturating_sub(live.len());
+            if free > 0 {
+                for it in db.items.values_mut() {
+                    if to_start.len() >= free {
+                        break;
+                    }
+                    // A queued item that is not live is exactly one that is waiting for a slot.
+                    if it.status == Status::Queued && !live.contains_key(&it.id) {
+                        to_start.push(it.id);
+                    }
+                }
+            }
+        }
+        for id in to_start {
+            self.start(id);
+        }
     }
 
     pub fn resume(&self, id: u64) -> Result<()> {
@@ -389,7 +538,25 @@ impl Manager {
             }
             it.status = Status::Queued;
         }
-        self.start(id);
+        // Through the scheduler, so resuming twenty paused rows does not start twenty transfers.
+        self.pump();
+        Ok(())
+    }
+
+    /// Re-queue a finished download from its original URL, replacing what is on disk.
+    pub fn redownload(&self, id: u64) -> Result<()> {
+        {
+            let mut db = self.0.db.lock().unwrap();
+            let it = db.items.get_mut(&id).ok_or_else(|| anyhow!("no such download {id}"))?;
+            it.segments.clear();
+            it.downloaded = 0;
+            it.size = None;
+            it.resumable = false;
+            it.status = Status::Queued;
+            let _ = std::fs::remove_file(part_path(&it.path));
+        }
+        self.save();
+        self.pump();
         Ok(())
     }
 
@@ -413,6 +580,7 @@ impl Manager {
             }
         }
         self.save();
+        self.pump();
     }
 
     fn start(&self, id: u64) {
@@ -440,6 +608,7 @@ impl Manager {
             }
             me.0.live.lock().unwrap().remove(&id);
             me.save();
+            me.pump();
         });
     }
 
@@ -760,6 +929,19 @@ mod tests {
             Some("better.txt")
         );
         assert_eq!(filename_from_disposition("attachment").as_deref(), None);
+    }
+
+    #[test]
+    fn url_identity_ignores_fragment_and_query_order() {
+        let k = |u: &str| url_key(&url::Url::parse(u).unwrap());
+        assert_eq!(k("https://a.example/f.zip?a=1&b=2"), k("https://a.example/f.zip?b=2&a=1"));
+        assert_eq!(k("https://a.example/f.zip#part2"), k("https://a.example/f.zip"));
+        assert_eq!(k("https://A.example/f.zip"), k("https://a.example/f.zip"), "host is case-insensitive");
+        // Genuinely different downloads must not collide.
+        assert_ne!(k("https://a.example/f.zip?a=1"), k("https://a.example/f.zip?a=2"));
+        assert_ne!(k("https://a.example/f.zip"), k("https://b.example/f.zip"));
+        assert_ne!(k("https://a.example/f.zip"), k("https://a.example/g.zip"));
+        assert_ne!(k("http://a.example/f.zip"), k("https://a.example/f.zip"));
     }
 
     #[test]

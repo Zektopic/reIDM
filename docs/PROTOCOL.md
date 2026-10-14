@@ -19,6 +19,24 @@ surrounding text says what this project actually does.
 
 Native-messaging payloads are **JSON strings** (one frame per string) inside Chrome's `u32-LE length + JSON` envelope.
 
+## The browser hand-off is pause-then-decide
+
+Worth stating because it is easy to get backwards, and getting it wrong loses the user's file.
+
+The extension does **not** cancel a download and then ask what to do with it. On `onCreated` it calls
+`browser.downloads.pause()`, and the decision is taken in `onDeterminingFilename`. Only when reIDM's reply says
+"taken" (result 3) does it call `browser.downloads.cancel()`; on any other result it calls
+`browser.downloads.resume()`, handing the download back to the browser exactly as it was.
+
+Verified in the decompiled `background.js` 6.43.1: `onCreated` → `pause()`; the reply dispatcher's result-3 case
+computes `k = (result == 3)` and calls `kc(id, k)`, which cancels when `k` is true and resumes when it is false.
+IDM also correlates the browser's download with a previously sniffed request by URL within a ~50 ms window, which
+is how it attaches the cookies and referrer it observed.
+
+reIDM's own extension (`extension/`) works the same way, for the same reason: a cancel that happens before the
+manager has agreed to take the file is irreversible, and if the manager is not running the download is simply
+destroyed.
+
 ## Frame grammar
 
 ```
@@ -38,7 +56,7 @@ value := <int> | <utf8-byte-length>:<bytes>
 | 3 | srv→ext | hello ack `[proto=113,0,0,0,dpi=96,manager_version,client_id,0,zoom=100]` | `manager_version` = 6.43 build 15 (`6<<24\|43<<16\|15<<8`), so the extension skips its registration/nag paths *(inferred from `xc()`)* |
 | 4 | srv→ext | capture settings. `flags`: 64 auto-capture, 32 sniff UI, 256/512 menu entries, 1024 extended. key 1 = file-type list, key 23 = page-hook names | list in `crates/reidm/src/session.rs` |
 | 0 | ext→srv | keep-alive (every 15 s) | type‑1 reply |
-| 13, flags&128 | ext→srv | browser started saving a file; keys 6 url, 4 ext, 100 name, 103 size, 127 mime, 50 referrer, 51 cookie, 54 UA | queues it, replies `[id, 3]` ⇒ extension cancels the browser's own download |
+| 13, flags&128 | ext→srv | browser started saving a file; keys 6 url, 4 ext, 100 name, 103 size, 127 mime, 50 referrer, 51 cookie, 54 UA | queues it, replies `[id, 3]` ⇒ extension cancels its paused copy; result 0 ⇒ it resumes |
 | 13, other | ext→srv | passive request sniffing | replies `[id, 0]` (not captured) |
 | 14 | ext→srv | explicit "Download with IDM" / link list (15 announces a batch) | queues it and replies `[id, 3]` when the request was queued, `[id, 0]` when it was rejected — the extension uses this to decide whether to cancel the browser's own download, so reporting "taken" for a link we could not queue would drop it *(the reply value is reIDM's choice; the vendor's exact reply is not recovered)* |
 | 1 | both | reply `[request id, result]`; result 3 = taken over | — |

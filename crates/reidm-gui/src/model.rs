@@ -172,6 +172,29 @@ pub fn rate_human(bps: f64) -> String {
     format!("{}/s", size_human(bps as u64))
 }
 
+/// Options for a site-grabber scan, mirroring the daemon's.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GrabOptions {
+    pub depth: u32,
+    pub types: Vec<String>,
+    pub same_host_only: bool,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub sizes: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Found {
+    pub url: String,
+    pub filename: String,
+    #[serde(default)]
+    pub ext: String,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub found_on: String,
+}
+
 /// How long ago a unix timestamp was, for the "Last Try" column.
 ///
 /// Relative rather than a clock time: the standard library exposes no local timezone, and

@@ -10,10 +10,24 @@ reIDM is an independent project and is **not affiliated with, endorsed by, or de
 It exists to document how the browser-integration protocol works so that reIDM can interoperate with the official extension.
 
 * It is derived from proprietary software. The original binaries are **not** in this repository (see `.gitignore`).
-* Keep this repository **private**. Do not publish or redistribute `decomp/` without checking the vendor's licence terms
-  and the law where you live; interoperability exceptions to decompilation restrictions differ by jurisdiction.
 * No reIDM source was copied from the decompiled output: the protocol was re-implemented from observed message formats
   (extension JavaScript, `docs/PROTOCOL.md`). The decompiler output is reference material only.
+
+### On publishing this
+
+**This repository is public, by the owner's deliberate decision.** That is a knowing choice and not an oversight, but it
+is worth stating plainly what it means:
+
+* The decompiler output is derived from Tonec's proprietary binaries, and it is now readable by anyone. Whether that is
+  lawful depends on where you are: the EU and the US recognise narrower interoperability rights than some other
+  jurisdictions, and those exceptions generally attach to *decompiling for a purpose*, not to *republishing the result*.
+  Publishing is the riskier half.
+* Removing these files from the working tree in future would **not** unpublish them: they remain in the git history and
+  stay downloadable from the existing commit URLs. Taking them down would mean rewriting history and force-pushing, or
+  making the repository private again.
+* The purpose here is interoperability with a piece of software the user already has, which is the use the exceptions
+  are aimed at. Nothing in this repository implements or interferes with Tonec's licensing, registration or trial
+  logic, and the vendor's binaries and installer are not redistributed.
 
 ## What reIDM deliberately does not do
 

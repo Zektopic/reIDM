@@ -48,8 +48,54 @@ enum Cmd {
         #[arg(long)]
         cookie: Option<String>,
     },
-    /// Queue a URL in the running daemon.
-    Add { url: String, #[arg(long)] referer: Option<String>, #[arg(short, long)] output: Option<String> },
+    /// Queue one or more URLs in the running daemon. Re-adding a URL resumes it.
+    Add {
+        #[arg(required = true)]
+        urls: Vec<String>,
+        #[arg(long)]
+        referer: Option<String>,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Queue every URL in a text file (one per line, `#` comments); `-` reads stdin.
+    Import {
+        file: String,
+        #[arg(short, long)]
+        dir: Option<PathBuf>,
+    },
+    /// Write the URLs of the current list to a text file (`-` for stdout).
+    Export {
+        #[arg(default_value = "-")]
+        file: String,
+    },
+    /// Scan a page for downloadable files without downloading anything.
+    Grab {
+        url: String,
+        /// 0 = only this page; 1 = also follow its links once.
+        #[arg(short, long, default_value_t = 0)]
+        depth: u32,
+        /// Extensions to keep, comma separated (default: the built-in list).
+        #[arg(short = 't', long)]
+        types: Option<String>,
+        /// Keep only links on the same host as the page.
+        #[arg(long)]
+        same_host: bool,
+        /// Keep only URLs containing this text (repeatable).
+        #[arg(long)]
+        include: Vec<String>,
+        /// Drop URLs containing this text (repeatable).
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Ask each server for the file size as well.
+        #[arg(long)]
+        sizes: bool,
+        /// Write the found URLs to a file (`-` for stdout). Default: print a table.
+        #[arg(long)]
+        export: Option<String>,
+        /// Queue everything that was found.
+        #[arg(long)]
+        add: bool,
+    },
     /// List downloads known to the daemon.
     List,
     Pause { id: u64 },
@@ -95,6 +141,78 @@ async fn send_to_daemon(msgs: Vec<Message>) -> Result<Vec<Message>> {
     }
     let _ = s.close(None).await;
     Ok(replies)
+}
+
+/// The daemon's API token, as published in its data directory. A local, same-user client can
+/// already read that file, which is why the token is stored there.
+fn api_token() -> Result<String> {
+    let path = default_data_dir().join("api-token");
+    let t = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {} — is the daemon running?", path.display()))?
+        .trim()
+        .to_string();
+    if t.is_empty() {
+        bail!("the daemon's API token is empty; restart `reidm daemon`");
+    }
+    Ok(t)
+}
+
+/// POST JSON to the daemon and decode the reply.
+async fn api_post(path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+    let url = format!("http://127.0.0.1:{}{path}", web::UI_PORT);
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("X-Reidm-Token", api_token()?)
+        .json(&body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .with_context(|| format!("cannot reach the daemon at {url} (start it with `reidm daemon`)"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("daemon said {status}: {text}");
+    }
+    serde_json::from_str(&text).context("decoding the daemon's reply")
+}
+
+/// Read a file, or stdin when the path is `-`.
+fn read_input(path: &str) -> Result<String> {
+    if path == "-" {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))
+    }
+}
+
+/// Print a per-URL summary of a batch add.
+fn report_batch(v: &serde_json::Value) {
+    let mut added = 0;
+    let mut existing = 0;
+    let mut complete = 0;
+    let mut failed = 0;
+    for r in v["results"].as_array().into_iter().flatten() {
+        if let Some(err) = r["error"].as_str() {
+            failed += 1;
+            eprintln!("  failed:  {}  ({err})", r["url"].as_str().unwrap_or(""));
+            continue;
+        }
+        match r["outcome"].as_str().unwrap_or("") {
+            "new" => added += 1,
+            "already_complete" => {
+                complete += 1;
+                println!("  already have: {}", r["url"].as_str().unwrap_or(""));
+            }
+            _ => {
+                existing += 1;
+                println!("  resuming:     {}", r["url"].as_str().unwrap_or(""));
+            }
+        }
+    }
+    println!("{added} queued, {existing} resumed, {complete} already complete, {failed} failed");
 }
 
 fn ctl(ty: u32, id: u64, extra: Option<i64>) -> Message {
@@ -178,16 +296,103 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Add { url, referer, output } => {
-            let mut m = Message::new(1, 14, 1, 1).with_args([1]).with_str(6, url);
-            if let Some(r) = referer {
-                m = m.with_str(50, r);
+        Cmd::Add { urls, referer, output } => {
+            if output.is_some() && urls.len() > 1 {
+                bail!("--output only makes sense for a single URL");
             }
-            if let Some(o) = output {
-                m = m.with_str(100, o);
+            // `referer` applies to the whole batch; `output` (a file name) is only meaningful
+            // for one URL. Both go through the single-URL path when given.
+            if referer.is_some() || output.is_some() {
+                let mut body = serde_json::json!({ "urls": urls });
+                if let Some(r) = referer {
+                    body["referer"] = serde_json::Value::String(r);
+                }
+                if let Some(o) = output {
+                    body["filename"] = serde_json::Value::String(o);
+                }
+                let v = api_post("/api/downloads/batch", body).await?;
+                report_batch(&v);
+            } else {
+                let v = api_post("/api/downloads/batch", serde_json::json!({ "urls": urls })).await?;
+                report_batch(&v);
             }
-            send_to_daemon(vec![m]).await?;
-            println!("queued");
+        }
+        Cmd::Import { file, dir } => {
+            let text = read_input(&file)?;
+            let urls = reidm_core::grabber::parse_url_list(&text);
+            if urls.is_empty() {
+                bail!("no http(s) URLs found in {file}");
+            }
+            println!("importing {} URL(s)", urls.len());
+            let mut body = serde_json::json!({ "urls": urls });
+            if let Some(d) = dir {
+                body["dir"] = serde_json::Value::String(d.to_string_lossy().into_owned());
+            }
+            let v = api_post("/api/downloads/batch", body).await?;
+            report_batch(&v);
+        }
+        Cmd::Export { file } => {
+            let path = default_data_dir().join("downloads.json");
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no downloads yet ({})", path.display()))?)?;
+            let mut urls: Vec<String> = v["items"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(_, it)| it["request"]["url"].as_str().map(str::to_string))
+                .collect();
+            urls.sort();
+            urls.dedup();
+            let text = reidm_core::grabber::url_list_text(&urls);
+            match file.as_str() {
+                "-" => print!("{text}"),
+                f => {
+                    std::fs::write(f, &text)?;
+                    println!("wrote {} URL(s) to {f}", urls.len());
+                }
+            }
+        }
+        Cmd::Grab { url, depth, types, same_host, include, exclude, sizes, export, add } => {
+            let mut opts = reidm_core::grabber::Options {
+                depth,
+                same_host_only: same_host,
+                include,
+                exclude,
+                sizes,
+                ..Default::default()
+            };
+            if let Some(t) = types {
+                opts.types = t.split(',').map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase()).filter(|s| !s.is_empty()).collect();
+            }
+            if opts.types.is_empty() {
+                opts.types = reidm_core::grabber::COMMON_TYPES.iter().map(|s| s.to_string()).collect();
+            }
+            eprintln!("scanning {url} …");
+            let files = reidm_core::grabber::grab_page(&url, &opts).await?;
+            if files.is_empty() {
+                println!("no downloadable files found");
+                return Ok(());
+            }
+            match export.as_deref() {
+                Some("-") | None => {
+                    for f in &files {
+                        match f.size {
+                            Some(sz) => println!("{:>12}  {}", human(sz), f.url),
+                            None => println!("{:>12}  {}", "-", f.url),
+                        }
+                    }
+                }
+                Some(path) => {
+                    let urls: Vec<String> = files.iter().map(|f| f.url.clone()).collect();
+                    std::fs::write(path, reidm_core::grabber::url_list_text(&urls))?;
+                    println!("wrote {} URL(s) to {path}", urls.len());
+                }
+            }
+            if add {
+                let urls: Vec<String> = files.iter().map(|f| f.url.clone()).collect();
+                println!("queueing {} file(s)…", urls.len());
+                let v = api_post("/api/downloads/batch", serde_json::json!({ "urls": urls })).await?;
+                report_batch(&v);
+            }
         }
         Cmd::List => {
             let path = default_data_dir().join("downloads.json");

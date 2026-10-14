@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+* **Batch downloads.** `Add URL` now takes a list, one per line; `reidm import <file>` reads one from
+  a text file or stdin, and `POST /api/downloads/batch` answers per URL so the caller can report
+  "8 queued, 2 resumed, 1 failed".
+* **A queue.** `max_concurrent` (default 4, settable in Options) caps how many downloads transfer at
+  once; the rest wait and start as slots free. Adding a hundred links no longer opens a hundred
+  connections.
+* **Resume by re-adding the link.** Queueing a URL that is already known resumes it instead of
+  creating a second copy: a paused or failed download carries on from where it stopped, and a
+  finished one is reported as already downloaded. URL identity ignores the fragment and sorts the
+  query, so `?b=2&a=1` and `?a=1&b=2` are the same download.
+* **Site grabber** (`reidm grab`, the Site Grabber window, `POST /api/grab`). Scans a page for files,
+  optionally follows links to a chosen depth, filters by extension, host and include/exclude
+  patterns, and can ask each server for the size. It reports when a page's links are built by
+  JavaScript rather than pretending it found none.
+* **Import and export.** URL lists in and out as plain text, from the File menu, the grabber window,
+  or `reidm import` / `reidm export`.
+* **reIDM's own browser extension** (`extension/`): MV3, takes over browser downloads by pausing
+  them and cancelling only once reIDM has accepted the URL, right-click entries for links, pages,
+  selections and media, and media sniffing through `webRequest` plus a page-side `fetch`/`XHR` hook.
+  It has its own `/ext/ping` and `/ext/add` endpoints, authorised by origin rather than by token.
+
+### Fixed
+
+* The scheduler hands a freed slot to a waiting download when one finishes, is removed, or the limit
+  is raised.
+* The grabber reads `Content-Length` from the header rather than `Response::content_length()`, which
+  reports the empty body of a HEAD response as zero.
+
 ## 0.2.2
 
 * The window checks for a new release **once shortly after it starts**, so a newer version is

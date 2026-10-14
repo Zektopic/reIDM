@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>reIDM options</title>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --mut:#6c6c6c; --line:#d8d8d8; --accent:#0a60c8; --ok:#2ea053; --err:#c02828; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#242427; --fg:#e6e6e6; --mut:#9a9a9a; --line:#3c3c3c; --accent:#2a84e0; } }
+  body { margin:0; padding:22px; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,"Segoe UI",sans-serif; }
+  main { max-width: 620px; margin: 0 auto; }
+  h1 { font-size: 17px; margin: 0 0 4px; display:flex; align-items:center; gap:9px; }
+  h1 img { width:22px; height:22px; }
+  .sub { color: var(--mut); font-size: 12px; margin-bottom: 20px; }
+  section { border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin-bottom:14px; }
+  section h2 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--mut); }
+  label.field { display:block; margin-bottom:12px; }
+  label.field span { display:block; color:var(--mut); font-size:12px; margin-bottom:4px; }
+  input[type=number], input[type=text], textarea {
+    width:100%; font:inherit; padding:7px 9px; border:1px solid var(--line);
+    border-radius:6px; background:transparent; color:var(--fg);
+  }
+  textarea { min-height:92px; resize:vertical; font-family: ui-monospace, monospace; font-size: 12px; }
+  .check { display:flex; align-items:flex-start; gap:9px; margin-bottom:12px; }
+  .check input { margin-top:3px; }
+  .check .t { font-weight:500; }
+  .check .d { color:var(--mut); font-size:12px; }
+  button { font:inherit; padding:7px 14px; border:1px solid var(--line); border-radius:6px; background:transparent; color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .row { display:flex; gap:10px; align-items:center; }
+  #status { margin-left:10px; font-size:13px; }
+  #status.ok { color: var(--ok); } #status.err { color: var(--err); }
+  code { background: rgba(128,128,128,.18); padding:1px 5px; border-radius:4px; font-size:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1><img src="icons/48.png" alt="">reIDM Integration</h1>
+  <div class="sub">Hands downloads and page media to the reIDM download manager. Independent of Tonec's IDM extension.</div>
+
+  <section>
+    <h2>Connection</h2>
+    <label class="field">
+      <span>reIDM port (the daemon's web API)</span>
+      <input type="number" id="port" min="1" max="65535" step="1">
+    </label>
+    <div class="row">
+      <button id="test">Test connection</button>
+      <span id="status"></span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Capture</h2>
+    <div class="check">
+      <input type="checkbox" id="capture">
+      <div>
+        <div class="t">Take over browser downloads</div>
+        <div class="d">When the browser starts saving a file, cancel it and hand the URL to reIDM instead.
+          Very small files may still finish before the extension can cancel them — that is a browser
+          limitation, not a setting.</div>
+      </div>
+    </div>
+    <div class="check">
+      <input type="checkbox" id="sniffMedia">
+      <div>
+        <div class="t">Look for video and audio</div>
+        <div class="d">Watches network requests for streams and media files (HLS/DASH manifests, mp4,
+          webm, audio) and lists them in the popup. Needs broad host permissions, which is why the
+          extension asks for them.</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Never capture</h2>
+    <label class="field">
+      <span>One URL prefix per line</span>
+      <textarea id="ignore" spellcheck="false"></textarea>
+    </label>
+  </section>
+
+  <div class="row">
+    <button class="primary" id="save">Save</button>
+    <span id="saved" style="color:var(--mut);font-size:13px"></span>
+  </div>
+
+  <p style="color:var(--mut);font-size:12px;margin-top:22px">
+    Requests to reIDM are made from the extension's service worker, so they carry a
+    <code>chrome-extension://</code> origin. reIDM accepts only extension origins and local
+    processes on that endpoint, which is what keeps ordinary web pages out.
+  </p>
+</main>
+<script src="options.js"></script>
+</body>
+</html>

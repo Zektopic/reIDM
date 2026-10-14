@@ -32,6 +32,15 @@ pub struct Snapshot {
     pub platform: String,
 }
 
+/// One line of a batch add's reply.
+#[derive(Debug, Clone)]
+pub struct BatchResult {
+    pub url: String,
+    /// `new`, `existing` or `already_complete`; `None` when the URL failed.
+    pub outcome: Option<String>,
+    pub error: Option<String>,
+}
+
 struct Sampled {
     downloaded: u64,
     at: Instant,
@@ -284,6 +293,52 @@ impl Api {
         }
     }
 
+    /// Queue many URLs. Returns one line per URL describing what happened.
+    pub fn add_batch(&self, urls: &[String]) -> Result<Vec<BatchResult>, String> {
+        let Some(t) = self.token() else { return Err("not connected to the download service".into()) };
+        let body = serde_json::json!({ "urls": urls });
+        let mut r = self
+            .agent
+            .post(format!("{}/api/downloads/batch", self.base))
+            .header("X-Reidm-Token", &t)
+            .header("Content-Type", "application/json")
+            .send(body.to_string())
+            .map_err(|e| e.to_string())?;
+        let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let out = v["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| BatchResult {
+                url: r["url"].as_str().unwrap_or_default().to_string(),
+                outcome: r["outcome"].as_str().map(str::to_string),
+                error: r["error"].as_str().map(str::to_string),
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// Scan a page on a worker thread. A scan is network-bound and can take many seconds, so
+    /// the result arrives over a channel rather than blocking a frame.
+    pub fn grab_async(&self, url: &str, opts: &crate::model::GrabOptions) -> std::sync::mpsc::Receiver<Result<Vec<crate::model::Found>, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let base = self.base.clone();
+        let token = self.token();
+        let url = url.to_string();
+        let opts = opts.clone();
+        std::thread::spawn(move || {
+            let agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(180)))
+                .build()
+                .new_agent();
+            let _ = tx.send(grab_with(&agent, &base, token.as_deref(), &url, &opts));
+        });
+        rx
+    }
+
+
+
     /// Open a URL in the user's browser (used for release notes and update downloads).
     pub fn open_url(&self, url: &str) {
         #[cfg(windows)]
@@ -317,6 +372,30 @@ impl Api {
             self.action(it.id, "pause");
         }
     }
+}
+
+fn grab_with(
+    agent: &ureq::Agent,
+    base: &str,
+    token: Option<&str>,
+    url: &str,
+    opts: &crate::model::GrabOptions,
+) -> Result<Vec<crate::model::Found>, String> {
+    let t = token.ok_or("not connected to the download service")?;
+    let body = serde_json::json!({ "url": url, "options": opts });
+    let mut r = agent
+        .post(format!("{base}/api/grab"))
+        .header("X-Reidm-Token", t)
+        .header("Content-Type", "application/json")
+        .send(body.to_string())
+        .map_err(|e| e.to_string())?;
+    let status = r.status();
+    let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(text);
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    serde_json::from_value(v["files"].clone()).map_err(|e| e.to_string())
 }
 
 /// `(owns the extension's default port, platform)`.
