@@ -8,6 +8,22 @@ pub struct Request {
     pub url: String,
     #[serde(default)]
     pub referer: Option<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
+/// One byte range of a download and how far it has got.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Segment {
+    pub start: u64,
+    /// Inclusive; `u64::MAX` when the length is unknown.
+    pub end: u64,
+    pub done: u64,
+    #[serde(default)]
+    pub finished: bool,
+    /// A connection is working on it right now.
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -54,9 +70,26 @@ pub struct Item {
     pub added: u64,
     #[serde(default)]
     pub last_try: Option<u64>,
+    #[serde(default)]
+    pub finished_at: Option<u64>,
+    #[serde(default)]
+    pub segments: Vec<Segment>,
+    #[serde(default)]
+    pub resumable: bool,
+    /// This download's own speed cap, bytes per second.
+    #[serde(default)]
+    pub speed_limit: Option<u64>,
+    /// In the scheduled queue (*Download Later*).
+    #[serde(default)]
+    pub scheduled: bool,
 }
 
 impl Item {
+    /// Connections transferring right now.
+    pub fn connections(&self) -> usize {
+        self.segments.iter().filter(|s| s.active).count()
+    }
+
     pub fn file_name(&self) -> String {
         self.path
             .file_name()
@@ -146,6 +179,78 @@ impl Category {
         *self == Category::All || item.category() == *self
     }
 
+}
+
+/// What the category tree selects: a file-type category, or one of IDM's status nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Category(Category),
+    Unfinished,
+    Finished,
+    /// The scheduled queue: everything added with *Download Later*.
+    Queue,
+}
+
+impl View {
+    pub fn matches(&self, it: &Item) -> bool {
+        match self {
+            View::Category(c) => c.matches(it),
+            View::Unfinished => it.status != Status::Done,
+            View::Finished => it.status == Status::Done,
+            View::Queue => it.scheduled,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            View::Category(c) => c.label(),
+            View::Unfinished => "Unfinished",
+            View::Finished => "Finished",
+            View::Queue => "Scheduled queue",
+        }
+    }
+}
+
+/// The daemon's schedule (`/api/settings`), mirrored.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct Schedule {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub start: Option<String>,
+    #[serde(default)]
+    pub stop: Option<String>,
+    /// Monday = 0 … Sunday = 6; empty means every day.
+    #[serde(default)]
+    pub days: Vec<u8>,
+}
+
+/// The daemon's settings, mirrored.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Settings {
+    #[serde(default)]
+    pub default_dir: String,
+    #[serde(default)]
+    pub connections: usize,
+    #[serde(default)]
+    pub max_concurrent: usize,
+    #[serde(default)]
+    pub speed_limit: u64,
+    #[serde(default)]
+    pub limit_enabled: bool,
+    #[serde(default)]
+    pub schedule: Schedule,
+}
+
+/// When reIDM's own browser extension last checked in.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ExtensionSeen {
+    #[serde(default)]
+    pub seconds_ago: u64,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub browser: String,
 }
 
 /// `1.4 GB`, `812 KB`, … (IDM shows decimal units, so we do too).

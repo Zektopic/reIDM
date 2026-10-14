@@ -4,13 +4,11 @@
 //! ports, so the GUI can be closed and downloads keep running. The GUI keeps a snapshot fresh on a
 //! background thread and sends commands over the same JSON API the web page uses.
 
-use crate::model::Item;
+use crate::model::{ExtensionSeen, Item, Settings, Status};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use crate::model::Status;
 
 /// Port the daemon serves its JSON API on (must match `reidm::web::UI_PORT`).
 pub const UI_PORT: u16 = 61002;
@@ -27,9 +25,24 @@ pub struct Snapshot {
     pub connected: bool,
     /// Set when a command failed, so the UI can show it.
     pub last_error: Option<String>,
-    /// Service capabilities, refreshed occasionally.
+    /// Refreshed every few seconds rather than on every poll.
+    pub service: Service,
+}
+
+/// The slower-changing half of the daemon's state.
+#[derive(Default, Clone)]
+pub struct Service {
+    /// Owns the port the official IDM extension dials first.
     pub idm_port: bool,
     pub platform: String,
+    pub version: String,
+    pub settings: Option<Settings>,
+    /// reIDM's own extension, if it has checked in since the daemon started.
+    pub extension: Option<ExtensionSeen>,
+    /// A download waiting for the browser to supply a new address.
+    pub refresh_armed: Option<u64>,
+    /// The folder to point the browser's "Load unpacked" at.
+    pub extension_dir: Option<String>,
 }
 
 /// One line of a batch add's reply.
@@ -41,10 +54,10 @@ pub struct BatchResult {
     pub error: Option<String>,
 }
 
-struct Sampled {
-    downloaded: u64,
-    at: Instant,
-}
+/// How far back the transfer rate looks. A single 300 ms poll interval is too short: a download
+/// held back by a speed limit, or a server that sends in bursts, would flicker between zero and
+/// double its real rate.
+const RATE_WINDOW: Duration = Duration::from_secs(3);
 
 pub struct Api {
     agent: ureq::Agent,
@@ -97,6 +110,13 @@ pub fn ensure_daemon() -> bool {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0000_0008 | 0x0800_0000); // DETACHED_PROCESS | CREATE_NO_WINDOW
     }
+    #[cfg(unix)]
+    {
+        // Its own process group, so closing a terminal that started the window does not take the
+        // service down with it.
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+    }
     if c.spawn().is_err() {
         return false;
     }
@@ -109,12 +129,17 @@ pub fn ensure_daemon() -> bool {
     false
 }
 
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        // Error statuses come back as responses, so the daemon's explanation can be shown.
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+}
+
 impl Api {
     pub fn start() -> Api {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .build()
-            .new_agent();
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -124,22 +149,19 @@ impl Api {
             let mut token = None;
             let base2 = base.clone();
             std::thread::spawn(move || {
-                let agent = ureq::Agent::config_builder()
-                    .timeout_global(Some(Duration::from_secs(5)))
-                    .build()
-                    .new_agent();
-                let mut prev: std::collections::HashMap<u64, Sampled> = Default::default();
-                let mut caps = (false, String::new());
+                let agent = agent(Duration::from_secs(5));
+                let mut history: std::collections::HashMap<u64, std::collections::VecDeque<(Instant, u64)>> = Default::default();
+                let mut service = Service::default();
                 let mut ticks: u64 = 0;
                 loop {
                     if token.is_none() {
                         token = read_token();
                     }
-                    // Capabilities change rarely, so refresh them about every 5 seconds.
-                    if ticks.is_multiple_of(16) {
+                    // Settings and integration status change rarely: refresh about every 3 s.
+                    if ticks.is_multiple_of(10) {
                         if let Some(t) = token.as_deref() {
-                            if let Some(c) = fetch_status(&agent, &base2, t) {
-                                caps = c;
+                            if let Some(s) = fetch_service(&agent, &base2, t) {
+                                service = s;
                             }
                         }
                     }
@@ -151,45 +173,36 @@ impl Api {
                                 let mut rates = std::collections::HashMap::new();
                                 let mut total = 0.0;
                                 for it in &items {
-                                    if it.status == Status::Running {
-                                        if let Some(p) = prev.get(&it.id) {
-                                            let dt = now.duration_since(p.at).as_secs_f64();
-                                            if dt > 0.05 && it.downloaded >= p.downloaded {
-                                                let r = (it.downloaded - p.downloaded) as f64 / dt;
-                                                rates.insert(it.id, r);
-                                                total += r;
-                                            }
+                                    let h = history.entry(it.id).or_default();
+                                    if it.status != Status::Running || h.back().is_some_and(|(_, d)| *d > it.downloaded) {
+                                        // Stopped, or restarted from zero: the old samples mean nothing now.
+                                        h.clear();
+                                    }
+                                    h.push_back((now, it.downloaded));
+                                    while h.len() > 2 && h.front().is_some_and(|(t, _)| now.duration_since(*t) > RATE_WINDOW) {
+                                        h.pop_front();
+                                    }
+                                    if let (Some((t0, d0)), true) = (h.front(), it.status == Status::Running) {
+                                        let dt = now.duration_since(*t0).as_secs_f64();
+                                        if dt > 0.25 {
+                                            let r = (it.downloaded - d0) as f64 / dt;
+                                            rates.insert(it.id, r);
+                                            total += r;
                                         }
                                     }
-                                    prev.insert(it.id, Sampled { downloaded: it.downloaded, at: now });
                                 }
-                                prev.retain(|id, _| items.iter().any(|i| i.id == *id));
-                                Snapshot {
-                                    items,
-                                    rates,
-                                    total_rate: total,
-                                    connected: true,
-                                    last_error: None,
-                                    idm_port: caps.0,
-                                    platform: caps.1.clone(),
-                                }
+                                history.retain(|id, _| items.iter().any(|i| i.id == *id));
+                                Snapshot { items, rates, total_rate: total, connected: true, last_error: None, service: service.clone() }
                             }
                             Err(e) => {
                                 token = None; // daemon restarted; its token is new
-                                Snapshot {
-                                    connected: false,
-                                    last_error: Some(e),
-                                    idm_port: caps.0,
-                                    platform: caps.1.clone(),
-                                    ..Default::default()
-                                }
+                                Snapshot { connected: false, last_error: Some(e), service: service.clone(), ..Default::default() }
                             }
                         },
                         None => Snapshot {
                             connected: false,
                             last_error: Some("waiting for the download service…".into()),
-                            idm_port: caps.0,
-                            platform: caps.1.clone(),
+                            service: service.clone(),
                             ..Default::default()
                         },
                     };
@@ -206,7 +219,7 @@ impl Api {
             })
         };
 
-        Api { agent, base, token: Mutex::new(None), snapshot, rx, _poller: poller }
+        Api { agent: agent(Duration::from_secs(10)), base, token: Mutex::new(None), snapshot, rx, _poller: poller }
     }
 
     /// Non-blocking: returns the newest snapshot if the poller produced one.
@@ -236,18 +249,29 @@ impl Api {
         }
     }
 
-    pub fn add(&self, url: &str, filename: Option<String>) {
-        let Some(t) = self.token() else { return self.note_error("not connected to the download service".into()) };
-        let body = serde_json::json!({ "url": url, "filename": filename });
-        let r = self
+    /// POST JSON; `Ok(body)` on success, the daemon's explanation otherwise.
+    fn post(&self, path: &str, body: serde_json::Value) -> Result<String, String> {
+        let t = self.token().ok_or("not connected to the download service")?;
+        let mut r = self
             .agent
-            .post(format!("{}/api/downloads", self.base))
+            .post(format!("{}{path}", self.base))
             .header("X-Reidm-Token", &t)
             .header("Content-Type", "application/json")
-            .send(body.to_string());
-        if let Err(e) = r {
-            self.note_error(format!("could not add the download: {e}"));
+            .send(body.to_string())
+            .map_err(|e| e.to_string())?;
+        let ok = r.status().is_success();
+        let text = r.body_mut().read_to_string().unwrap_or_default();
+        if ok {
+            Ok(text)
+        } else {
+            Err(if text.trim().is_empty() { format!("HTTP {}", r.status()) } else { text })
         }
+    }
+
+    /// Queue one download. `later` adds it to the scheduled queue without starting it.
+    pub fn add(&self, url: &str, filename: Option<String>, dir: Option<String>, later: bool) -> Result<(), String> {
+        let body = serde_json::json!({ "url": url, "filename": filename, "dir": dir, "later": later });
+        self.post("/api/downloads", body).map(|_| ())
     }
 
     pub fn action(&self, id: u64, what: &str) {
@@ -257,9 +281,19 @@ impl Api {
             .post(format!("{}/api/downloads/{id}/{what}", self.base))
             .header("X-Reidm-Token", &t)
             .send("");
-        if let Err(e) = r {
-            self.note_error(format!("{what} failed: {e}"));
+        match r {
+            Ok(mut r) if !r.status().is_success() => {
+                let text = r.body_mut().read_to_string().unwrap_or_default();
+                self.note_error(format!("{what} failed: {text}"));
+            }
+            Err(e) => self.note_error(format!("{what} failed: {e}")),
+            _ => {}
         }
+    }
+
+    /// Like [`Api::action`], but reports the daemon's answer.
+    pub fn try_action(&self, id: u64, what: &str) -> Result<(), String> {
+        self.post(&format!("/api/downloads/{id}/{what}"), serde_json::json!({})).map(|_| ())
     }
 
     pub fn remove(&self, id: u64, purge: bool) {
@@ -271,42 +305,32 @@ impl Api {
         }
     }
 
-    /// `(download folder, connections per download)`, or `None` if the daemon is unreachable.
-    pub fn fetch_settings(&self) -> Option<(String, usize)> {
+    /// The daemon's settings, fetched now.
+    pub fn fetch_settings(&self) -> Option<Settings> {
         let t = self.token()?;
         let mut r = self.agent.get(format!("{}/api/settings", self.base)).header("X-Reidm-Token", &t).call().ok()?;
-        let v: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()?;
-        Some((v["default_dir"].as_str()?.to_string(), v["connections"].as_u64()? as usize))
+        serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()
     }
 
-    pub fn set_settings(&self, dir: &str, connections: usize) {
-        let Some(t) = self.token() else { return };
-        let body = serde_json::json!({ "default_dir": dir, "connections": connections });
-        if let Err(e) = self
-            .agent
-            .post(format!("{}/api/settings", self.base))
-            .header("X-Reidm-Token", &t)
-            .header("Content-Type", "application/json")
-            .send(body.to_string())
-        {
-            self.note_error(format!("could not save options: {e}"));
-        }
+    /// A partial settings update: only the fields present in `patch` change.
+    pub fn update_settings(&self, patch: serde_json::Value) -> Result<(), String> {
+        self.post("/api/settings", patch).map(|_| ())
     }
 
     /// Queue many URLs. Returns one line per URL describing what happened.
-    pub fn add_batch(&self, urls: &[String]) -> Result<Vec<BatchResult>, String> {
-        let Some(t) = self.token() else { return Err("not connected to the download service".into()) };
-        let body = serde_json::json!({ "urls": urls });
-        let mut r = self
-            .agent
-            .post(format!("{}/api/downloads/batch", self.base))
-            .header("X-Reidm-Token", &t)
-            .header("Content-Type", "application/json")
-            .send(body.to_string())
-            .map_err(|e| e.to_string())?;
-        let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    pub fn add_batch(&self, urls: &[String], later: bool) -> Result<Vec<BatchResult>, String> {
+        self.batch(serde_json::json!({ "urls": urls, "later": later }))
+    }
+
+    /// Queue entries that carry their own referer/cookie/user agent (an `.ef2` import).
+    pub fn add_entries(&self, entries: &[reidm_core::lists::Entry], later: bool) -> Result<Vec<BatchResult>, String> {
+        self.batch(serde_json::json!({ "items": entries, "later": later }))
+    }
+
+    fn batch(&self, body: serde_json::Value) -> Result<Vec<BatchResult>, String> {
+        let text = self.post("/api/downloads/batch", body)?;
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let out = v["results"]
+        Ok(v["results"]
             .as_array()
             .into_iter()
             .flatten()
@@ -315,8 +339,65 @@ impl Api {
                 outcome: r["outcome"].as_str().map(str::to_string),
                 error: r["error"].as_str().map(str::to_string),
             })
-            .collect();
-        Ok(out)
+            .collect())
+    }
+
+    /// Cap one download (bytes per second), or lift its cap with `None`.
+    pub fn set_limit(&self, id: u64, limit: Option<u64>) -> Result<(), String> {
+        self.post(&format!("/api/downloads/{id}/limit"), serde_json::json!({ "limit": limit })).map(|_| ())
+    }
+
+    /// Start or stop the scheduled queue; returns how many downloads it touched.
+    pub fn queue(&self, start: bool) -> Result<u64, String> {
+        let text = self.post(&format!("/api/queue/{}", if start { "start" } else { "stop" }), serde_json::json!({}))?;
+        Ok(serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v["count"].as_u64()).unwrap_or(0))
+    }
+
+    pub fn cancel_refresh(&self) {
+        let _ = self.post("/api/refresh-capture/cancel", serde_json::json!({}));
+    }
+
+    /// The whole list as `ef2` or `txt`.
+    pub fn export(&self, format: &str) -> Result<String, String> {
+        let t = self.token().ok_or("not connected to the download service")?;
+        let mut r = self
+            .agent
+            .get(format!("{}/api/export?format={format}", self.base))
+            .header("X-Reidm-Token", &t)
+            .call()
+            .map_err(|e| e.to_string())?;
+        let ok = r.status().is_success();
+        let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+        if ok {
+            Ok(text)
+        } else {
+            Err(text)
+        }
+    }
+
+    /// Point a download at a new address. It checks the new address first, which takes a
+    /// network round trip, so the answer arrives over a channel.
+    pub fn refresh_async(&self, id: u64, url: &str) -> Receiver<Result<(), String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (base, token, url) = (self.base.clone(), self.token(), url.to_string());
+        std::thread::spawn(move || {
+            let r = (|| {
+                let t = token.ok_or("not connected to the download service")?;
+                let mut r = agent(Duration::from_secs(60))
+                    .post(format!("{base}/api/downloads/{id}/refresh"))
+                    .header("X-Reidm-Token", &t)
+                    .header("Content-Type", "application/json")
+                    .send(serde_json::json!({ "url": url }).to_string())
+                    .map_err(|e| e.to_string())?;
+                if r.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(r.body_mut().read_to_string().unwrap_or_default())
+                }
+            })();
+            let _ = tx.send(r);
+        });
+        rx
     }
 
     /// Scan a page on a worker thread. A scan is network-bound and can take many seconds, so
@@ -328,42 +409,14 @@ impl Api {
         let url = url.to_string();
         let opts = opts.clone();
         std::thread::spawn(move || {
-            let agent = ureq::Agent::config_builder()
-                .timeout_global(Some(Duration::from_secs(180)))
-                .build()
-                .new_agent();
-            let _ = tx.send(grab_with(&agent, &base, token.as_deref(), &url, &opts));
+            let _ = tx.send(grab_with(&agent(Duration::from_secs(180)), &base, token.as_deref(), &url, &opts));
         });
         rx
     }
 
-
-
     /// Open a URL in the user's browser (used for release notes and update downloads).
     pub fn open_url(&self, url: &str) {
-        #[cfg(windows)]
-        let mut c = {
-            let mut c = std::process::Command::new("rundll32");
-            c.args(["url.dll,FileProtocolHandler", url]);
-            c
-        };
-        #[cfg(target_os = "macos")]
-        let mut c = {
-            let mut c = std::process::Command::new("open");
-            c.arg(url);
-            c
-        };
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let mut c = {
-            let mut c = std::process::Command::new("xdg-open");
-            c.arg(url);
-            c
-        };
-        let _ = c
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+        open_external(url);
     }
 
     /// Pause every active download.
@@ -372,6 +425,33 @@ impl Api {
             self.action(it.id, "pause");
         }
     }
+}
+
+/// Hand a URL or a folder to the desktop: the browser for a link, the file manager for a path.
+pub fn open_external(target: &str) {
+    #[cfg(windows)]
+    let mut c = {
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", target]);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut c = {
+        let mut c = std::process::Command::new("open");
+        c.arg(target);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut c = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(target);
+        c
+    };
+    let _ = c
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn grab_with(
@@ -398,11 +478,25 @@ fn grab_with(
     serde_json::from_value(v["files"].clone()).map_err(|e| e.to_string())
 }
 
-/// `(owns the extension's default port, platform)`.
-fn fetch_status(agent: &ureq::Agent, base: &str, token: &str) -> Option<(bool, String)> {
-    let mut r = agent.get(format!("{base}/api/status")).header("X-Reidm-Token", token).call().ok()?;
-    let v: serde_json::Value = serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()?;
-    Some((v["idm_port"].as_bool()?, v["platform"].as_str().unwrap_or_default().to_string()))
+/// Status and settings in one go.
+fn fetch_service(agent: &ureq::Agent, base: &str, token: &str) -> Option<Service> {
+    let get = |path: &str| -> Option<serde_json::Value> {
+        let mut r = agent.get(format!("{base}{path}")).header("X-Reidm-Token", token).call().ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()
+    };
+    let v = get("/api/status")?;
+    Some(Service {
+        idm_port: v["idm_port"].as_bool().unwrap_or(false),
+        platform: v["platform"].as_str().unwrap_or_default().to_string(),
+        version: v["version"].as_str().unwrap_or_default().to_string(),
+        extension: serde_json::from_value(v["extension"].clone()).ok(),
+        refresh_armed: v["refresh_armed"].as_u64(),
+        extension_dir: v["extension_dir"].as_str().map(str::to_string),
+        settings: get("/api/settings").and_then(|s| serde_json::from_value(s).ok()),
+    })
 }
 
 fn fetch(agent: &ureq::Agent, base: &str, token: &str) -> Result<Vec<Item>, String> {
@@ -411,6 +505,9 @@ fn fetch(agent: &ureq::Agent, base: &str, token: &str) -> Result<Vec<Item>, Stri
         .header("X-Reidm-Token", token)
         .call()
         .map_err(|e| e.to_string())?;
+    if !r.status().is_success() {
+        return Err(format!("HTTP {}", r.status()));
+    }
     let body = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
     serde_json::from_str(&body).map_err(|e| e.to_string())
 }
