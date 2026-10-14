@@ -1,0 +1,9 @@
+{
+  "name": "com.zektopic.reidm",
+  "description": "Starts reIDM for the reIDM browser extension",
+  "type": "stdio",
+  "path": "/usr/bin/reidm-host",
+  "allowed_origins": [
+    "chrome-extension://pgeonmdaagbiccimgojpafdjcipcfnlc/"
+  ]
+}

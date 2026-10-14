@@ -24,8 +24,12 @@ jobs:
       - run: cargo build --release --locked
       - run: cargo install cargo-deb --locked --version 2.7.0
       - run: cargo deb -p reidm --no-build --output dist/
+      - name: Browser extension zip
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          (cd extension && zip -r -X "../dist/reidm-extension-$V.zip" .)
       - uses: actions/upload-artifact@v4
-        with: { name: deb, path: dist/*.deb }
+        with: { name: deb, path: "dist/*" }
 
   windows-exe:
     runs-on: windows-2022
@@ -109,12 +113,13 @@ jobs:
           ls -la dist
           gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" \
             --title "reIDM ${{ github.ref_name }}" --notes-file - <<'EON'
-          Cross-platform Rust download manager with a native desktop app, speaking the IDM browser-extension protocol.
+A cross-platform download manager that takes over your browser's downloads. See CHANGELOG.md for what is new.
 
-          * `reIDM-setup-*.exe` – Windows installer (registers the native host, starts the daemon at login)
-          * `reidm_*_amd64.deb` – Debian/Ubuntu (desktop entry, system-wide native-host manifests, systemd user unit)
-          * `reIDM-*-universal.dmg` – macOS app bundle (Intel + Apple silicon; unsigned, see README for Gatekeeper)
+          * `reIDM-setup-*.exe` – Windows installer (the app, the browser extension, native hosts, start at login)
+          * `reidm_*_amd64.deb` – Debian/Ubuntu (desktop entry, the browser extension, native hosts, systemd user unit)
+          * `reIDM-*-universal.dmg` – macOS app bundle (Intel + Apple silicon; ad-hoc signed unless a Developer ID is configured)
+          * `reidm-extension-*.zip` – the browser extension on its own, for Chrome, Edge, Brave, Vivaldi and Opera
 
+          Install the app, then load the extension once: open the reIDM window and choose Help › Browser integration.
           The window is a front-end for the background service, so downloads keep running when it is closed.
-          Read docs/EXTENSION.md: the official extension only runs unmodified on Windows.
           EON

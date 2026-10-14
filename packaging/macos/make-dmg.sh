@@ -40,14 +40,27 @@ done
 echo "code signatures:"
 codesign -dv "$APP/Contents/MacOS/reidm-gui" 2>&1 | grep -E "^Identifier|^Signature|^TeamIdentifier" || true
 
-# Icon: assemble an .icns from the PNGs we ship.
+# Icon: assemble an .icns from the PNGs we ship. Each slot gets the size drawn for it rather
+# than a resampled large one: the small sizes are drawn differently (bolder arrow, no letters).
 ICONSET=$(mktemp -d)/reidm.iconset
 mkdir -p "$ICONSET"
-for s in 16 32 128 256 512; do
-  sips -z $s $s "$ROOT/packaging/icon/reidm-512.png" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
-  sips -z $((s*2)) $((s*2)) "$ROOT/packaging/icon/reidm-512.png" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
-done
+I="$ROOT/packaging/icon"
+cp "$I/reidm-16.png"   "$ICONSET/icon_16x16.png"
+cp "$I/reidm-32.png"   "$ICONSET/icon_16x16@2x.png"
+cp "$I/reidm-32.png"   "$ICONSET/icon_32x32.png"
+cp "$I/reidm-64.png"   "$ICONSET/icon_32x32@2x.png"
+cp "$I/reidm-128.png"  "$ICONSET/icon_128x128.png"
+cp "$I/reidm-256.png"  "$ICONSET/icon_128x128@2x.png"
+cp "$I/reidm-256.png"  "$ICONSET/icon_256x256.png"
+cp "$I/reidm-512.png"  "$ICONSET/icon_256x256@2x.png"
+cp "$I/reidm-512.png"  "$ICONSET/icon_512x512.png"
+cp "$I/reidm-1024.png" "$ICONSET/icon_512x512@2x.png"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/reIDM.icns"
+
+# reIDM's browser extension. The daemon finds it here (next to the app binary, in Resources)
+# and keeps a copy the browser can load in ~/Library/Application Support.
+cp -R "$ROOT/extension" "$APP/Contents/Resources/extension"
+cp -R "$ROOT/extension" "$STAGE/browser-extension"
 
 cat > "$APP/Contents/Info.plist" <<EOP
 <?xml version="1.0" encoding="UTF-8"?>
@@ -66,7 +79,8 @@ cat > "$APP/Contents/Info.plist" <<EOP
 </dict></plist>
 EOP
 
-cp "$ROOT/README.md" "$STAGE/README.md"; cp "$ROOT/docs/EXTENSION.md" "$STAGE/EXTENSION.md"; cp "$ROOT/CHANGELOG.md" "$STAGE/CHANGELOG.md"; cp "$ROOT/docs/PACKAGING.md" "$STAGE/PACKAGING.md"
+cp "$ROOT/README.md" "$STAGE/README.md"; cp "$ROOT/CHANGELOG.md" "$STAGE/CHANGELOG.md"
+mkdir -p "$STAGE/docs"; cp "$ROOT"/docs/*.md "$STAGE/docs/"
 
 cat > "$STAGE/Install reIDM.command" <<'EOS'
 #!/usr/bin/env bash
@@ -75,6 +89,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 DEST="$HOME/.local/bin"; mkdir -p "$DEST"
 cp bin/reidm bin/reidm-host "$DEST/"
+# The daemon in ~/.local/bin looks for the extension in ../share/reidm/extension.
+mkdir -p "$HOME/.local/share/reidm"; rm -rf "$HOME/.local/share/reidm/extension"
+cp -R browser-extension "$HOME/.local/share/reidm/extension"
 # Keep the daemon beside the app too, so the window can start it itself.
 cp bin/reidm "reIDM.app/Contents/MacOS/reidm"
 xattr -dr com.apple.quarantine reIDM.app "$DEST/reidm" "$DEST/reidm-host" 2>/dev/null || true
@@ -96,6 +113,7 @@ echo
 echo "reIDM installed."
 echo "  * Drag reIDM.app to /Applications to keep it."
 echo "  * Add \$HOME/.local/bin to PATH to use the 'reidm' command."
+echo "  * Browser: load the extension once — see Help > Browser integration in the reIDM window."
 EOS
 chmod 755 "$STAGE/Install reIDM.command"
 

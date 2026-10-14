@@ -199,7 +199,13 @@ pub fn ensure_reidm_host() -> Result<Vec<String>> {
         }
         for (browser, base) in WINDOWS_BROWSERS {
             let key = format!(r"{base}\{REIDM_HOST_NAME}");
-            if reg_default_value(&key).as_deref() != Some(&*file.to_string_lossy()) && reg_set_default(&key, &file) {
+            // The installer registers its own manifest; leave any registration that already
+            // leads to this host, so the two do not take turns rewriting the key.
+            let current = reg_default_value(&key);
+            if current.as_deref().is_some_and(|m| manifest_points_at(Path::new(m), &host)) {
+                continue;
+            }
+            if reg_set_default(&key, &file) {
                 changed.push(format!("{browser}: registered {REIDM_HOST_NAME}"));
             }
         }
@@ -216,6 +222,23 @@ pub fn ensure_reidm_host() -> Result<Vec<String>> {
         }
     }
     Ok(changed)
+}
+
+/// Does the host manifest at `manifest` name `host`? A relative `path` is relative to the
+/// manifest's own folder, which is how the Windows installer writes it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn manifest_points_at(manifest: &Path, host: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(manifest) else { return false };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+    let Some(p) = v["path"].as_str() else { return false };
+    let p = Path::new(p);
+    let p = if p.is_absolute() { p.to_path_buf() } else { manifest.parent().unwrap_or(Path::new(".")).join(p) };
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let origin_ok = v["allowed_origins"].as_array().is_some_and(|o| o.iter().any(|x| x.as_str() == Some(&format!("chrome-extension://{REIDM_EXTENSION_ID}/"))));
+    origin_ok && same(&p, host)
 }
 
 pub fn uninstall() -> Result<()> {
@@ -339,6 +362,23 @@ mod tests {
         assert_eq!(std::fs::read(dst.join("manifest.json")).unwrap(), b"{\"v\":2}");
         assert!(!dst.join("stale.js").exists());
         assert!(dst.join("icons/16.png").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_relative_host_path_is_resolved_against_the_manifest() {
+        let root = std::env::temp_dir().join(format!("reidm-mf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let host = root.join("reidm-host");
+        std::fs::write(&host, b"").unwrap();
+        let mf = root.join("m.json");
+        let mut m = reidm_manifest(Path::new("reidm-host"));
+        std::fs::write(&mf, serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(manifest_points_at(&mf, &host));
+        m["allowed_origins"] = serde_json::json!(["chrome-extension://someoneelse/"]);
+        std::fs::write(&mf, serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(!manifest_points_at(&mf, &host), "a manifest for another extension does not count");
         let _ = std::fs::remove_dir_all(&root);
     }
 
