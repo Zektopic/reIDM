@@ -497,6 +497,7 @@ async fn main() -> Result<()> {
                                     referer: it["request"]["referer"].as_str().map(str::to_string),
                                     cookie: None,
                                     user_agent: it["request"]["user_agent"].as_str().map(str::to_string),
+                                    post_data: None,
                                 })
                             })
                             .collect();

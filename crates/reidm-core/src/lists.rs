@@ -14,10 +14,12 @@
 //! ```
 //!
 //! with CRLF line ends. This follows IDM's own reader (`CUrlExporter::ReadFromIEFFile` in
-//! `IDMan.exe`): a record opens with `<`, closes at `\r\n>\r\n`, the first line is the address,
-//! and `referer: `, `cookie: ` and `User-Agent: ` are looked for by name. Fields IDM writes that
-//! reIDM has no use for are skipped, and the reader here also accepts bare `\n` line ends,
-//! because a file that has been through a text editor or `git` often has them.
+//! `IDMan.exe`): a record opens with `<\r\n`, closes at `\r\n>\r\n`, the first line is the
+//! address, and `referer: `, `cookie: `, `pd: ` and `User-Agent: ` are looked for by name — the
+//! tag strings are read straight from the binary's data section. `pd: ` is the body of a form
+//! submission: such a download is a POST, which reIDM cannot repeat, so it is kept apart rather
+//! than fetched with a GET that would get some other answer. The reader also accepts bare `\n`
+//! line ends, because a file that has been through a text editor or `git` often has them.
 //!
 //! ## Batch patterns
 //!
@@ -38,6 +40,10 @@ pub struct Entry {
     pub cookie: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// The request body of a download that came from a form (`pd: `). Its presence means the
+    /// download needs a POST.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_data: Option<String>,
 }
 
 /// Does this text look like an `.ef2` file rather than a plain list of URLs?
@@ -82,7 +88,7 @@ fn entry_from(lines: &[&str]) -> Option<Entry> {
             }
         })
     };
-    Some(Entry { referer: field("referer:"), cookie: field("cookie:"), user_agent: field("User-Agent:"), url })
+    Some(Entry { referer: field("referer:"), cookie: field("cookie:"), user_agent: field("User-Agent:"), post_data: field("pd:"), url })
 }
 
 /// Write records the way IDM does, so the file imports back into IDM as well as into reIDM.
@@ -181,10 +187,18 @@ mod tests {
 
     #[test]
     fn tolerates_lf_unknown_fields_and_junk() {
-        let text = "junk before\n<\nhttps://x.example/f.bin\npd: something\nREFERER: https://x.example/\n>\n<\nnot a url\n>\n";
+        let text = "junk before\n<\nhttps://x.example/f.bin\nx-unknown: something\nREFERER: https://x.example/\n>\n<\nnot a url\n>\n";
         let v = parse_ef2(text);
         assert_eq!(v.len(), 1, "the record without an address is skipped");
         assert_eq!(v[0].referer.as_deref(), Some("https://x.example/"));
+        assert_eq!(v[0].post_data, None);
+    }
+
+    #[test]
+    fn a_form_download_keeps_its_post_body() {
+        let text = "<\r\nhttps://x.example/export\r\npd: q=1&format=csv\r\n>\r\n";
+        let v = parse_ef2(text);
+        assert_eq!(v[0].post_data.as_deref(), Some("q=1&format=csv"));
     }
 
     #[test]

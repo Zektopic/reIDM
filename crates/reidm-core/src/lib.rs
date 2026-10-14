@@ -857,29 +857,37 @@ impl Manager {
     /// Start as many queued downloads as the concurrency limit allows.
     ///
     /// Called after anything that changes what is running: a new download, a pause, a removal, or
-    /// a transfer finishing.
+    /// a transfer finishing — often from several threads at once. A download is therefore marked
+    /// live under the same locks that chose it: choosing under the lock and marking it live
+    /// afterwards let two concurrent calls both pick the same download and run it twice, two
+    /// transfers writing one part file until one renamed it away from under the other.
     pub fn pump(&self) {
         let limit = self.0.settings.lock().unwrap().max_concurrent.max(1);
         let mut to_start = Vec::new();
         {
             // db before live, like every other lock site in this type.
-            let mut db = self.0.db.lock().unwrap();
-            let live = self.0.live.lock().unwrap();
+            let db = self.0.db.lock().unwrap();
+            let mut live = self.0.live.lock().unwrap();
             let free = limit.saturating_sub(live.len());
-            if free > 0 {
-                for it in db.items.values_mut() {
-                    if to_start.len() >= free {
-                        break;
-                    }
-                    // A queued item that is not live is exactly one that is waiting for a slot.
-                    if it.status == Status::Queued && !live.contains_key(&it.id) {
-                        to_start.push(it.id);
-                    }
+            for it in db.items.values() {
+                if to_start.len() >= free {
+                    break;
+                }
+                // A queued item that is not live is exactly one that is waiting for a slot.
+                if it.status == Status::Queued && !live.contains_key(&it.id) {
+                    let l = Live {
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        progress: Arc::new(AtomicU64::new(it.downloaded)),
+                        plan: Arc::new(Mutex::new(Plan::default())),
+                        limiter: Arc::new(Limiter::new(it.speed_limit.unwrap_or(0))),
+                    };
+                    live.insert(it.id, l.clone());
+                    to_start.push((it.id, l));
                 }
             }
         }
-        for id in to_start {
-            self.start(id);
+        for (id, live) in to_start {
+            self.launch(id, live);
         }
     }
 
@@ -1174,15 +1182,8 @@ impl Manager {
         Ok(())
     }
 
-    fn start(&self, id: u64) {
-        let (downloaded, limit) = self.0.db.lock().unwrap().items.get(&id).map_or((0, None), |i| (i.downloaded, i.speed_limit));
-        let live = Live {
-            cancel: Arc::new(AtomicBool::new(false)),
-            progress: Arc::new(AtomicU64::new(downloaded)),
-            plan: Arc::new(Mutex::new(Plan::default())),
-            limiter: Arc::new(Limiter::new(limit.unwrap_or(0))),
-        };
-        self.0.live.lock().unwrap().insert(id, live.clone());
+    /// Run a download whose slot [`Manager::pump`] has already reserved in `live`.
+    fn launch(&self, id: u64, live: Live) {
         let me = self.clone();
         tokio::spawn(async move {
             me.set_status(id, Status::Running);

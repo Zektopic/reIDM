@@ -270,6 +270,7 @@ async fn export(State(app): State<App>, h: HeaderMap, Query(q): Query<ExportQuer
                     referer: i.request.referer.clone(),
                     cookie: None,
                     user_agent: i.request.user_agent.clone(),
+                    post_data: None,
                 })
                 .collect();
             reidm_core::lists::write_ef2(&entries)
@@ -535,7 +536,10 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
             ..Default::default()
         })
         .collect();
-    reqs.extend(b.items.into_iter().filter(|e| !e.url.trim().is_empty()).map(|e| Request {
+    // A download that came from a form needs its POST body sent again, which reIDM's engine does
+    // not do; fetching the address with a GET instead would quietly save some other response.
+    let (posts, items): (Vec<_>, Vec<_>) = b.items.into_iter().partition(|e| e.post_data.is_some());
+    reqs.extend(items.into_iter().filter(|e| !e.url.trim().is_empty()).map(|e| Request {
         url: e.url.trim().to_string(),
         dir: dir.clone(),
         referer: e.referer.or_else(|| b.referer.clone()),
@@ -543,7 +547,7 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
         user_agent: e.user_agent,
         filename: if single { b.filename.clone() } else { None },
     }));
-    let results: Vec<serde_json::Value> = app
+    let mut results: Vec<serde_json::Value> = app
         .mgr
         .add_many_with(reqs, AddOptions { later: b.later, ..Default::default() })
         .into_iter()
@@ -552,6 +556,9 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
             Err(e) => serde_json::json!({ "url": url, "error": format!("{e:#}") }),
         })
         .collect();
+    results.extend(posts.into_iter().map(|e| {
+        serde_json::json!({ "url": e.url, "error": "this download came from a form (POST), which reIDM cannot repeat; start it from the page in the browser" })
+    }));
     Json(serde_json::json!({ "results": results })).into_response()
 }
 
