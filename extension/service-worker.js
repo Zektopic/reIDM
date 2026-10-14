@@ -208,8 +208,144 @@ function badge(text, color, clearAfterMs) {
 const MEDIA_EXT = /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|flv|ts|mp3|m4a|flac|ogg|opus|wav|aac)(\?|#|$)/i;
 const MANIFEST_EXT = /\.(m3u8|mpd)(\?|#|$)/i;
 
-/** tabId -> Map(url -> {url, kind, at}) */
+/** tabId -> Map(url -> {url, kind, at, formats?}) */
 const mediaByTab = new Map();
+
+// ── surviving the worker being torn down ────────────────────────────────
+//
+// An MV3 service worker is stopped whenever Chrome feels like it, and every module-scope
+// variable goes with it. Without this, the variants parsed out of a manifest disappear the
+// moment the worker idles, and the popup would come back empty on a page that is still
+// playing. `chrome.storage.session` is the right home: it lives as long as the browser
+// session, which is exactly the lifetime of "a page that is still open".
+
+const MEDIA_KEY = 'reidm-media-by-tab';
+let persistTimer = null;
+
+function persistMedia() {
+  // Every network request would otherwise rewrite the whole map.
+  if (persistTimer) return;
+  persistTimer = setTimeout(async () => {
+    persistTimer = null;
+    try {
+      const obj = {};
+      for (const [tab, map] of mediaByTab) obj[tab] = [...map.values()];
+      await chrome.storage.session.set({ [MEDIA_KEY]: obj });
+    } catch {
+      /* storage unavailable; the in-memory map still works for this worker's lifetime */
+    }
+  }, 250);
+}
+
+async function restoreMedia() {
+  try {
+    const o = (await chrome.storage.session.get(MEDIA_KEY))[MEDIA_KEY] || {};
+    for (const [tab, list] of Object.entries(o)) {
+      if (!mediaByTab.has(Number(tab))) {
+        mediaByTab.set(Number(tab), new Map(list.map((e) => [e.url, e])));
+      }
+    }
+  } catch {
+    /* nothing to restore */
+  }
+}
+
+/** Resolves once the stored map is back. Every reader must await this: a worker that has just
+ *  been woken starts handling messages immediately, and reading `mediaByTab` before the
+ *  restore lands would report an empty list for a page that is plainly playing video. */
+const mediaReady = restoreMedia();
+
+// ── manifest parsing, in the worker ─────────────────────────────────────
+//
+// The MAIN-world hook also parses manifests, but it can lose a race: a page that fetches its
+// manifest from an inline <script> does so before the injected hook has finished loading, and
+// the request is then invisible to it. `webRequest` sees the request regardless of what the
+// page did, so the worker re-fetches the manifest itself (it has host permissions) and parses
+// it here. That is the authoritative source; the hook's copy is a fallback for anything the
+// worker cannot re-fetch (a POST-only or signed URL).
+
+function codecNames(codecs) {
+  const c = String(codecs || '').toLowerCase();
+  return {
+    video: c.includes('av01') ? 'AV1'
+      : c.includes('vp9') || c.includes('vp09') ? 'VP9'
+      : c.includes('avc1') || c.includes('h264') ? 'H.264'
+      : c.includes('hev1') || c.includes('hvc1') ? 'H.265' : null,
+    audio: c.includes('opus') ? 'Opus' : c.includes('mp4a') ? 'AAC' : null,
+  };
+}
+
+function parseHLS(body, baseUrl) {
+  const out = [];
+  const lines = body.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+    const res = /RESOLUTION=(\d+)x(\d+)/i.exec(line);
+    const bw = /BANDWIDTH=(\d+)/i.exec(line);
+    const codecs = /CODECS="([^"]+)"/i.exec(line);
+    const name = /NAME="([^"]+)"/i.exec(line);
+    let uri = null;
+    for (let k = i + 1; k < lines.length; k++) {
+      const t = lines[k].trim();
+      if (t && !t.startsWith('#')) { uri = t; break; }
+    }
+    const n = codecNames(codecs && codecs[1]);
+    out.push({
+      quality: name ? name[1] : res ? `${res[2]}p` : null,
+      width: res ? Number(res[1]) : null,
+      height: res ? Number(res[2]) : null,
+      bitrate: bw ? Number(bw[1]) : null,
+      videoCodec: n.video,
+      audioCodec: n.audio,
+      codecs: codecs ? codecs[1] : null,
+      url: uri ? new URL(uri, baseUrl).href : null,
+      kind: 'hls-variant',
+    });
+  }
+  return out;
+}
+
+function parseDASH(body, baseUrl) {
+  const out = [];
+  const re = /<Representation\b([^>]*)>([\s\S]*?)<\/Representation>/gi;
+  let m;
+  while ((m = re.exec(body))) {
+    const attr = (n) => {
+      const r = new RegExp(`${n}="([^"]*)"`, 'i').exec(m[1]);
+      return r ? r[1] : null;
+    };
+    const base = /<BaseURL>([^<]+)<\/BaseURL>/i.exec(m[2]);
+    const n = codecNames(attr('codecs'));
+    out.push({
+      quality: attr('height') ? `${attr('height')}p` : attr('id'),
+      width: attr('width') ? Number(attr('width')) : null,
+      height: attr('height') ? Number(attr('height')) : null,
+      bitrate: attr('bandwidth') ? Number(attr('bandwidth')) : null,
+      mime: attr('mimeType'),
+      codecs: attr('codecs'),
+      videoCodec: n.video,
+      audioCodec: n.audio,
+      url: base ? new URL(base[1], baseUrl).href : baseUrl.split('#')[0],
+      kind: 'dash-representation',
+    });
+  }
+  return out;
+}
+
+/** Re-fetch a manifest and return its variants. Resolves to [] on anything unexpected. */
+async function formatsForManifest(url) {
+  try {
+    const r = await fetch(url, { credentials: 'include', cache: 'no-store' });
+    if (!r.ok) return [];
+    const body = (await r.text()).slice(0, 2 * 1024 * 1024);
+    if (body.includes('#EXTM3U')) return parseHLS(body, url);
+    if (body.includes('<MPD') || body.includes('<Representation')) return parseDASH(body, url);
+  } catch {
+    /* a signed, POST-only or otherwise unfetchable URL; the page hook may still have it */
+  }
+  return [];
+}
 
 function record(tabId, url, kind, extra = {}) {
   if (tabId === undefined || tabId < 0 || !isHttp(url) || isIgnored(url)) return;
@@ -223,13 +359,29 @@ function record(tabId, url, kind, extra = {}) {
     tab.delete(oldest[0]);
   }
   badge(String(tab.size), '#0a60c8', null);
+  persistMedia();
 }
 
 chrome.webRequest.onBeforeRequest.addListener(
   (d) => {
     if (!settings.sniffMedia) return;
-    if (MANIFEST_EXT.test(d.url)) record(d.tabId, d.url, 'stream');
-    else if (MEDIA_EXT.test(d.url)) record(d.tabId, d.url, 'media');
+    if (MANIFEST_EXT.test(d.url)) {
+      record(d.tabId, d.url, 'stream');
+      // Fetch and parse it out-of-band; the picker can then offer real variants even if the
+      // page fetched the manifest before our hook existed.
+      formatsForManifest(d.url).then(async (formats) => {
+        if (!formats.length) return;
+        await mediaReady;
+        const tab = mediaByTab.get(d.tabId);
+        const entry = tab && tab.get(d.url);
+        if (entry) {
+          entry.formats = formats;
+          persistMedia();
+        }
+      });
+    } else if (MEDIA_EXT.test(d.url)) {
+      record(d.tabId, d.url, 'media');
+    }
   },
   { urls: ['http://*/*', 'https://*/*'] },
 );
@@ -241,15 +393,44 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   const tabId = sender.tab ? sender.tab.id : msg.tabId;
 
   if (msg.type === 'media') {
-    for (const m of msg.items || []) record(tabId, m.url, m.kind || 'media', { page: m.page });
+    for (const m of msg.items || []) {
+      record(tabId, m.url, m.kind || 'media', { page: m.page, formats: m.formats });
+      // A later report for the same URL may carry the variants the first one lacked.
+      if (m.formats && m.formats.length) {
+        const tab = mediaByTab.get(tabId);
+        const e = tab && tab.get(m.url);
+        if (e) {
+          e.formats = m.formats;
+          persistMedia();
+        }
+      }
+    }
     if (tabId !== undefined) badge(String((mediaByTab.get(tabId) || new Map()).size), '#0a60c8', null);
     reply?.({ ok: true });
     return true;
   }
 
+  if (msg.type === 'formats-for-tab') {
+    // Everything this tab has, including the variants the worker parsed out of a manifest the
+    // page fetched before our hook existed. The content script merges this with the hook's view.
+    const want = msg.tabId !== undefined ? msg.tabId : tabId;
+    mediaReady.then(() => {
+      const entries = [...((mediaByTab.get(want) || new Map()).values())].filter(
+        (i) => i.formats && i.formats.length,
+      );
+      reply?.({ ok: true, entries });
+    });
+    return true; // async reply
+  }
+
   if (msg.type === 'add') {
     send(msg.details).then((r) => reply?.(r));
     return true; // keep the channel open for the async reply
+  }
+
+  if (msg.type === 'download-format') {
+    downloadFormat(msg).then((r) => reply?.(r));
+    return true;
   }
 
   if (msg.type === 'ping') {
@@ -279,6 +460,58 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
     chrome.action.setBadgeText({ text: '' }).catch(() => {});
   }
 });
+
+// ── 2b. handing a chosen video format to reIDM ──────────────────────────
+
+/** A safe-ish file name: "Title 1080p.mp4". reIDM sanitises it again on its side. */
+function formatFilename(title, format, url) {
+  const ext = (() => {
+    const m = /^video\/(\w+)|^audio\/(\w+)/.exec(format.mime || '');
+    if (m) return (m[1] || m[2]).replace('mpegurl', 'm3u8');
+    const u = /\.([a-z0-9]{2,4})(?:\?|#|$)/i.exec(url || '');
+    return u ? u[1] : 'mp4';
+  })();
+  const base = (title || 'video')
+    .replace(/[/\\?%*:|"<>]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  const q = format.quality ? ` ${format.quality}` : '';
+  const a = format.audioOnly ? ' (audio)' : '';
+  return `${base}${q}${a}.${ext}`;
+}
+
+/**
+ * The user picked a format.
+ *
+ * A format that already has a direct URL is just a download, so it goes through the same path
+ * as any other capture. One that does not is a URL the player protects with a signature
+ * (`signatureCipher`); an extension must not reimplement that, so the page URL and the format
+ * descriptor go across instead and the manager resolves it. reIDM has no resolver yet, and
+ * saying so plainly beats handing it a URL that will 403.
+ */
+async function downloadFormat(msg) {
+  const f = msg.format || {};
+  if (!msg.url) {
+    return {
+      ok: false,
+      error:
+        'this format needs the player’s signature to be resolved, which reIDM cannot do yet ' +
+        '(it needs a yt-dlp-style resolver). Pick a format that is not greyed out.',
+    };
+  }
+  const r = await send({
+    url: msg.url,
+    filename: formatFilename(msg.title, f, msg.url),
+    referer: msg.page || undefined,
+  });
+  if (r.ok) {
+    badge('✓', '#2ea053', 2500);
+  } else {
+    notify('reIDM could not take the video', r.error || 'unknown error');
+  }
+  return r;
+}
 
 // ── 3. context menus ────────────────────────────────────────────────────
 

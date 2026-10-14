@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.1
+
+### Added
+
+* **A video quality picker in the extension.** A *Download with reIDM* button appears over a playing
+  video and opens a list of what the player actually offers — resolution, codec, fps, bitrate and
+  size, best first, with audio-only tracks tagged and last. It understands YouTube's
+  `streamingData`, HLS `#EXT-X-STREAM-INF` and DASH `<Representation>`. The button is anchored to the
+  video's own box and follows it on scroll and resize; it is hidden when the player is too small.
+* The picker is rendered inside a closed shadow root, because a page's own CSS on a site like
+  YouTube is aggressive enough to break a plain element.
+
+### Fixed
+
+Five bugs in the extension, all found by loading it in a real Chromium and watching what it did:
+
+* **The service worker never started.** A top-level `await` before the listeners were registered is
+  the pattern the docs show, and Chrome accepts it silently: the extension loaded, logged nothing,
+  and did nothing at all. Listeners are now registered synchronously and the settings are corrected
+  asynchronously.
+* **A refused download was destroyed.** The browser's copy was cancelled before reIDM was asked, so
+  if reIDM was not running the file was simply lost. It is now paused, offered, and cancelled only
+  on acceptance — otherwise resumed. See `docs/PROTOCOL.md`; the official extension does the same.
+* **A manifest fetched inline was never seen.** A page that loads its manifest from an inline
+  `<script>` does so before the injected hook exists. The worker now re-fetches and parses manifests
+  it observes through `webRequest`, which does not depend on timing.
+* **A richer format list was being downgraded.** The page hook's answer overwrote the worker's list,
+  silently collapsing a four-variant stream to one progressive file. The two sources are now kept
+  apart and shown as a union.
+* **Everything was lost when the service worker was torn down.** Chrome stops the worker freely, and
+  the per-tab media index lived only in module scope. It is persisted to session storage now.
+
 ## 0.3.0
 
 ### Added

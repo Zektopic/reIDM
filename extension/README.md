@@ -12,6 +12,7 @@ manager. It is entirely reIDM's own — it does not depend on, or talk to, Tonec
 | **Right-click a page** | *Download all links on this page with reIDM* — up to 500 links, duplicates skipped. |
 | **Right-click a selection** | *Download the selected link with reIDM*. |
 | **Finds media** | Watches network requests for HLS/DASH manifests and media files, plus a page-side scan of `<video>`/`<audio>`/`<source>`, and lists what it found in the popup so you can pick. This works inside cross-origin iframes, where a content script cannot see into the DOM. |
+| **Picks a video quality** | A *Download with reIDM* button appears over a playing video and opens a picker listing what the player actually offers — resolution, codec, fps, bitrate and size, best first. Understands YouTube's `streamingData`, HLS `#EXT-X-STREAM-INF` and DASH `<Representation>`. |
 | **Answers reIDM's own questions** | The toolbar badge shows how many media URLs were seen on the current tab. |
 
 ## Installing
@@ -61,6 +62,12 @@ These are properties of the browser platform, not of this extension:
 * **A page with no extension in the URLs** (a signed CDN link, say) is only found through
   `webRequest` if it looks like media by extension. There is no reliable content sniffing available
   to an extension.
+* **Signature-protected formats are listed but greyed out.** Most real YouTube formats carry a
+  `signatureCipher` that must be unscrambled with the player's own obfuscated logic. An extension
+  must not reimplement that: it changes constantly and it is against YouTube's terms. Those rows are
+  shown so you can see they exist, and marked as unavailable rather than failing when clicked.
+  Making them downloadable needs a resolver on the reIDM side (a yt-dlp-style component), which is
+  not built yet.
 
 ## Permissions, and why
 
