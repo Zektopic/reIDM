@@ -135,7 +135,9 @@ fn tmp(tag: &str) -> PathBuf {
 
 /// Wait until `f` holds; panics with `what` if it never does.
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Generous: these run on shared CI machines. A test that fails only when the runner is
+    // busy is a bad test, so anything timing-sensitive below also keeps its payload small.
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
         if f() {
             return;
@@ -398,8 +400,8 @@ async fn re_adding_a_stopped_url_resumes_it() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrency_limit_queues_the_rest() {
-    let data = body(3_000_000);
-    let srv = serve(data.clone(), true, 500_000);
+    let data = body(1_200_000);
+    let srv = serve(data.clone(), true, 2_000_000);
     let dir = tmp("queue");
     let dl = dir.join("dl");
     let m = Manager::open_with(&dir.join("state"), dl.clone(), 2, 2).unwrap();
@@ -410,12 +412,21 @@ async fn concurrency_limit_queues_the_rest() {
         ids.push(m.add(Request { url, dir: Some(dl.clone()), ..Default::default() }).unwrap());
     }
 
-    std::thread::sleep(Duration::from_millis(1200));
-    let running = m.list().iter().filter(|i| i.status == Status::Running).count();
-    assert!(running <= 2, "at most 2 should transfer at once, saw {running}");
-
-    // Everything must finish: the queue drains as slots free up.
-    wait_until("all done", || m.list().iter().all(|i| i.status == Status::Done));
+    // Sample for the whole run and assert the *peak*: the invariant is that the limit is never
+    // exceeded, not that it happens to be reached at one particular moment.
+    let mut peak = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let items = m.list();
+        peak = peak.max(items.iter().filter(|i| i.status == Status::Running).count());
+        if items.iter().all(|i| i.status == Status::Done) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "downloads never finished; states: {:?}", items.iter().map(|i| &i.status).collect::<Vec<_>>());
+        assert!(items.iter().all(|i| !matches!(i.status, Status::Failed(_))), "a download failed: {:?}", items.iter().map(|i| &i.status).collect::<Vec<_>>());
+        std::thread::sleep(Duration::from_millis(40));
+    }
+    assert!(peak <= 2, "at most 2 should transfer at once, peak was {peak}");
     assert_eq!(m.list().len(), 6);
     for id in ids {
         assert_eq!(std::fs::read(m.get(id).unwrap().path).unwrap(), data);
