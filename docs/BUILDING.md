@@ -58,6 +58,11 @@ cargo build -p reidm -p reidm-host
 xvfb-run -a node tools/capture-test.mjs --chrome /path/to/chrome     # or with a display: node tools/…
 ```
 
+It runs on Linux and Windows (macOS untested). The service it starts uses a throw-away data folder
+(`REIDM_DATA_DIR`) but the usual ports, so stop any running reIDM first. On Windows the service
+registers its native host in the registry as it starts; the test notes what was there before
+and puts it back.
+
 It needs Node 22 or newer (for its built-in `WebSocket`) and nothing else — no npm packages. Any Chromium works; Chrome for
 Testing or Playwright's build (`npx playwright install chromium`) is the easy way to get one
 whose path is stable. It checks, among other things, that:
@@ -77,6 +82,7 @@ whose path is stable. It checks, among other things, that:
 | `--bin DIR` | where the reIDM binaries are (default `target/debug`) |
 | `--extension DIR` | the extension to load (default `extension/`) |
 | `--site-port`, `--cdp-port` | ports for the test site (18871) and DevTools (9333) |
+| `--host-key KEY` | Windows: where checks 7–8 register the test's native host, under `HKCU\Software\KEY\NativeMessagingHosts` (default `Google\Chrome`, which Chrome for Testing also reads) |
 | `REIDM_PROMPT=1` | turn on the browser's *Ask where to save each file* |
 | `REIDM_ONLY_GRABBER=1` | run only the resource-grabber checks |
 | `REIDM_SHOT_CMD`, `REIDM_SHOT_DIR` | a command that takes a screenshot, run at key moments, and where to keep them |

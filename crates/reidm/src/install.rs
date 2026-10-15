@@ -106,10 +106,32 @@ fn reidm_manifest(host_path: &Path) -> serde_json::Value {
 }
 
 fn host_binary() -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
+    // Resolved first, so a `reidm` symlinked onto the PATH still finds the host beside the real
+    // binary (inside reIDM.app, on macOS).
+    let exe = std::env::current_exe()?.canonicalize()?;
     let name = if cfg!(windows) { "reidm-host.exe" } else { "reidm-host" };
     let p = exe.with_file_name(name);
-    p.canonicalize().with_context(|| format!("{} not found next to reidm", p.display()))
+    p.canonicalize().map(plain_path).with_context(|| format!("{} not found next to reidm", p.display()))
+}
+
+/// `canonicalize` on Windows returns an extended-length path (`\\?\C:\…`). Browsers can't start
+/// a native host by such a path — Chrome reports only "Error when communicating with the native
+/// messaging host" — and it reads oddly anywhere a person sees it, so drop the prefix.
+fn plain_path(p: PathBuf) -> PathBuf {
+    match p.to_str().and_then(strip_verbatim) {
+        Some(s) => PathBuf::from(s),
+        None => p,
+    }
+}
+
+fn strip_verbatim(s: &str) -> Option<String> {
+    if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+        return Some(format!(r"\\{unc}"));
+    }
+    let rest = s.strip_prefix(r"\\?\")?;
+    // Only a drive path has a plain spelling; leave `\\?\Volume{…}` and the like alone.
+    let b = rest.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\').then(|| rest.to_string())
 }
 
 /// Write `value` to `path` unless it already holds exactly that. Returns whether it wrote.
@@ -127,7 +149,8 @@ fn write_if_changed(path: &Path, value: &serde_json::Value) -> Result<bool> {
 
 #[cfg(windows)]
 fn reg_default_value(key: &str) -> Option<String> {
-    let out = std::process::Command::new("reg").args(["query", key, "/ve"]).output().ok()?;
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("reg").args(["query", key, "/ve"]).creation_flags(0x0800_0000).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -144,6 +167,9 @@ fn reg_set_default(key: &str, value: &Path) -> bool {
         .arg(value)
         .arg("/f")
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        // "The operation completed successfully." would land in the service's log.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -283,7 +309,7 @@ pub fn bundled_extension_dir() -> Option<PathBuf> {
     ];
     // target/{debug,release}/reidm -> the repository's own copy
     candidates.push(bin.join("../../extension"));
-    candidates.into_iter().find(|d| d.join("manifest.json").is_file()).and_then(|d| d.canonicalize().ok())
+    candidates.into_iter().find(|d| d.join("manifest.json").is_file()).and_then(|d| d.canonicalize().ok()).map(plain_path)
 }
 
 /// The folder to point a browser's *Load unpacked* at: a per-user copy of the bundled extension.
@@ -345,6 +371,15 @@ fn sync_dir(src: &Path, dst: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_length_paths_lose_their_prefix() {
+        assert_eq!(strip_verbatim(r"\\?\C:\Users\a\reidm-host.exe").as_deref(), Some(r"C:\Users\a\reidm-host.exe"));
+        assert_eq!(strip_verbatim(r"\\?\UNC\server\share\reidm-host.exe").as_deref(), Some(r"\\server\share\reidm-host.exe"));
+        assert_eq!(strip_verbatim(r"\\?\Volume{0b1c}\x"), None);
+        assert_eq!(strip_verbatim(r"C:\already\plain"), None);
+        assert_eq!(strip_verbatim("/usr/bin/reidm-host"), None);
+    }
 
     #[test]
     fn sync_copies_updates_and_prunes() {

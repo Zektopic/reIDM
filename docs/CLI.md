@@ -343,6 +343,7 @@ It downloads and installs nothing. Exit status 1 if the check itself failed.
 |---|---|
 | `RUST_LOG` | log detail of `reidm daemon`, e.g. `RUST_LOG=reidm=debug,reidm_core=debug` (default `info`) |
 | `REIDM_GH_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | a GitHub token for `update-check`, only needed against rate limits or a private fork |
+| `REIDM_DATA_DIR` | uses this folder as the data folder, on any system — for a second, separate instance or a test (it still needs ports 61001 and 61002 free) |
 | `XDG_DATA_HOME` | (Linux) moves the data folder, `$XDG_DATA_HOME/reidm` |
 
 ## Exit status

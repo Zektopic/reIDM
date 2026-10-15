@@ -62,7 +62,7 @@ Download the latest release for your system from the [Releases page](https://git
 | System | Package | |
 |---|---|---|
 | **Windows** 10/11 (x64) | `reIDM-setup-<version>.exe` | Per-user install, no admin rights. Starts with Windows. |
-| **macOS** 11+ (Intel and Apple silicon) | `reIDM-<version>-universal.dmg` | Open it and run **Install reIDM.command**, then drag reIDM to Applications. |
+| **macOS** 11+ (Intel and Apple silicon) | `reIDM-<version>-universal.dmg` | Open it and drag reIDM onto Applications. |
 | **Debian / Ubuntu** (x64) | `reidm_<version>-1_amd64.deb` | `sudo apt install ./reidm_*.deb` |
 | Any | `reidm-extension-<version>.zip` | The browser extension on its own. |
 

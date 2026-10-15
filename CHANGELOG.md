@@ -74,6 +74,15 @@ remaining core features, and the desktop window catches up with IDM's.
 * New endpoints for each of the above, and `/api/status` reports the connected extension.
 * Documentation: a user guide, browser integration, command-line and HTTP API references,
   architecture and security model, troubleshooting and building guides.
+* `REIDM_DATA_DIR` moves the data folder on every system, for a separate instance or a test.
+
+### Packages
+
+* **The macOS disk image is a proper drag-to-Applications installer**: its window shows reIDM,
+  an arrow and the Applications folder on a drawn background, and nothing else. Everything
+  reIDM needs is inside the app now — the service, the browser's native host, the extension — so
+  there is no install script to run; open reIDM once and it registers itself with your browsers.
+* The real-browser test (`tools/capture-test.mjs`) runs on Windows too.
 
 ### New look
 
@@ -90,6 +99,15 @@ remaining core features, and the desktop window catches up with IDM's.
   reading the extension's code side by side with the decompiled IDM).
 * On Windows, a reIDM service started through the browser's native host is no longer killed
   when the browser closes the host: it now leaves the browser's job object.
+* **On Windows, the browser couldn't start reIDM when reIDM had registered its native host
+  itself** (rather than the installer): the registration named the host by an extended-length
+  path (`\\?\C:\…`), which browsers can't launch — Chrome said only "Error when communicating
+  with the native messaging host". Paths are now written plainly, and existing registrations are
+  rewritten at the next start. Found by running the browser test on Windows.
+* On Windows, registering the native host no longer writes "The operation completed
+  successfully." into the service's log, or flashes a console window.
+* The release workflow's notes had an unindented line that made the whole file invalid YAML,
+  so the 0.4.0 release would not have built.
 
 ## 0.3.1
 

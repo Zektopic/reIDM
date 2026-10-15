@@ -125,7 +125,7 @@ of the data folder (or fix it) and start again; the files already downloaded are
 
 **The window says it can't reach the service, but it's running.** The window authenticates with
 the token in the data folder's `api-token`, written when the service starts. If the service runs
-as a different user, or with a different data folder (`XDG_DATA_HOME` on Linux), the window can't
+as a different user, or with a different data folder (`REIDM_DATA_DIR`, or `XDG_DATA_HOME` on Linux), the window can't
 read it. Run both as the same user, with the same environment.
 
 ## Installing

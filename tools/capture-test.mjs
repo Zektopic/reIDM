@@ -27,6 +27,12 @@
 //   cargo build -p reidm -p reidm-host
 //   xvfb-run -a node tools/capture-test.mjs --chrome /path/to/chrome
 //
+// On Windows, browsers find native hosts through the registry, and the service registers itself
+// for Chrome, Edge, Brave and Vivaldi when it starts. The test notes those registrations first and
+// puts them back at the end; checks 7 and 8 add and remove the one under
+// HKCU\Software\<--host-key>\NativeMessagingHosts (default Google\Chrome, which Chrome for
+// Testing reads too). Stop any running reIDM first: the test needs its ports.
+//
 // Exits non-zero if any check fails.
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -34,21 +40,29 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const args = Object.fromEntries(
   process.argv.slice(2).reduce((acc, a, i, all) => (a.startsWith('--') ? [...acc, [a.slice(2), all[i + 1]]] : acc), []),
 );
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const WIN = process.platform === 'win32';
+const EXE = WIN ? '.exe' : '';
 const CHROME = args.chrome || process.env.CHROME_PATH || path.join(os.homedir(), '.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');
 const BIN = path.resolve(args.bin || path.join(ROOT, 'target/debug'));
 const EXT = path.resolve(args.extension || path.join(ROOT, 'extension'));
 const EXT_ID = 'pgeonmdaagbiccimgojpafdjcipcfnlc';
+const hostKey = (base) => `HKCU\\Software\\${base}\\NativeMessagingHosts\\com.zektopic.reidm`;
+const HOST_KEY = hostKey(args['host-key'] || 'Google\\Chrome');
+const REG_KEYS = ['Google\\Chrome', 'Microsoft\\Edge', 'BraveSoftware\\Brave-Browser', 'Vivaldi'].map(hostKey);
+const regValue = (key) => /REG_SZ\s+(.*)/.exec(spawnSync('reg', ['query', key, '/ve'], { encoding: 'utf8' }).stdout || '')?.[1].trim();
+const savedReg = WIN ? new Map(REG_KEYS.map((k) => [k, regValue(k)])) : new Map();
 const SITE_PORT = Number(args['site-port'] || 18871);
 const CDP_PORT = Number(args['cdp-port'] || 9333);
 const API = 'http://127.0.0.1:61002';
 
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'reidm-capture-'));
-const DATA = path.join(WORK, 'xdg-data'); // the daemon's data dir lives under here
+const DATA = path.join(WORK, 'data'); // the daemon's data folder
 const REIDM_DL = path.join(WORK, 'reidm-downloads');
 const BROWSER_DL = path.join(WORK, 'browser-downloads');
 const PROFILE = path.join(WORK, 'profile');
@@ -165,10 +179,10 @@ const site = http.createServer((req, res) => {
 
 // ── reIDM ───────────────────────────────────────────────────────────────
 
-const env = { ...process.env, XDG_DATA_HOME: DATA, RUST_LOG: 'reidm=info,reidm_core=info' };
+const env = { ...process.env, REIDM_DATA_DIR: DATA, RUST_LOG: 'reidm=info,reidm_core=info' };
 let daemon = null;
 async function startDaemon() {
-  daemon = spawn(path.join(BIN, 'reidm'), ['daemon', '--no-idm-port', '--dir', REIDM_DL], { env, stdio: ['ignore', 'ignore', 'inherit'] });
+  daemon = spawn(path.join(BIN, `reidm${EXE}`), ['daemon', '--no-idm-port', '--dir', REIDM_DL], { env, stdio: ['ignore', 'ignore', 'inherit'] });
   for (let i = 0; i < 100; i++) {
     if (await apiUp()) return;
     await sleep(100);
@@ -180,7 +194,13 @@ async function stopDaemon() {
   daemon = null;
   // A daemon the native host started is not our child; stop whatever holds the port.
   for (let i = 0; i < 50 && (await apiUp()); i++) {
-    spawnSync('fuser', ['-k', '-TERM', '61002/tcp']);
+    if (WIN) {
+      const pids = new Set(spawnSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8' }).stdout.split('\n')
+        .filter((l) => /127\.0\.0\.1:61002\s.*LISTENING/.test(l)).map((l) => l.trim().split(/\s+/).pop()));
+      for (const pid of pids) spawnSync('taskkill', ['/F', '/PID', pid]);
+    } else {
+      spawnSync('fuser', ['-k', '-TERM', '61002/tcp']);
+    }
     await sleep(100);
   }
 }
@@ -193,7 +213,7 @@ async function apiUp() {
   }
 }
 function token() {
-  return fs.readFileSync(path.join(DATA, 'reidm', 'api-token'), 'utf8').trim();
+  return fs.readFileSync(path.join(DATA, 'api-token'), 'utf8').trim();
 }
 async function reidmItems() {
   const r = await fetch(`${API}/api/downloads`, { headers: { 'X-Reidm-Token': token() } });
@@ -472,12 +492,14 @@ async function main() {
   await openPage(`http://127.0.0.1:${SITE_PORT}/`);
 
   // 7. reIDM stopped; the native host starts it
-  const hostDir = path.join(PROFILE, 'NativeMessagingHosts');
+  const hostDir = WIN ? WORK : path.join(PROFILE, 'NativeMessagingHosts');
+  const hostFile = path.join(hostDir, 'com.zektopic.reidm.json');
   fs.mkdirSync(hostDir, { recursive: true });
   fs.writeFileSync(
-    path.join(hostDir, 'com.zektopic.reidm.json'),
-    JSON.stringify({ name: 'com.zektopic.reidm', description: 'test', type: 'stdio', path: path.join(BIN, 'reidm-host'), allowed_origins: [`chrome-extension://${EXT_ID}/`] }),
+    hostFile,
+    JSON.stringify({ name: 'com.zektopic.reidm', description: 'test', type: 'stdio', path: path.join(BIN, `reidm-host${EXE}`), allowed_origins: [`chrome-extension://${EXT_ID}/`] }),
   );
+  if (WIN) spawnSync('reg', ['add', HOST_KEY, '/ve', '/t', 'REG_SZ', '/d', hostFile, '/f']);
   await stopDaemon();
   await inWorker('reidm.ping().then(i => !!i)');
   await click('#launched');
@@ -497,13 +519,25 @@ async function main() {
   await openPage(`http://127.0.0.1:${SITE_PORT}/`);
 
   // 8. reIDM stopped and no host: the browser keeps the download
-  fs.rmSync(path.join(hostDir, 'com.zektopic.reidm.json'));
+  fs.rmSync(hostFile);
+  unregisterHost();
   await stopDaemon();
   await inWorker('reidm.ping().then(i => !!i)');
   await click('#fallback');
   const fb = await waitFor('fallback in the browser folder', async () => browserFiles().find((f) => f.startsWith('fallback') && !f.endsWith('.crdownload')), 30000);
   check('reIDM unavailable: the browser downloaded it itself', !!fb);
   if (fb) check('reIDM unavailable: the browser’s file is intact', Buffer.compare(fs.readFileSync(path.join(BROWSER_DL, fb)), FILES['/dl/fallback']) === 0);
+}
+
+function unregisterHost() {
+  if (WIN) spawnSync('reg', ['delete', HOST_KEY, '/f'], { stdio: 'ignore' });
+}
+/** Put back the registrations the test's service replaced. */
+function restoreRegistry() {
+  for (const [key, value] of savedReg) {
+    if (value) spawnSync('reg', ['add', key, '/ve', '/t', 'REG_SZ', '/d', value, '/f'], { stdio: 'ignore' });
+    else spawnSync('reg', ['delete', key, '/f'], { stdio: 'ignore' });
+  }
 }
 
 let failed = false;
@@ -520,6 +554,7 @@ try {
   }
   chrome?.kill('SIGTERM');
   await stopDaemon();
+  restoreRegistry();
   site.close();
 }
 const bad = results.filter((r) => !r.ok);

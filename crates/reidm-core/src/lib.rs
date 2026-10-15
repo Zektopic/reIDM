@@ -324,7 +324,12 @@ struct Inner {
 #[derive(Clone)]
 pub struct Manager(Arc<Inner>);
 
+/// Where the list, settings and token live. `REIDM_DATA_DIR` moves it — the only way to on
+/// Windows and macOS, whose folders don't follow the environment the way `XDG_DATA_HOME` does.
 pub fn default_data_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("REIDM_DATA_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
     directories::ProjectDirs::from("com", "Zektopic", "reIDM")
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(".reidm"))
