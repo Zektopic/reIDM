@@ -133,6 +133,10 @@ read it. Run both as the same user, with the same environment.
 **Windows: "Windows protected your PC".** The installer isn't code-signed yet. Choose *More info*
 › *Run anyway*. See [PACKAGING.md](PACKAGING.md).
 
+**Windows: "DeleteFile failed; code 5" while installing.** Setup couldn't replace a reIDM
+program that was running. Installers from 0.4.1 on stop reIDM first; with an older one, end
+`reidm.exe` and `reidm-gui.exe` in Task Manager and run it again.
+
 **macOS: "reIDM is damaged and can't be opened" or "can't be opened because Apple cannot check
 it".** Builds are not notarized unless the project's Developer ID is configured. Right-click the
 app › **Open** › **Open**, once. If macOS still refuses:
