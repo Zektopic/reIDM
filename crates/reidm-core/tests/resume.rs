@@ -437,7 +437,9 @@ async fn concurrency_limit_queues_the_rest() {
 async fn batch_add_skips_duplicates_and_reports_each() {
     use reidm_core::Outcome;
     let data = body(500_000);
-    let srv = serve(data, true, 0);
+    // Throttled, so "a" is still downloading when the batch reaches its duplicate: unthrottled,
+    // a fast machine finishes it first, and the duplicate is rightly reported AlreadyComplete.
+    let srv = serve(data, true, 100_000);
     let dir = tmp("batch");
     let dl = dir.join("dl");
     let m = Manager::open(&dir.join("state"), dl.clone(), 4).unwrap();
