@@ -126,6 +126,12 @@ The transfer rate isn't a field: take two readings of `downloaded` a few seconds
 Only `url` is required. `filename` overrides the server's name; `dir` the download folder;
 `later: true` puts it in the scheduled queue without starting it.
 
+With `"media": { "format": "137+bestaudio/best[height<=1080]" }`, `url` is a page with a video
+and reIDM fetches it through yt-dlp in that format (a
+[yt-dlp format selector](https://github.com/yt-dlp/yt-dlp#format-selection): letters, digits and
+`+/[]<>=!*_.,-:^$~?`, at most 200 characters). Without `filename`, yt-dlp names the file after
+the video's title. The same page in two formats is two downloads.
+
 ```json
 { "id": 7, "outcome": "new" }
 ```
@@ -363,8 +369,11 @@ Is reIDM running, and with what defaults? A ping that carries `v` is recorded as
 checking in (shown in `/api/status`).
 
 ```json
-{ "app": "reIDM", "version": "0.4.0", "default_dir": "/home/me/Downloads", "connections": 8, "max_concurrent": 4 }
+{ "app": "reIDM", "version": "0.5.0", "default_dir": "/home/me/Downloads", "connections": 8, "max_concurrent": 4, "media": true }
 ```
+
+`media: true` means `/ext/add` accepts `media` (from 0.5.0). An older reIDM would save a video's
+web page instead, so the extension checks this first.
 
 #### `POST /ext/add`
 
@@ -380,6 +389,9 @@ checking in (shown in `/api/status`).
   "later": false
 }
 ```
+
+`media` works as in [`POST /api/downloads`](#post-apidownloads); `verify` is then ignored, since
+yt-dlp finds the video's address when the download runs.
 
 With `verify`, reIDM fetches the first byte before accepting, so that the extension can hand a
 download back to the browser when reIDM can't fetch it; `refuse_html` also refuses an address

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.0
+
+### YouTube
+
+* **Every quality in YouTube's list can now be downloaded.** They were all greyed out: YouTube
+  gives the browser scrambled addresses (`signatureCipher`), or none, and only its player's code
+  unscrambles them. reIDM now hands the page and the chosen format to
+  [yt-dlp](https://github.com/yt-dlp/yt-dlp), which keeps up with YouTube's changes.
+* **Picture and sound in one file.** Qualities above 360p come as separate video and audio;
+  ffmpeg joins them. The quality clicked is the one fetched when yt-dlp offers it, else the best
+  at that height, H.264 with AAC first.
+* **reIDM fetches what it needs by itself** the first time: yt-dlp (checked for a newer release
+  once a day), Deno for yt-dlp to read YouTube's player when no Deno, Node or Bun is installed,
+  and on Windows ffmpeg — each from its project's GitHub releases, checked against the SHA-256
+  the release publishes. On macOS and Linux, ffmpeg comes from the system (the `.deb` recommends
+  it).
+* Video downloads live in the list like any other: progress, stop and resume, the speed limit,
+  *Downloads at the same time*. They are named after the video and quality; Properties shows the
+  format; removing one also removes yt-dlp's partial files.
+* The popup offers the video on a YouTube page as one row, in the best quality, instead of the
+  player's internal addresses (which would have saved a web page).
+* Audio formats are labelled by bitrate ("130k") instead of YouTube's "tiny", and YouTube's
+  loudness-normalised copies are marked *stable volume*.
+* `reidm add --video [FORMAT] URL…` does the same from a terminal, for YouTube and the other
+  sites yt-dlp supports. The API's `POST /api/downloads` and `/ext/add` take `media`, and
+  `/ext/ping` says `media: true`; the extension won't send a video to an older reIDM, which would
+  save the page instead.
+
+### Fixed
+
+* `reidm list` showed a download that had just started as *Queued* until its first progress was
+  saved.
+
 ## 0.4.2
 
 ### Fixed

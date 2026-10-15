@@ -107,6 +107,16 @@ a request. The grabber page asks every frame's content script for links, images,
 page's `performance` resource entries, merges in what the service worker saw on the network, and
 sends the selection to `/ext/add-batch`.
 
+**Videos that need a player to resolve (YouTube).** The page's own addresses are scrambled or
+missing, so the extension sends `/ext/add` the *page* and a yt-dlp format selector (`media`)
+instead of a file address. The engine runs such a download through yt-dlp instead of its own
+connections (`media.rs`): it fetches yt-dlp (and Deno, and on Windows ffmpeg) into `tools/`,
+checked against each release's published SHA-256, and runs it with a progress template it can
+parse, a cookies file made from the browser's cookies, and the page after `--`. yt-dlp reports
+the file name before downloading and the final path after merging; progress goes into the same
+fields as any download's. Stopping kills yt-dlp's whole process tree (its process group on Unix,
+`taskkill /T` on Windows); resuming runs it again and it carries on from its `.part` files.
+
 **Tonec's extension** speaks the IDM protocol — binary messages over a WebSocket, or over native
 messaging through `reidm-host` — described in [PROTOCOL.md](PROTOCOL.md). `session.rs` answers
 it the way `IDMan.exe` does.
@@ -220,6 +230,7 @@ What this does and doesn't protect against:
 | `crates/reidm-core/src/limiter.rs` | the token-bucket speed limiter |
 | `crates/reidm-core/src/schedule.rs` | the scheduler's time windows |
 | `crates/reidm-core/src/lists.rs` | `.ef2` import/export, batch patterns |
+| `crates/reidm-core/src/media.rs` | video downloads through yt-dlp: fetching and checking yt-dlp, Deno and ffmpeg, running yt-dlp, its progress, stopping it |
 | `crates/reidm-core/src/grabber.rs` | the site grabber, URL-list parsing |
 | `crates/reidm-core/src/update.rs` | the release check |
 | `crates/reidm/src/main.rs` | the CLI and service start-up |

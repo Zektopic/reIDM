@@ -8,10 +8,12 @@
 pub mod grabber;
 mod limiter;
 pub mod lists;
+mod media;
 pub mod schedule;
 pub mod update;
 
 pub use limiter::Limiter;
+pub use media::{valid_format, Media};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
@@ -49,6 +51,10 @@ pub struct Request {
     /// Suggested file name (e.g. from the browser). Sanitised before use.
     pub filename: Option<String>,
     pub dir: Option<PathBuf>,
+    /// Fetch through yt-dlp: `url` is then the page with the video, and this says which
+    /// format. See [`media`](crate::media).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Media>,
 }
 
 /// How to add a download, beyond what to fetch.
@@ -129,6 +135,12 @@ pub fn url_key(u: &url::Url) -> String {
     let host = u.host_str().unwrap_or("").to_ascii_lowercase();
     let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
     format!("{}{host}{port}{}{query}", u.scheme(), u.path())
+}
+
+/// Whether `i` is the download `key` (from [`url_key`]) and `media` describe. The same page in
+/// two formats is two downloads.
+fn same_download(i: &Item, key: &str, media: Option<&Media>) -> bool {
+    url_key_of(&i.request.url).as_deref() == Some(key) && i.request.media.as_ref().map(|m| &m.format) == media.map(|m| &m.format)
 }
 
 fn url_key_of(raw: &str) -> Option<String> {
@@ -740,8 +752,9 @@ impl Manager {
             bail!("unsupported scheme {:?} (only http/https)", u.scheme());
         }
         let key = url_key(&u);
-        let known = self.0.db.lock().unwrap().items.values().any(|i| url_key_of(&i.request.url).as_deref() == Some(key.as_str()));
-        if known {
+        let known = self.0.db.lock().unwrap().items.values().any(|i| same_download(i, &key, req.media.as_ref()));
+        // A video page is not a file to check: yt-dlp resolves it when the download runs.
+        if known || req.media.is_some() {
             // Already in the list: re-adding resumes it, which needs no new check.
             return self.add_with(req, opts);
         }
@@ -766,6 +779,11 @@ impl Manager {
         if !matches!(u.scheme(), "http" | "https") {
             bail!("unsupported scheme {:?} (only http/https)", u.scheme());
         }
+        if let Some(m) = &req.media {
+            if !valid_format(&m.format) {
+                bail!("not a format selector: {:?}", m.format);
+            }
+        }
         let key = url_key(&u);
         let dir = req.dir.clone().unwrap_or_else(|| self.0.settings.lock().unwrap().default_dir.clone());
         std::fs::create_dir_all(&dir)?;
@@ -774,7 +792,7 @@ impl Manager {
             let mut db = self.0.db.lock().unwrap();
 
             // Already in the list?
-            if let Some(existing) = db.items.values().find(|i| url_key_of(&i.request.url).as_deref() == Some(key.as_str())) {
+            if let Some(existing) = db.items.values().find(|i| same_download(i, &key, req.media.as_ref())) {
                 let (id, status) = (existing.id, existing.status.clone());
                 // `req.filename` may carry a better name than the one we guessed last time.
                 if let Some(name) = req.filename.as_deref().map(sanitize_filename) {
@@ -809,7 +827,12 @@ impl Manager {
                 .as_deref()
                 .or(probe.as_ref().and_then(|p| p.filename.as_deref()))
                 .map(sanitize_filename)
-                .unwrap_or_else(|| sanitize_filename(&filename_from_url(&u)));
+                .unwrap_or_else(|| match &req.media {
+                    // yt-dlp names it after the title once it starts; until then, the video's
+                    // id (`watch?v=…`) says more than the page's name ("watch").
+                    Some(_) => sanitize_filename(&u.query_pairs().find(|(k, _)| k == "v").map(|(_, v)| v.into_owned()).unwrap_or_else(|| filename_from_url(&u))),
+                    None => sanitize_filename(&filename_from_url(&u)),
+                });
             let claimed: HashSet<PathBuf> = db.items.values().map(|i| i.path.clone()).collect();
             let path = unique_path(&dir, &hint, |p| claimed.contains(p));
             let mut item = Item {
@@ -927,6 +950,13 @@ impl Manager {
             it.finished_at = None;
             it.status = Status::Queued;
             let _ = std::fs::remove_file(part_path(&it.path));
+            if it.request.media.is_some() {
+                // yt-dlp would otherwise find the finished file and its pieces and stop there.
+                let _ = std::fs::remove_file(&it.path);
+                for f in media::leftovers(&it.path) {
+                    let _ = std::fs::remove_file(f);
+                }
+            }
         }
         self.save();
         self.pump();
@@ -976,6 +1006,11 @@ impl Manager {
             // The part file is reIDM's own scratch space, so it always goes; leaving it behind
             // would make every later download of the same name pick "name (1).zip".
             let _ = std::fs::remove_file(part_path(&it.path));
+            if it.request.media.is_some() {
+                for f in media::leftovers(&it.path) {
+                    let _ = std::fs::remove_file(f);
+                }
+            }
             if delete_files {
                 // "remove and delete the file" must also work for finished downloads, which are
                 // the ones people actually delete.
@@ -1136,6 +1171,9 @@ impl Manager {
         {
             let db = self.0.db.lock().unwrap();
             let it = db.items.get(&id).ok_or_else(|| anyhow!("no such download {id}"))?;
+            if it.request.media.is_some() {
+                bail!("a video download finds its own address each time it runs; there is none to refresh");
+            }
             if it.status == Status::Done {
                 bail!("that download is already complete");
             }
@@ -1195,6 +1233,9 @@ impl Manager {
         let me = self.clone();
         tokio::spawn(async move {
             me.set_status(id, Status::Running);
+            // Saved now, not at the first progress: a video download can spend a while fetching
+            // yt-dlp first, and `reidm list` reads the saved list.
+            me.save();
             let res = me.run(id, live.clone()).await;
             let st = match res {
                 Ok(true) => Status::Done,
@@ -1277,6 +1318,9 @@ impl Manager {
     /// Returns Ok(true) when finished, Ok(false) when paused/cancelled.
     async fn run(&self, id: u64, live: Live) -> Result<bool> {
         let mut item = self.get(id).ok_or_else(|| anyhow!("vanished"))?;
+        if item.request.media.is_some() {
+            return self.run_media(id, live, item).await;
+        }
         let headers = Self::headers(&item.request);
 
         if item.segments.is_empty() {

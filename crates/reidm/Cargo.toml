@@ -37,6 +37,8 @@ priority = "optional"
 # `$auto` picks up the shared libraries the binaries link against; these are the GUI's, which are
 # loaded through the windowing stack rather than always appearing in the ELF dependency list.
 depends = "$auto, libxkbcommon0, libgl1 | libgl1-mesa-glx, libxcb1, libwayland-client0, libfontconfig1"
+# Joins the separate video and audio of YouTube's higher qualities.
+recommends = "ffmpeg"
 assets = [
   ["../../target/release/reidm", "usr/bin/reidm", "755"],
   ["../../target/release/reidm-host", "usr/bin/reidm-host", "755"],

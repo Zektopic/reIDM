@@ -68,6 +68,11 @@ enum Cmd {
         /// Add to the scheduled queue without starting (IDM's "Download Later").
         #[arg(long)]
         later: bool,
+        /// The addresses are pages with a video (YouTube and the many other sites yt-dlp
+        /// supports): fetch the video through yt-dlp, which reIDM downloads on first use.
+        /// FORMAT is a yt-dlp format selector; without one, the best video with its sound.
+        #[arg(long, value_name = "FORMAT", num_args = 0..=1, default_missing_value = "bestvideo*+bestaudio/best")]
+        video: Option<String>,
     },
     /// Queue a numbered or lettered series: `reidm batch 'https://x/img*.jpg' --from 1 --to 50 --width 3`.
     Batch {
@@ -456,7 +461,25 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Add { urls, referer, output, later } => {
+        Cmd::Add { urls, referer, output, later, video: Some(format) } => {
+            if output.is_some() && urls.len() > 1 {
+                bail!("--output only makes sense for a single URL");
+            }
+            if !reidm_core::valid_format(&format) {
+                bail!("not a yt-dlp format selector: {format:?}");
+            }
+            let mut results = Vec::new();
+            for url in urls {
+                // Without --output, yt-dlp names the file after the video's title.
+                let body = serde_json::json!({ "url": url, "referer": referer, "filename": output, "later": later, "media": { "format": format } });
+                results.push(match api_post("/api/downloads", body).await {
+                    Ok(v) => serde_json::json!({ "url": url, "outcome": v["outcome"] }),
+                    Err(e) => serde_json::json!({ "url": url, "error": format!("{e:#}") }),
+                });
+            }
+            report_batch(&serde_json::json!({ "results": results }));
+        }
+        Cmd::Add { urls, referer, output, later, video: None } => {
             if output.is_some() && urls.len() > 1 {
                 bail!("--output only makes sense for a single URL");
             }

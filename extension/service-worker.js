@@ -139,7 +139,7 @@ async function ping() {
     const r = await fetch(api(`/ext/ping?v=${encodeURIComponent(VERSION)}`), { cache: 'no-store', signal: ctl.signal });
     if (!r.ok) return null;
     const info = await r.json();
-    publishStatus({ up: true, version: info.version || null });
+    publishStatus({ up: true, version: info.version || null, media: !!info.media });
     return info;
   } catch {
     publishStatus({ up: false, version: null });
@@ -161,7 +161,7 @@ async function post(path, body, timeoutMs = 25000) {
       signal: ctl.signal,
     });
     const j = await r.json().catch(() => ({}));
-    if (!status.up) publishStatus({ up: true, version: status.version });
+    if (!status.up) publishStatus({ ...status, up: true });
     if (!r.ok) return { ok: false, error: j.error || `HTTP ${r.status}` };
     return j;
   } catch (e) {
@@ -696,21 +696,63 @@ function formatFilename(title, format, url) {
 }
 
 /**
- * The user picked a format. A format that already has a direct URL is just a download. One
- * that does not is protected by the player's signature (`signatureCipher`); an extension must
- * not reimplement that, and reIDM has no resolver yet, so say so plainly.
+ * The yt-dlp format selector for a format picked in the list: that exact format when yt-dlp
+ * offers it (its list is not always the page's), else the best at the same height — H.264 with
+ * AAC first, which plays anywhere. A format without sound gets the best audio joined to it.
+ * With nothing picked, the best there is.
+ */
+function ytdlpFormat(f = {}) {
+  const id = Number.isInteger(f.itag) ? String(f.itag) : null;
+  if (f.audioOnly) return [id, 'bestaudio[ext=m4a]', 'bestaudio'].filter(Boolean).join('/');
+  const h = Number(f.height) || parseInt(f.quality, 10) || 0;
+  const cap = h ? `[height<=${h}]` : '';
+  const alts = [];
+  if (id) alts.push(...(f.hasAudio ? [id] : [`${id}+bestaudio[ext=m4a]`, `${id}+bestaudio`]));
+  alts.push(`bestvideo${cap}[vcodec^=avc1]+bestaudio[ext=m4a]`, `bestvideo${cap}+bestaudio`, `best${cap}`);
+  return alts.join('/');
+}
+
+/** Whether the reIDM that answers can fetch videos through yt-dlp (0.5 and later); starts it
+ *  if it is not running. An older one would save the video's web page instead. */
+async function reidmResolves() {
+  let info = await ping();
+  if (!info && (await launchReidm())) info = await ping();
+  if (!info) return { ok: false, error: 'reIDM is not running' };
+  if (!info.media) return { ok: false, error: `downloading videos from this site needs reIDM 0.5 or later (this is ${info.version || 'an older one'}); update reIDM` };
+  return { ok: true };
+}
+
+/** A video on a page that only yt-dlp can resolve (YouTube): hand reIDM the page and a format. */
+async function downloadVideoPage(page, title, f, incognito) {
+  const can = await reidmResolves();
+  if (!can.ok) return can;
+  const r = await send({
+    url: page,
+    filename: f && (f.itag != null || f.quality) ? formatFilename(title, f, page) : undefined,
+    referer: page,
+    // The signed-in user's cookies let yt-dlp fetch what they can watch (age checks, members).
+    cookie: await cookieHeader(page, incognito ? 'incognito' : undefined),
+    user_agent: navigator.userAgent,
+    media: { format: ytdlpFormat(f) },
+  });
+  if (r.ok) badge('✓', '#2ea053', 2500);
+  else notify('reIDM could not take the video', r.error || 'unknown error');
+  return r;
+}
+
+const isYouTube = (u) => /^https?:\/\/([a-z0-9-]+\.)*(youtube\.com|youtube-nocookie\.com|youtu\.be)\//i.test(u || '');
+
+/**
+ * The user picked a format. On YouTube it goes through reIDM's yt-dlp; anywhere else a format
+ * with an address is just a download.
  */
 async function downloadFormat(msg, sender) {
   const f = msg.format || {};
-  if (!msg.url) {
-    return {
-      ok: false,
-      error:
-        'this format needs the player’s signature to be resolved, which reIDM cannot do yet ' +
-        '(it needs a yt-dlp-style resolver). Pick a format that is not greyed out.',
-    };
-  }
   const incognito = !!(sender.tab && sender.tab.incognito);
+  if (msg.source === 'youtube' || (!msg.url && isYouTube(msg.page))) {
+    return downloadVideoPage(msg.page, msg.title, f, incognito);
+  }
+  if (!msg.url) return { ok: false, error: 'this format has no address to download from' };
   const r = await send({
     url: msg.url,
     filename: formatFilename(msg.title, f, msg.url),
@@ -796,6 +838,10 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       return true;
     case 'download-format':
       downloadFormat(msg, sender).then(reply);
+      return true;
+    case 'download-video':
+      // From the popup: the video on this YouTube page, in the best quality.
+      downloadVideoPage(msg.page, msg.title, null, !!msg.incognito).then(reply);
       return true;
     case 'ping':
       ping().then((info) => reply({ ok: !!info, info }));

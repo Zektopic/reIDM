@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use reidm_core::{AddOptions, Manager, Request, SettingsPatch};
+use reidm_core::{AddOptions, Manager, Media, Request, SettingsPatch};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -132,6 +132,9 @@ struct AddBody {
     /// *Download Later*: list it in the scheduled queue without starting it.
     #[serde(default)]
     later: bool,
+    /// Fetch the video on the page `url` through yt-dlp, in this format.
+    #[serde(default)]
+    media: Option<Media>,
 }
 
 async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Response {
@@ -145,6 +148,7 @@ async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Re
         cookie: b.cookie,
         user_agent: b.user_agent,
         dir: b.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from),
+        media: b.media,
     };
     match app.mgr.add_with(req, AddOptions { later: b.later, ..Default::default() }) {
         Ok(o) => Json(serde_json::json!({ "id": o.id, "outcome": o.outcome })).into_response(),
@@ -369,6 +373,8 @@ async fn ext_ping(State(app): State<App>, h: HeaderMap, Query(q): Query<PingQuer
         "default_dir": s.default_dir.to_string_lossy(),
         "connections": s.connections,
         "max_concurrent": s.max_concurrent,
+        // Video pages can be handed over for yt-dlp to resolve (`media` in /ext/add).
+        "media": true,
     }))
     .into_response()
 }
@@ -404,6 +410,9 @@ struct ExtAdd {
     refuse_html: bool,
     #[serde(default)]
     later: bool,
+    /// A video the extension found on the page `url`, for yt-dlp to fetch in this format.
+    #[serde(default)]
+    media: Option<Media>,
 }
 
 fn ext_error(e: anyhow::Error) -> Response {
@@ -421,10 +430,11 @@ async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) ->
         cookie: b.cookie.filter(|c| !c.is_empty()),
         user_agent: b.user_agent.filter(|u| !u.is_empty()),
         dir: None,
+        media: b.media,
     };
 
     // A download waiting for a fresh address takes the next link that is the same file.
-    if let Some(id) = app.mgr.refresh_armed() {
+    if let Some(id) = app.mgr.refresh_armed().filter(|_| req.media.is_none()) {
         match app.mgr.refresh_address(id, req.clone()).await {
             Ok(()) => {
                 app.mgr.disarm_refresh();
@@ -482,6 +492,7 @@ async fn ext_add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtBa
             cookie: i.cookie.filter(|c| !c.is_empty()),
             user_agent: b.user_agent.clone().filter(|u| !u.is_empty()),
             dir: None,
+            media: None,
         })
         .collect();
     let results: Vec<serde_json::Value> = app
@@ -548,6 +559,7 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
         cookie: e.cookie,
         user_agent: e.user_agent,
         filename: if single { b.filename.clone() } else { None },
+        media: None,
     }));
     let mut results: Vec<serde_json::Value> = app
         .mgr

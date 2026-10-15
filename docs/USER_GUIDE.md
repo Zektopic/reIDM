@@ -78,6 +78,12 @@ make up to 10,000.
 **From the browser,** downloads arrive by themselves — see
 [Browser integration](BROWSER_INTEGRATION.md).
 
+**Videos from YouTube** come from the **Download with reIDM** button over the video: pick a
+quality and it appears in the list, named after the video. reIDM fetches them with yt-dlp, which
+it gets by itself the first time (see [YouTube](BROWSER_INTEGRATION.md#youtube)). They stop and
+resume like any download; *Refresh download address* doesn't apply to them, because yt-dlp finds
+the address afresh each time. Properties shows the format that was asked for.
+
 ## While a download runs
 
 Every download is split into parts fetched in parallel — 8 connections by default, up to 32. When
@@ -222,6 +228,7 @@ In the data folder:
 | `gui.json` | the window's own preferences |
 | `api-token` | the key the window uses to talk to the service (readable only by you) |
 | `browser-extension/` | the extension folder your browser loads |
+| `tools/` | yt-dlp and, where needed, Deno and ffmpeg, fetched for video downloads; safe to delete — they are fetched again when needed |
 
 An unfinished download is written to `<name>.reidm` next to where the file will be, and renamed
 when it completes.
