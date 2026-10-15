@@ -52,6 +52,8 @@ const DEFAULTS = {
   captureIncognito: false,
   // Start reIDM through the native host when it is not running.
   launchReidm: true,
+  // A desktop notification when reIDM takes a download, or can't.
+  notifications: true,
   sniffMedia: true,
   ignore: ['blob:', 'data:', 'chrome:', 'chrome-extension://', 'about:', 'file://', 'filesystem:'],
 };
@@ -351,6 +353,7 @@ async function takeOver(item, suggest) {
       release();
       recordCapture({ url, filename: details.filename, outcome: r.outcome, id: r.id });
       badge(r.outcome === 'already_complete' ? '=' : '✓', '#2ea053', 2500);
+      announce(r, details.filename || nameFromUrl(url));
       return;
     }
     if (paused) await callback((done) => chrome.downloads.resume(item.id, done));
@@ -407,9 +410,33 @@ async function recordCapture(entry) {
 }
 
 function notify(title, message) {
-  // A notification needs its own permission; the action badge and the popup are enough.
   console.warn(`reIDM: ${title}: ${message}`);
   badge('!', '#c02828', 4000);
+  toast(`reIDM: ${title}`, message);
+}
+
+/** A desktop notification, unless the user turned them off. Never throws. */
+function toast(title, message, id) {
+  if (!settings.notifications || !chrome.notifications) return;
+  try {
+    chrome.notifications.create(
+      id || `reidm-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      { type: 'basic', iconUrl: 'icons/128.png', title, message: String(message || '').slice(0, 300), priority: 0, silent: true },
+      () => void chrome.runtime.lastError,
+    );
+  } catch {
+    /* notifications are a courtesy */
+  }
+}
+
+/** Tell the user reIDM has a download: the browser's own download bubble no longer appears for
+ *  what reIDM takes, so this is how they know it started. */
+function announce(r, name) {
+  if (!r || !r.ok) return;
+  const what = name || 'the download';
+  if (r.outcome === 'already_complete') toast('Already downloaded', `${what} is already in reIDM, finished.`, `reidm-${r.id}`);
+  else if (r.outcome === 'existing') toast('reIDM carries on', `${what} was already in reIDM; it continues from where it stopped.`, `reidm-${r.id}`);
+  else toast('Downloading in reIDM', what, `reidm-${r.id}`);
 }
 
 let badgeTimer = null;
@@ -444,6 +471,7 @@ async function captureLink(msg, sender) {
   if (r.ok) {
     recordCapture({ url, filename, outcome: r.outcome, id: r.id });
     badge(r.outcome === 'already_complete' ? '=' : '✓', '#2ea053', 2500);
+    announce(r, filename || nameFromUrl(url));
   } else {
     recordCapture({ url, filename, error: r.error || 'refused' });
   }
@@ -735,8 +763,11 @@ async function downloadVideoPage(page, title, f, incognito) {
     user_agent: navigator.userAgent,
     media: { format: ytdlpFormat(f) },
   });
-  if (r.ok) badge('✓', '#2ea053', 2500);
-  else notify('reIDM could not take the video', r.error || 'unknown error');
+  if (r.ok) {
+    badge('✓', '#2ea053', 2500);
+    const q = f && f.quality ? ` (${f.quality})` : '';
+    announce(r, `${title || 'the video'}${q}`);
+  } else notify('reIDM could not take the video', r.error || 'unknown error');
   return r;
 }
 
@@ -760,8 +791,10 @@ async function downloadFormat(msg, sender) {
     cookie: await cookieHeader(msg.url, incognito ? 'incognito' : undefined),
     user_agent: navigator.userAgent,
   });
-  if (r.ok) badge('✓', '#2ea053', 2500);
-  else notify('reIDM could not take the video', r.error || 'unknown error');
+  if (r.ok) {
+    badge('✓', '#2ea053', 2500);
+    announce(r, formatFilename(msg.title, f, msg.url));
+  } else notify('reIDM could not take the video', r.error || 'unknown error');
   return r;
 }
 
@@ -834,7 +867,11 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       return true;
     }
     case 'add-batch':
-      sendBatch(msg.items || [], msg.referer, msg.later).then(reply);
+      sendBatch(msg.items || [], msg.referer, msg.later).then((r) => {
+        const n = ((r && r.results) || []).filter((x) => x.outcome === 'new').length;
+        if (r && r.ok && n) toast(msg.later ? 'Added to reIDM for later' : 'Downloading in reIDM', `${n} download${n === 1 ? '' : 's'} added`);
+        reply(r);
+      });
       return true;
     case 'download-format':
       downloadFormat(msg, sender).then(reply);
@@ -903,14 +940,14 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       cookie: await cookieHeader(url, incognito ? 'incognito' : undefined),
       user_agent: navigator.userAgent,
     });
-    flash(r);
+    flash(r, nameFromUrl(url));
     return;
   }
 
   if (info.menuItemId === MENU.selection) {
     const url = (info.selectionText || '').trim();
     if (!isHttp(url)) return flash({ ok: false, error: 'the selection is not a link' });
-    flash(await send({ url, referer, cookie: await cookieHeader(url), user_agent: navigator.userAgent }));
+    flash(await send({ url, referer, cookie: await cookieHeader(url), user_agent: navigator.userAgent }), nameFromUrl(url));
     return;
   }
 
@@ -934,9 +971,12 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 });
 
-function flash(r) {
-  if (r && r.ok) badge(r.queued ? String(r.queued) : '✓', '#2ea053', 2500);
-  else notify('reIDM could not take it', (r && r.error) || 'unknown error');
+function flash(r, name) {
+  if (r && r.ok) {
+    badge(r.queued ? String(r.queued) : '✓', '#2ea053', 2500);
+    if (r.queued != null) toast('Downloading in reIDM', `${r.queued} download${r.queued === 1 ? '' : 's'} added`);
+    else announce(r, name);
+  } else notify('reIDM could not take it', (r && r.error) || 'unknown error');
 }
 
 // ── keeping in touch ────────────────────────────────────────────────────

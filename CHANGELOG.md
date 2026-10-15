@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.1
+
+* **A notification when reIDM takes a download.** The extension shows *Downloading in reIDM* with
+  the file's name — for a captured download, a clicked link, a video from the list, the
+  right-click menu and the grabber — and says why when reIDM can't take one. The browser's own
+  download bubble doesn't appear for what reIDM takes, so this is how you know it started. It can
+  be turned off in the extension's Options.
+* **YouTube downloads are faster and sturdier:** yt-dlp now fetches a video in pieces over as many
+  connections as *Connections per download* (up to 16). One connection is throttled by YouTube, and
+  a long one is often cut off with a 403. About three times faster in testing.
+* **A video download says what it's doing** before its bytes start: *Getting yt-dlp (first time
+  only)*, *Looking up the video*, then *Joining video and audio* at the end. A first YouTube
+  download used to sit at "0 B" for minutes while reIDM fetched yt-dlp, which looked like a hang.
+  `reidm list` shows the same.
+* **The size of a video is right from the start,** video and audio together, instead of an
+  estimate that swung by gigabytes while it downloaded in pieces.
+* The window no longer waits on the download service when you pause, resume or open a download,
+  so a slow answer can't freeze it.
+
 ## 0.5.0
 
 ### YouTube

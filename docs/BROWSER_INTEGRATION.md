@@ -142,6 +142,12 @@ choice to [yt-dlp](https://github.com/yt-dlp/yt-dlp), which keeps up with YouTub
 
 - **The quality you click is the one you get** when yt-dlp's list has it; otherwise the best at
   that height, H.264 with AAC first (it plays anywhere).
+- **Several connections at once,** as many as *Connections per download* in reIDM's Options:
+  yt-dlp fetches the video in pieces, in parallel. One connection is throttled by YouTube, and a
+  long one is often cut off.
+- **The list says what it's doing** before the bytes start: *Getting yt-dlp (first time only)*,
+  *Looking up the video*, and at the end *Joining video and audio*. The size shown is the whole
+  file's, video and audio together, from the start.
 - **Picture and sound arrive as one file.** Qualities above 360p come from YouTube as separate
   video and audio; reIDM has ffmpeg join them.
 - The file is named after the video and the quality, e.g. *Me at the zoo 240p.mp4*.
@@ -206,6 +212,7 @@ Open the extension's **Options** (popup › Options, or right-click the toolbar 
 | Leave downloads smaller than (KB) | 0 | 0 takes everything. |
 | Never take downloads from these sites | — | One host per line; subdomains are included. |
 | Also in incognito windows | off | Also needs *Allow in incognito* on the extension's details page. |
+| Show a notification when reIDM takes a download | on | A desktop notification, *Downloading in reIDM*, with the file's name — the browser's own download bubble doesn't appear for what reIDM takes. Also when reIDM can't take one, and why. |
 | Start reIDM when it is not running | on | Uses the `com.zektopic.reidm` helper. |
 | reIDM port | 61002 | Only change it if you run reIDM on another port. |
 | Look for video and audio | on | Media detection, the popup's list and the quality picker. |

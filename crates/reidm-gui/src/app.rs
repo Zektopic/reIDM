@@ -1478,7 +1478,14 @@ impl App {
                                 let (dr, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
                                 icons::dot(ui.painter(), dr, c);
                                 let n = it.connections();
-                                let label = if it.status == Status::Running && n > 1 { format!("{} ({n})", it.status.label()) } else { it.status.label().to_string() };
+                                let label = match &it.note {
+                                    Some(note) if it.status == Status::Running => {
+                                        let mut c = note.chars();
+                                        c.next().map(|f| format!("{}{}…", f.to_uppercase(), c.as_str())).unwrap_or_default()
+                                    }
+                                    _ if it.status == Status::Running && n > 1 => format!("{} ({n})", it.status.label()),
+                                    _ => it.status.label().to_string(),
+                                };
                                 ui.label(RichText::new(label).size(12.0).color(c)).on_hover_text(if n > 1 { format!("{n} connections") } else { String::new() });
                             });
 

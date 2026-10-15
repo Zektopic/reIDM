@@ -274,21 +274,22 @@ impl Api {
         self.post("/api/downloads", body).map(|_| ())
     }
 
+    /// Ask the service to pause, resume, open… a download, without waiting for the answer on
+    /// the window's thread: a slow answer must not freeze the window. A failure shows in the
+    /// status bar, like the poller's.
     pub fn action(&self, id: u64, what: &str) {
         let Some(t) = self.token() else { return };
-        let r = self
-            .agent
-            .post(format!("{}/api/downloads/{id}/{what}", self.base))
-            .header("X-Reidm-Token", &t)
-            .send("");
-        match r {
-            Ok(mut r) if !r.status().is_success() => {
-                let text = r.body_mut().read_to_string().unwrap_or_default();
-                self.note_error(format!("{what} failed: {text}"));
+        let (agent, url, snapshot, what) = (self.agent.clone(), format!("{}/api/downloads/{id}/{what}", self.base), self.snapshot.clone(), what.to_string());
+        std::thread::spawn(move || {
+            let err = match agent.post(&url).header("X-Reidm-Token", &t).send("") {
+                Ok(mut r) if !r.status().is_success() => Some(r.body_mut().read_to_string().unwrap_or_default()),
+                Err(e) => Some(e.to_string()),
+                _ => None,
+            };
+            if let (Some(e), Ok(mut s)) = (err, snapshot.lock()) {
+                s.last_error = Some(format!("{what} failed: {e}"));
             }
-            Err(e) => self.note_error(format!("{what} failed: {e}")),
-            _ => {}
-        }
+        });
     }
 
     /// Like [`Api::action`], but reports the daemon's answer.
