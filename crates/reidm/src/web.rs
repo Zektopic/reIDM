@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use reidm_core::{AddOptions, Manager, Media, Request, SettingsPatch};
+use reidm_core::{AddOptions, Category, Manager, Media, Request, SettingsPatch};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -375,6 +375,8 @@ async fn ext_ping(State(app): State<App>, h: HeaderMap, Query(q): Query<PingQuer
         "max_concurrent": s.max_concurrent,
         // Video pages can be handed over for yt-dlp to resolve (`media` in /ext/add).
         "media": true,
+        // Where each type of file goes, for the extension's "Download file info" dialog.
+        "folders": folders_json(&app),
     }))
     .into_response()
 }
@@ -585,6 +587,34 @@ struct GrabBody {
 }
 
 /// Scan a page for downloadable files. Read-only: nothing is queued by this call.
+#[derive(Deserialize)]
+struct UrlBody {
+    url: String,
+}
+
+/// The videos of a playlist, for the window's *Add YouTube playlist*. Runs yt-dlp, so the first
+/// call can take a while (reIDM fetches yt-dlp first).
+async fn media_playlist(State(app): State<App>, h: HeaderMap, Json(b): Json<UrlBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    match app.mgr.playlist(&b.url).await {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// The heights and codecs one video comes in.
+async fn media_info(State(app): State<App>, h: HeaderMap, Json(b): Json<UrlBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    match app.mgr.video_info(&b.url).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
 async fn grab(State(_app): State<App>, h: HeaderMap, Json(b): Json<GrabBody>) -> Response {
     if let Err(c) = guard(&_app, &h, true) {
         return c.into_response();
@@ -609,6 +639,31 @@ struct SettingsBody {
     limit_enabled: Option<bool>,
     #[serde(default)]
     schedule: Option<reidm_core::schedule::Schedule>,
+    #[serde(default)]
+    sort_by_category: Option<bool>,
+    /// Every category's folder; an empty or missing one is its default.
+    #[serde(default)]
+    category_dirs: Option<std::collections::BTreeMap<Category, String>>,
+    /// The temporary folder; empty is the default.
+    #[serde(default)]
+    temp_dir: Option<String>,
+}
+
+/// The folders, as the window's Folders tab and the extension's dialog show them: each
+/// category's folder in effect, which ones the user chose, and the temporary folder.
+fn folders_json(app: &App) -> serde_json::Value {
+    let s = app.mgr.settings();
+    let dirs: serde_json::Map<String, serde_json::Value> = reidm_core::category::ALL.iter().map(|c| (c.name().to_string(), s.folder(*c).to_string_lossy().into_owned().into())).collect();
+    let custom: Vec<&str> = s.category_dirs.keys().map(|c| c.name()).collect();
+    let types: serde_json::Map<String, serde_json::Value> = reidm_core::category::ALL.iter().map(|c| (c.name().to_string(), c.extensions().into())).collect();
+    serde_json::json!({
+        "sort": s.sort_by_category,
+        "dirs": dirs,
+        "custom": custom,
+        "types": types,
+        "temp_dir": app.mgr.temp_dir().to_string_lossy(),
+        "temp_custom": s.temp_dir.is_some(),
+    })
 }
 
 /// What the daemon is actually able to offer right now.
@@ -649,6 +704,7 @@ async fn settings(State(app): State<App>, h: HeaderMap) -> Response {
         "speed_limit": s.speed_limit,
         "limit_enabled": s.limit_enabled,
         "schedule": s.schedule,
+        "folders": folders_json(&app),
     }))
     .into_response()
 }
@@ -665,6 +721,9 @@ async fn set_settings(State(app): State<App>, h: HeaderMap, Json(b): Json<Settin
         speed_limit: b.speed_limit,
         limit_enabled: b.limit_enabled,
         schedule: b.schedule,
+        sort_by_category: b.sort_by_category,
+        category_dirs: b.category_dirs.map(|m| m.into_iter().filter(|(_, d)| !d.trim().is_empty()).map(|(c, d)| (c, std::path::PathBuf::from(d.trim()))).collect()),
+        temp_dir: b.temp_dir.map(|d| std::path::PathBuf::from(d.trim())),
     };
     match app.mgr.update_settings(patch) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -741,6 +800,8 @@ pub async fn serve(mgr: Manager, idm_port: Arc<std::sync::atomic::AtomicBool>) -
         .route("/api/settings", get(settings).post(set_settings))
         .route("/api/status", get(status))
         .route("/api/downloads/batch", post(add_batch))
+        .route("/api/media/playlist", post(media_playlist))
+        .route("/api/media/info", post(media_info))
         .route("/api/grab", post(grab))
         .route("/ext/ping", get(ext_ping).options(ext_preflight))
         .route("/ext/add", post(ext_add).options(ext_preflight))

@@ -126,6 +126,12 @@ fn handle_conn(mut s: TcpStream, data: &[u8], ranges: bool, throttle: usize) {
     }
 }
 
+/// Where download `id`'s unfinished data is: `<id>-<name>.reidm` in the temporary folder.
+fn part_file(m: &Manager, id: u64) -> PathBuf {
+    let name = m.get(id).unwrap().path.file_name().unwrap().to_string_lossy().into_owned();
+    m.temp_dir().join(format!("{id}-{name}.reidm"))
+}
+
 fn tmp(tag: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("reidm-it-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&p);
@@ -193,12 +199,7 @@ async fn resume_after_the_part_file_is_lost_is_not_corrupt() {
 
     // Simulate the part file being deleted or lost with a power cut: the database still claims
     // progress, but the bytes are gone.
-    let part = {
-        let p = m.get(id).unwrap().path;
-        let mut s = p.into_os_string();
-        s.push(".reidm");
-        PathBuf::from(s)
-    };
+    let part = part_file(&m, id);
     std::fs::remove_file(&part).unwrap();
 
     m.resume(id).unwrap();
@@ -276,9 +277,7 @@ async fn removing_an_unfinished_download_takes_its_part_file() {
     m.pause(id);
     wait_until("paused", || state(&m, id) == Status::Paused);
 
-    let mut part = m.get(id).unwrap().path.into_os_string();
-    part.push(".reidm");
-    let part = PathBuf::from(part);
+    let part = part_file(&m, id);
     assert!(part.exists());
 
     // Keeping the file, dropping the row: the scratch file must still go, or the next download

@@ -5,13 +5,15 @@
 //! connection is still working on — IDM's dynamic segmentation — so one slow connection does
 //! not decide how long the whole file takes.
 
+pub mod category;
 pub mod grabber;
 mod limiter;
 pub mod lists;
-mod media;
+pub mod media;
 pub mod schedule;
 pub mod update;
 
+pub use category::Category;
 pub use limiter::Limiter;
 pub use media::{valid_format, Media};
 
@@ -294,9 +296,43 @@ pub struct Settings {
     pub limit_enabled: bool,
     #[serde(default)]
     pub schedule: schedule::Schedule,
+    /// File each download into its category's folder, as IDM does.
+    #[serde(default = "yes")]
+    pub sort_by_category: bool,
+    /// A category's folder where the user moved it; otherwise `<default_dir>/<Category>`, and
+    /// the download folder itself for *General*.
+    #[serde(default)]
+    pub category_dirs: BTreeMap<Category, PathBuf>,
+    /// Where unfinished downloads are kept until they are complete; `None` is the `parts`
+    /// folder in the data folder.
+    #[serde(default)]
+    pub temp_dir: Option<PathBuf>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Settings {
+    /// The folder for a category: the user's choice, else its own folder under the download
+    /// folder (the download folder itself for *General*).
+    pub fn folder(&self, c: Category) -> PathBuf {
+        match self.category_dirs.get(&c) {
+            Some(d) => d.clone(),
+            None if c == Category::General => self.default_dir.clone(),
+            None => self.default_dir.join(c.name()),
+        }
+    }
+
+    /// Where a file with this name goes when no folder was asked for.
+    pub fn folder_for(&self, file_name: &str) -> PathBuf {
+        if self.sort_by_category {
+            self.folder(Category::of(file_name))
+        } else {
+            self.default_dir.clone()
+        }
+    }
+
     /// The cap actually in force, in bytes per second; 0 means none.
     pub fn effective_limit(&self) -> u64 {
         if self.limit_enabled {
@@ -322,6 +358,14 @@ pub struct SettingsPatch {
     pub limit_enabled: Option<bool>,
     #[serde(default)]
     pub schedule: Option<schedule::Schedule>,
+    #[serde(default)]
+    pub sort_by_category: Option<bool>,
+    /// Replaces every category's folder; a category left out goes back to its default.
+    #[serde(default)]
+    pub category_dirs: Option<BTreeMap<Category, PathBuf>>,
+    /// The temporary folder; an empty path goes back to the default.
+    #[serde(default)]
+    pub temp_dir: Option<PathBuf>,
 }
 
 struct Inner {
@@ -471,6 +515,20 @@ fn unique_path(dir: &Path, name: &str, claimed: impl Fn(&Path) -> bool) -> PathB
     p
 }
 
+/// Move a finished part file to where the download belongs: a rename, or, when the temporary
+/// folder is on another drive, a copy and a delete.
+async fn move_into_place(part: &Path, dest: &Path) -> Result<()> {
+    if let Some(d) = dest.parent() {
+        tokio::fs::create_dir_all(d).await?;
+    }
+    if tokio::fs::rename(part, dest).await.is_ok() {
+        return Ok(());
+    }
+    tokio::fs::copy(part, dest).await.with_context(|| format!("cannot move the finished file to {}", dest.display()))?;
+    tokio::fs::remove_file(part).await?;
+    Ok(())
+}
+
 fn part_path(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".reidm");
@@ -601,6 +659,9 @@ impl Manager {
             speed_limit: 0,
             limit_enabled: false,
             schedule: Default::default(),
+            sort_by_category: true,
+            category_dirs: BTreeMap::new(),
+            temp_dir: None,
         });
         settings.connections = settings.connections.clamp(1, 32);
         settings.max_concurrent = settings.max_concurrent.clamp(1, 64);
@@ -645,6 +706,18 @@ impl Manager {
         if let Some(d) = &patch.default_dir {
             std::fs::create_dir_all(d).with_context(|| format!("cannot use {} as the download folder", d.display()))?;
         }
+        for (c, d) in patch.category_dirs.iter().flatten() {
+            if !d.is_absolute() {
+                bail!("the {} folder must be a full path, not {}", c.name(), d.display());
+            }
+            std::fs::create_dir_all(d).with_context(|| format!("cannot use {} as the {} folder", d.display(), c.name()))?;
+        }
+        if let Some(d) = patch.temp_dir.as_ref().filter(|d| !d.as_os_str().is_empty()) {
+            if !d.is_absolute() {
+                bail!("the temporary folder must be a full path, not {}", d.display());
+            }
+            std::fs::create_dir_all(d).with_context(|| format!("cannot use {} as the temporary folder", d.display()))?;
+        }
         let limit = {
             let mut s = self.0.settings.lock().unwrap();
             if let Some(d) = patch.default_dir {
@@ -664,6 +737,15 @@ impl Manager {
             }
             if let Some(v) = patch.schedule {
                 s.schedule = v;
+            }
+            if let Some(v) = patch.sort_by_category {
+                s.sort_by_category = v;
+            }
+            if let Some(v) = patch.category_dirs {
+                s.category_dirs = v;
+            }
+            if let Some(v) = patch.temp_dir {
+                s.temp_dir = (!v.as_os_str().is_empty()).then_some(v);
             }
             s.effective_limit()
         };
@@ -695,6 +777,25 @@ impl Manager {
     }
 
     /// Directory holding `downloads.json` (and the daemon's API token, if it is serving a UI).
+    /// Where unfinished downloads are kept: the user's temporary folder, or `parts` in the data
+    /// folder.
+    pub fn temp_dir(&self) -> PathBuf {
+        let set = self.0.settings.lock().unwrap().temp_dir.clone();
+        set.unwrap_or_else(|| self.data_dir().join("parts"))
+    }
+
+    /// The part file of download `id`, which will be `path` when complete: in the temporary
+    /// folder — unless a download begun before there was one already has its part file beside
+    /// the final file, where it carries on.
+    fn part_for(&self, id: u64, path: &Path) -> PathBuf {
+        let beside = part_path(path);
+        if beside.exists() {
+            return beside;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.temp_dir().join(format!("{id}-{name}.reidm"))
+    }
+
     pub fn data_dir(&self) -> &Path {
         self.0.db_path.parent().unwrap_or(Path::new("."))
     }
@@ -787,9 +888,26 @@ impl Manager {
             if !valid_format(&m.format) {
                 bail!("not a format selector: {:?}", m.format);
             }
+            if m.audio.as_deref().is_some_and(|a| !media::AUDIO_FORMATS.contains(&a)) {
+                bail!("not an audio format reIDM converts to: {:?}", m.audio);
+            }
         }
         let key = url_key(&u);
-        let dir = req.dir.clone().unwrap_or_else(|| self.0.settings.lock().unwrap().default_dir.clone());
+        // The name it will most likely have, for its category's folder; settled below.
+        let likely = req
+            .filename
+            .as_deref()
+            .or(probe.as_ref().and_then(|p| p.filename.as_deref()))
+            .map(sanitize_filename)
+            .unwrap_or_else(|| sanitize_filename(&filename_from_url(&u)));
+        let dir = req.dir.clone().unwrap_or_else(|| {
+            let s = self.0.settings.lock().unwrap();
+            match (&req.media, Category::of(&likely)) {
+                // A video page has no telling extension; it is a video unless it is music.
+                (Some(_), Category::General) if s.sort_by_category => s.folder(Category::Video),
+                _ => s.folder_for(&likely),
+            }
+        });
         std::fs::create_dir_all(&dir)?;
 
         let id = {
@@ -954,13 +1072,14 @@ impl Manager {
             it.last_modified = None;
             it.finished_at = None;
             it.status = Status::Queued;
-            let _ = std::fs::remove_file(part_path(&it.path));
+            let _ = std::fs::remove_file(self.part_for(id, &it.path));
             if it.request.media.is_some() {
                 // yt-dlp would otherwise find the finished file and its pieces and stop there.
                 let _ = std::fs::remove_file(&it.path);
                 for f in media::leftovers(&it.path) {
                     let _ = std::fs::remove_file(f);
                 }
+                let _ = std::fs::remove_dir_all(media::work_dir(&self.temp_dir(), id));
             }
         }
         self.save();
@@ -1010,11 +1129,12 @@ impl Manager {
         if let Some(it) = removed {
             // The part file is reIDM's own scratch space, so it always goes; leaving it behind
             // would make every later download of the same name pick "name (1).zip".
-            let _ = std::fs::remove_file(part_path(&it.path));
+            let _ = std::fs::remove_file(self.part_for(id, &it.path));
             if it.request.media.is_some() {
                 for f in media::leftovers(&it.path) {
                     let _ = std::fs::remove_file(f);
                 }
+                let _ = std::fs::remove_dir_all(media::work_dir(&self.temp_dir(), id));
             }
             if delete_files {
                 // "remove and delete the file" must also work for finished downloads, which are
@@ -1349,7 +1469,13 @@ impl Manager {
             let p = self.probe(&item.request.url, &headers).await?;
             if item.request.filename.is_none() {
                 if let Some(n) = &p.filename {
-                    let dir = item.path.parent().unwrap().to_path_buf();
+                    // The server's name can say a different type than the address did: file it
+                    // in that type's folder, unless a folder was asked for.
+                    let dir = match &item.request.dir {
+                        Some(d) => d.clone(),
+                        None => self.0.settings.lock().unwrap().folder_for(&sanitize_filename(n)),
+                    };
+                    std::fs::create_dir_all(&dir)?;
                     // Other downloads must not be renamed onto the same file either.
                     let claimed: HashSet<PathBuf> = {
                         let db = self.0.db.lock().unwrap();
@@ -1376,7 +1502,10 @@ impl Manager {
             self.save();
         }
 
-        let part = part_path(&item.path);
+        let part = self.part_for(id, &item.path);
+        if let Some(d) = part.parent() {
+            std::fs::create_dir_all(d)?;
+        }
         {
             let f = tokio::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&part).await?;
             // The database can be ahead of the part file: it is written without fsync, and the
@@ -1467,7 +1596,7 @@ impl Manager {
             // not happen; if it does, say so rather than calling it "paused".
             bail!("the transfer stopped before the file was complete; resume it to try again");
         }
-        tokio::fs::rename(&part, &item.path).await?;
+        move_into_place(&part, &item.path).await?;
         Ok(true)
     }
 

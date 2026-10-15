@@ -66,12 +66,17 @@ them from there — before anything is saved:
 
 1. Chrome decides a download's file name before it shows the download, opens a *Save as* dialog,
    or writes the file. The extension holds that decision.
-2. It pauses the transfer and asks reIDM to take the download, sending the final address, the
-   referring page, your cookies for that site, and the browser's user agent.
-3. reIDM fetches the first byte to prove it can download it.
-4. **Only then** is the browser's copy cancelled and removed from its download list. You see no
+2. It pauses the transfer and shows reIDM's **Download file info** dialog, as IDM does: the
+   address, the file name (which you can change), the folder it will be saved in and its size.
+   **Start download** carries on; **Download later** puts it in reIDM's scheduled queue;
+   **Cancel**, or closing the dialog, means nobody downloads it — neither reIDM nor the browser.
+   (*Don't ask again*, or Options › *Ask before each download*, turns the dialog off.)
+3. It asks reIDM to take the download, sending the final address, the referring page, your
+   cookies for that site, and the browser's user agent.
+4. reIDM fetches the first byte to prove it can download it.
+5. **Only then** is the browser's copy cancelled and removed from its download list. You see no
    download bubble, no *Save as* dialog, and no partial file.
-5. If reIDM can't take it — it isn't running and can't be started, the site refuses it, it's a
+6. If reIDM can't take it — it isn't running and can't be started, the site refuses it, it's a
    one-time link the browser has already used — the download is resumed and released exactly as
    it was. **The worst case is "the browser downloads it", never "nobody does".**
 
@@ -212,6 +217,7 @@ Open the extension's **Options** (popup › Options, or right-click the toolbar 
 | Leave downloads smaller than (KB) | 0 | 0 takes everything. |
 | Never take downloads from these sites | — | One host per line; subdomains are included. |
 | Also in incognito windows | off | Also needs *Allow in incognito* on the extension's details page. |
+| Ask before each download | on | The *Download file info* dialog — name, folder, size; Start download, Download later, Cancel — for downloads the extension takes, clicked file links, the right-click menu and a video's qualities. Off: they start at once. |
 | Show a notification when reIDM takes a download | on | A desktop notification, *Downloading in reIDM*, with the file's name — the browser's own download bubble doesn't appear for what reIDM takes. Also when reIDM can't take one, and why. |
 | Start reIDM when it is not running | on | Uses the `com.zektopic.reidm` helper. |
 | reIDM port | 61002 | Only change it if you run reIDM on another port. |

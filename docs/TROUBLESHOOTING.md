@@ -116,9 +116,14 @@ and stopping it means starting again. Nothing in reIDM can change that.
 **Downloads stay *Queued*.** No more than *Downloads at the same time* (Options) run at once; the
 rest wait. Raise it, or stop something.
 
-**Files ending in `.reidm` in the download folder.** Downloads in progress. Each is renamed to
-its real name when complete. A leftover one belongs to a download you removed without *delete the
-file*; it's safe to delete.
+**Files ending in `.reidm` in the download folder.** Downloads begun before reIDM 0.6, which
+carry on where they started; newer ones wait in the temporary folder (Options › Folders) and
+appear in the download folder only when complete. A leftover `.reidm` belongs to a download you
+removed without *delete the file*; it's safe to delete.
+
+**A finished file isn't where I expected.** reIDM files downloads by type — `Video`,
+`Compressed`, `Programs`… under the download folder. Right-click › *Open folder* shows where one
+went; Options › Folders sets each type's folder, or turns sorting off.
 
 **A finished download reports *already downloaded* when added again.** reIDM recognises the
 address. Delete the file (or remove the download with *delete the file*) to download it again,

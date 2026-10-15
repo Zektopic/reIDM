@@ -65,6 +65,12 @@ impl Default for BatchState {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OptTab {
+    General,
+    Folders,
+}
+
 /// *Refresh download address* for one download.
 struct RefreshState {
     id: u64,
@@ -122,6 +128,11 @@ pub struct App {
     batch: BatchState,
     show_options: bool,
     opt_dir: String,
+    opt_tab: OptTab,
+    opt_sort: bool,
+    /// Category name and its folder, as edited; empty is its default.
+    opt_folders: Vec<(&'static str, String)>,
+    opt_temp: String,
     opt_conn: usize,
     opt_max: usize,
     confirm_remove: Vec<u64>,
@@ -148,6 +159,7 @@ pub struct App {
 
     // site grabber
     show_grabber: bool,
+    playlist: crate::playlist::PlaylistWindow,
     grab: GrabState,
 }
 
@@ -202,6 +214,10 @@ impl App {
             batch: BatchState::default(),
             show_options: false,
             opt_dir: String::new(),
+            opt_tab: OptTab::General,
+            opt_sort: true,
+            opt_folders: Vec::new(),
+            opt_temp: String::new(),
             opt_conn: 8,
             opt_max: 4,
             confirm_remove: Vec::new(),
@@ -220,6 +236,7 @@ impl App {
             downloads_open: true,
             checked_on_start: false,
             show_grabber: false,
+            playlist: Default::default(),
             grab: GrabState::default(),
         }
     }
@@ -726,8 +743,32 @@ impl App {
             self.opt_dir = s.default_dir;
             self.opt_conn = s.connections.max(1);
             self.opt_max = s.max_concurrent.max(1);
+            self.opt_sort = s.folders.sort;
+            // Only the folders the user chose are shown filled in; the rest follow the
+            // download folder, and show it greyed as their hint.
+            self.opt_folders = reidm_core::category::ALL
+                .iter()
+                .map(|c| (c.name(), if s.folders.custom.iter().any(|n| n == c.name()) { s.folders.dirs.get(c.name()).cloned().unwrap_or_default() } else { String::new() }))
+                .collect();
+            self.opt_temp = if s.folders.temp_custom { s.folders.temp_dir } else { String::new() };
         }
+        self.opt_tab = OptTab::General;
         self.show_options = true;
+    }
+
+    /// *Add YouTube playlist*, with a playlist link from the clipboard already filled in.
+    fn open_playlist(&mut self) {
+        let s = self.api.fetch_settings().unwrap_or_default();
+        let dir = |n: &str| s.folders.dirs.get(n).cloned().unwrap_or_else(|| s.default_dir.clone());
+        let (video, music) = if s.folders.sort { (dir("Video"), dir("Music")) } else { (s.default_dir.clone(), s.default_dir.clone()) };
+        let clip = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()).map(|t| t.trim().to_string()).filter(|t| t.starts_with("http") && (t.contains("list=") || t.contains("/@") || t.contains("/channel/")));
+        self.playlist.open_with(clip, video, music);
+    }
+
+    /// Where a category goes when the user hasn't chosen: under the download folder.
+    fn default_folder(&self, name: &str) -> String {
+        let base = std::path::Path::new(&self.opt_dir);
+        if name == reidm_core::Category::General.name() { base.to_string_lossy().into_owned() } else { base.join(name).to_string_lossy().into_owned() }
     }
 
     /// Keyboard shortcuts for the list. Ignored while a text field has the keyboard.
@@ -812,6 +853,9 @@ impl eframe::App for App {
         self.add_dialog(&ctx, &p);
         self.batch_dialog(&ctx, &p);
         self.options_dialog(&ctx, &p);
+        if let Some(msg) = self.playlist.show(&ctx, &self.api, &p) {
+            self.toast(msg);
+        }
         self.about_dialog(&ctx);
         self.confirm_dialog(&ctx);
         self.grabber_window(&ctx, &p);
@@ -896,6 +940,10 @@ impl App {
                     ui.menu_button("Tasks", |ui| {
                         if ui.button("Add URL…").clicked() {
                             self.open_add();
+                            ui.close();
+                        }
+                        if ui.button("Add YouTube playlist…").clicked() {
+                            self.open_playlist();
                             ui.close();
                         }
                         if ui.button("Add batch download…").clicked() {
@@ -1880,7 +1928,15 @@ impl App {
         let mut limiter = false;
         let mut integration = false;
         window("Options").open(&mut open).show(ctx, |ui| {
-            ui.set_min_width(500.0);
+            ui.set_min_width(560.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.opt_tab, OptTab::General, "General");
+                ui.selectable_value(&mut self.opt_tab, OptTab::Folders, "Folders");
+            });
+            ui.separator();
+            if self.opt_tab == OptTab::Folders {
+                self.folders_tab(ui, p);
+            } else {
             ui.label(RichText::new("Downloads").strong());
             ui.add_space(6.0);
             label(ui, p, "Default download folder");
@@ -1935,6 +1991,7 @@ impl App {
                 }
                 label(ui, p, "Uses the GitHub Releases API; nothing is downloaded or installed by itself.");
             });
+            }
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 if ui.add_sized(Vec2::new(90.0, 28.0), egui::Button::new("Save")).clicked() {
@@ -1946,10 +2003,14 @@ impl App {
             });
         });
         if save {
+            let dirs: serde_json::Map<String, serde_json::Value> = self.opt_folders.iter().filter(|(_, d)| !d.trim().is_empty()).map(|(n, d)| (n.to_string(), d.trim().into())).collect();
             let r = self.api.update_settings(serde_json::json!({
                 "default_dir": self.opt_dir,
                 "connections": self.opt_conn,
                 "max_concurrent": self.opt_max,
+                "sort_by_category": self.opt_sort,
+                "category_dirs": dirs,
+                "temp_dir": self.opt_temp.trim(),
             }));
             self.prefs.save();
             match r {
@@ -1969,6 +2030,48 @@ impl App {
         if !open {
             self.show_options = false;
         }
+    }
+
+    /// Options › Folders: where each type of file goes, and where unfinished downloads wait.
+    fn folders_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.checkbox(&mut self.opt_sort, "Save each download in the folder for its type");
+        label(ui, p, "As IDM does: videos in Video, archives in Compressed, installers in Programs… A folder left empty is the one under the download folder shown in grey; anything else goes to the download folder itself.");
+        ui.add_space(8.0);
+        let defaults: Vec<String> = self.opt_folders.iter().map(|(n, _)| self.default_folder(n)).collect();
+        egui::Grid::new("folders").num_columns(4).spacing(Vec2::new(8.0, 6.0)).show(ui, |ui| {
+            for ((name, dir), default) in self.opt_folders.iter_mut().zip(&defaults) {
+                let name: &'static str = name;
+                let on = self.opt_sort || name == "General";
+                ui.add_enabled_ui(on, |ui| ui.label(if name == "General" { "Everything else" } else { name }));
+                ui.add_enabled_ui(on, |ui| ui.add_sized(Vec2::new(330.0, 22.0), egui::TextEdit::singleline(dir).hint_text(default.as_str())));
+                if ui.add_enabled(on, egui::Button::new("Browse…")).clicked() {
+                    let start = if dir.is_empty() { default.clone() } else { dir.clone() };
+                    if let Some(d) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
+                        *dir = d.to_string_lossy().into_owned();
+                    }
+                }
+                if ui.add_enabled(!dir.is_empty(), egui::Button::new("Default")).on_hover_text("Back to the folder under the download folder").clicked() {
+                    dir.clear();
+                }
+                ui.end_row();
+            }
+        });
+        ui.add_space(12.0);
+        ui.label(RichText::new("Temporary folder").strong());
+        label(ui, p, "Unfinished downloads wait here, and move to their folder when complete — so the download folder only ever holds finished files. On another drive than the download folder, the move is a copy.");
+        let temp_default = reidm_core::default_data_dir().join("parts").to_string_lossy().into_owned();
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.opt_temp).hint_text(temp_default.as_str()).desired_width(330.0));
+            if ui.button("Browse…").clicked() {
+                let start = if self.opt_temp.is_empty() { temp_default.clone() } else { self.opt_temp.clone() };
+                if let Some(d) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
+                    self.opt_temp = d.to_string_lossy().into_owned();
+                }
+            }
+            if ui.add_enabled(!self.opt_temp.is_empty(), egui::Button::new("Default")).clicked() {
+                self.opt_temp.clear();
+            }
+        });
     }
 
     fn about_dialog(&mut self, ctx: &egui::Context) {

@@ -415,6 +415,59 @@ impl Api {
         rx
     }
 
+    /// POST JSON on another thread, the answer parsed into `T`, over a channel.
+    fn post_async<T: serde::de::DeserializeOwned + Send + 'static>(&self, path: &str, body: serde_json::Value, timeout: Duration) -> Receiver<Result<T, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (url, token) = (format!("{}{path}", self.base), self.token());
+        std::thread::spawn(move || {
+            let r = (|| {
+                let t = token.ok_or("not connected to the download service")?;
+                let mut r = agent(timeout).post(&url).header("X-Reidm-Token", &t).header("Content-Type", "application/json").send(body.to_string()).map_err(|e| e.to_string())?;
+                let text = r.body_mut().read_to_string().map_err(|e| e.to_string())?;
+                if !r.status().is_success() {
+                    return Err(if text.trim().is_empty() { format!("HTTP {}", r.status()) } else { text });
+                }
+                serde_json::from_str(&text).map_err(|e| e.to_string())
+            })();
+            let _ = tx.send(r);
+        });
+        rx
+    }
+
+    /// The videos of a playlist. Slow the first time: the service fetches yt-dlp.
+    pub fn playlist_async(&self, url: &str) -> Receiver<Result<reidm_core::media::Playlist, String>> {
+        self.post_async("/api/media/playlist", serde_json::json!({ "url": url }), Duration::from_secs(600))
+    }
+
+    /// The heights and codecs one video comes in.
+    pub fn video_info_async(&self, url: &str) -> Receiver<Result<reidm_core::media::VideoInfo, String>> {
+        self.post_async("/api/media/info", serde_json::json!({ "url": url }), Duration::from_secs(600))
+    }
+
+    /// Queue videos, each `(page, media, file name)`, on another thread. Answers how many were added, and
+    /// the errors of those that weren't.
+    pub fn add_videos_async(&self, items: Vec<(String, serde_json::Value, String)>, dir: Option<String>, later: bool) -> Receiver<(usize, Vec<String>)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (base, token) = (self.base.clone(), self.token());
+        std::thread::spawn(move || {
+            let a = agent(Duration::from_secs(30));
+            let (mut ok, mut errors) = (0, Vec::new());
+            for (url, media, filename) in items {
+                let body = serde_json::json!({ "url": url, "media": media, "dir": dir, "later": later, "filename": filename });
+                let r = token.as_deref().ok_or_else(|| "not connected to the download service".to_string()).and_then(|t| {
+                    a.post(format!("{base}/api/downloads")).header("X-Reidm-Token", t).header("Content-Type", "application/json").send(body.to_string()).map_err(|e| e.to_string())
+                });
+                match r {
+                    Ok(r) if r.status().is_success() => ok += 1,
+                    Ok(mut r) => errors.push(r.body_mut().read_to_string().unwrap_or_default()),
+                    Err(e) => errors.push(e),
+                }
+            }
+            let _ = tx.send((ok, errors));
+        });
+        rx
+    }
+
     /// Open a URL in the user's browser (used for release notes and update downloads).
     pub fn open_url(&self, url: &str) {
         open_external(url);

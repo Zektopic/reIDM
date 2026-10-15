@@ -12,8 +12,14 @@ const FAKE_YTDLP: &str = r#"#!/bin/sh
 # Stand-in for yt-dlp. Records its arguments; `mode` beside it says how to behave.
 here=$(dirname "$0")
 printf '%s\n' "$@" > "$here/args.txt"
-out=""; prev=""
-for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+out=""; home=""; temp=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "-o" ] && out="$a"
+  [ "$prev" = "-P" ] && case "$a" in home:*) home="${a#home:}" ;; temp:*) temp="${a#temp:}" ;; esac
+  prev="$a"
+done
+[ -n "$home" ] && out="$home/$out"
+printf '%s' "$temp" > "$here/temp.txt"
 file=$(printf '%s' "$out" | sed 's/%(ext)s/mp4/; s/%(title)\.150B/Clip/; s/%(id)s/abc/; s/%(height&{}p|audio)s/360p/')
 case "$(cat "$here/mode" 2>/dev/null)" in
   fail) echo "WARNING: [youtube] something minor" >&2; echo "ERROR: [youtube] abc: Video unavailable" >&2; exit 1 ;;
@@ -60,7 +66,7 @@ fn video(dl: &Path, format: &str) -> Request {
     Request {
         url: "https://www.youtube.com/watch?v=abc".into(),
         dir: Some(dl.to_path_buf()),
-        media: Some(Media { format: format.into() }),
+        media: Some(Media { format: format.into(), audio: None }),
         ..Default::default()
     }
 }
@@ -92,6 +98,9 @@ async fn a_video_is_fetched_by_ytdlp_and_named_after_its_title() {
     assert_eq!(after("--js-runtimes"), Some(format!("deno:{}", tools.join("deno").display())));
     assert_eq!(args[args.len() - 2..], ["--".to_string(), "https://www.youtube.com/watch?v=abc".to_string()], "the page last, after `--`");
     assert!(args.iter().any(|a| a == "--no-playlist"));
+    let temp = std::fs::read_to_string(tools.join("temp.txt")).unwrap();
+    assert!(temp.ends_with(&format!("parts/video-{id}")), "yt-dlp's pieces go to the temporary folder, not {temp:?}");
+    assert!(!Path::new(&temp).exists(), "and that folder goes once the file is done");
 }
 
 #[tokio::test(flavor = "multi_thread")]

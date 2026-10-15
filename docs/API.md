@@ -94,7 +94,7 @@ Every download, in the order they were added. Cookies are never included.
 |---|---|
 | `id` | the download's number |
 | `request` | what is fetched: address, and the referrer, user agent, file name and folder it was added with |
-| `path` | where the finished file goes; while it runs, the data is in `path` + `.reidm` |
+| `path` | where the finished file goes; while it runs, the data is in the temporary folder |
 | `size` | total bytes, or `null` while unknown |
 | `downloaded` | bytes so far |
 | `status` | `{"state": "Queued" \| "Running" \| "Paused" \| "Done"}`, or `{"state": "Failed", "error": "…"}` |
@@ -258,9 +258,20 @@ still start only as slots free up (*downloads at the same time*).
   "max_concurrent": 4,
   "speed_limit": 2097152,
   "limit_enabled": false,
-  "schedule": { "enabled": true, "start": "23:00", "stop": "06:30", "days": [0, 1, 2, 3, 4] }
+  "schedule": { "enabled": true, "start": "23:00", "stop": "06:30", "days": [0, 1, 2, 3, 4] },
+  "folders": {
+    "sort": true,
+    "dirs": { "General": "/home/me/Downloads", "Video": "/home/me/Downloads/Video", "Music": "/media/music", "…": "…" },
+    "custom": ["Music"],
+    "types": { "Video": ["mp4", "mkv", "…"], "…": [] },
+    "temp_dir": "/home/me/.local/share/reidm/parts",
+    "temp_custom": false
+  }
 }
 ```
+
+`folders.dirs` is each category's folder in effect; `custom` the ones the user chose; `types` the
+extensions that make each category.
 
 #### `POST /api/settings`
 
@@ -277,6 +288,9 @@ a new speed limit included, to transfers already running.
 | `schedule.enabled` | run the scheduled queue at set times |
 | `schedule.start`, `schedule.stop` | `"HH:MM"`, local time, 24-hour, or `null`. A stop earlier than the start means the next morning |
 | `schedule.days` | Monday = 0 … Sunday = 6; empty means every day |
+| `sort_by_category` | file downloads into their category's folder |
+| `category_dirs` | `{ "Video": "/full/path", … }` — replaces every choice: a category left out, or empty, goes back to its default (under the download folder). Paths must be absolute; they are created |
+| `temp_dir` | where unfinished downloads wait; `""` is the default (`parts` in the data folder) |
 
 ```sh
 curl -s -H "X-Reidm-Token: $TOKEN" -H 'Content-Type: application/json' \
@@ -318,6 +332,32 @@ What the service is able to do right now.
 
 The list as plain text: one address per line (`txt`, the default), or IDM's export format
 (`ef2`) with each download's referrer and user agent. Never includes cookies.
+
+## Videos
+
+Both run yt-dlp (which reIDM fetches the first time), so they can take a few seconds — or, on
+first use, a minute.
+
+#### `POST /api/media/playlist`
+
+`{ "url": "https://www.youtube.com/playlist?list=…" }` — a playlist, a channel's videos, or one
+video. The videos, without looking into each:
+
+```json
+{ "title": "Blender Studio - Videos", "entries": [ { "url": "https://www.youtube.com/watch?v=Q1fMMYyt0I4", "id": "Q1fMMYyt0I4", "title": "Raising the Steaks", "duration": 855.0 } ] }
+```
+
+#### `POST /api/media/info`
+
+`{ "url": "https://www.youtube.com/watch?v=…" }` — the heights one video comes in, tallest first,
+each with its codecs (`H264`, `Vp9`, `Av1`) and its largest format's size without sound:
+
+```json
+{ "title": "Big Buck Bunny", "heights": [ { "height": 2160, "codecs": ["Vp9", "Av1"], "size": 1362269481 }, { "height": 1080, "codecs": ["H264", "Vp9", "Av1"], "size": 257619653 } ] }
+```
+
+To download one, `POST /api/downloads` with `media` (see above): a format selector, and, for sound
+converted to MP3 or Opus, `"audio": "mp3"`.
 
 ## Site grabber
 
@@ -369,7 +409,7 @@ Is reIDM running, and with what defaults? A ping that carries `v` is recorded as
 checking in (shown in `/api/status`).
 
 ```json
-{ "app": "reIDM", "version": "0.5.0", "default_dir": "/home/me/Downloads", "connections": 8, "max_concurrent": 4, "media": true }
+{ "app": "reIDM", "version": "0.6.0", "default_dir": "/home/me/Downloads", "connections": 8, "max_concurrent": 4, "media": true, "folders": { "…": "as in GET /api/settings" } }
 ```
 
 `media: true` means `/ext/add` accepts `media` (from 0.5.0). An older reIDM would save a video's

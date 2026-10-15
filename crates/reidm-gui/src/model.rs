@@ -135,42 +135,36 @@ pub enum Category {
     All,
     Video,
     Music,
+    Images,
     Documents,
     Compressed,
     Programs,
     Other,
 }
 
-pub const CATEGORIES: [Category; 7] = [
+pub const CATEGORIES: [Category; 8] = [
     Category::All,
     Category::Video,
     Category::Music,
+    Category::Images,
     Category::Documents,
     Category::Compressed,
     Category::Programs,
     Category::Other,
 ];
 
-const VIDEO: &[&str] = &["3GP", "ASF", "AVI", "FLV", "M4V", "MKV", "MOV", "MP4", "MPE", "MPEG", "MPG", "OGV", "QT", "RM", "RMVB", "TS", "VOB", "WEBM", "WMV"];
-const MUSIC: &[&str] = &["AAC", "AIF", "FLAC", "M4A", "MP3", "MPA", "OGG", "RA", "WAV", "WMA"];
-const DOCUMENTS: &[&str] = &["CHM", "DOC", "DOCX", "EPUB", "MOBI", "ODP", "ODS", "ODT", "PDF", "PPS", "PPT", "PPTX", "RTF", "TXT", "XLS", "XLSX"];
-const COMPRESSED: &[&str] = &["7Z", "ACE", "ARJ", "BZ2", "GZ", "GZIP", "LZH", "RAR", "TAR", "TGZ", "XZ", "Z", "ZIP"];
-const PROGRAMS: &[&str] = &["APK", "APP", "BIN", "DEB", "DMG", "EXE", "IMG", "ISO", "MSI", "MSU", "PKG", "RPM"];
-
 impl Category {
+    /// By extension, as the download service files it (`reidm_core::Category`).
     pub fn of(ext: &str) -> Category {
-        if VIDEO.contains(&ext) {
-            Category::Video
-        } else if MUSIC.contains(&ext) {
-            Category::Music
-        } else if DOCUMENTS.contains(&ext) {
-            Category::Documents
-        } else if COMPRESSED.contains(&ext) {
-            Category::Compressed
-        } else if PROGRAMS.contains(&ext) {
-            Category::Programs
-        } else {
-            Category::Other
+        use reidm_core::Category as C;
+        match C::of(&format!("x.{ext}")) {
+            C::Video => Category::Video,
+            C::Music => Category::Music,
+            C::Images => Category::Images,
+            C::Documents => Category::Documents,
+            C::Compressed => Category::Compressed,
+            C::Programs => Category::Programs,
+            C::General => Category::Other,
         }
     }
 
@@ -179,6 +173,7 @@ impl Category {
             Category::All => "All Downloads",
             Category::Video => "Video",
             Category::Music => "Music",
+            Category::Images => "Images",
             Category::Documents => "Documents",
             Category::Compressed => "Compressed",
             Category::Programs => "Programs",
@@ -251,6 +246,25 @@ pub struct Settings {
     pub limit_enabled: bool,
     #[serde(default)]
     pub schedule: Schedule,
+    #[serde(default)]
+    pub folders: Folders,
+}
+
+/// Where each type of file goes, as the service reports it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Folders {
+    #[serde(default)]
+    pub sort: bool,
+    /// Category name -> the folder in effect.
+    #[serde(default)]
+    pub dirs: std::collections::BTreeMap<String, String>,
+    /// The categories whose folder the user chose.
+    #[serde(default)]
+    pub custom: Vec<String>,
+    #[serde(default)]
+    pub temp_dir: String,
+    #[serde(default)]
+    pub temp_custom: bool,
 }
 
 /// When reIDM's own browser extension last checked in.

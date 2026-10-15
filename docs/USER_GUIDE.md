@@ -78,6 +78,16 @@ make up to 10,000.
 **From the browser,** downloads arrive by themselves — see
 [Browser integration](BROWSER_INTEGRATION.md).
 
+**A YouTube playlist** (Tasks › **Add YouTube playlist…**): paste the playlist's address — or a
+channel's *Videos* page — and **List videos**. Every video is listed with its length, and, as
+reIDM looks into each in the background, what it offers (*up to 2160p · VP9, AV1, H.264*). Choose
+a resolution and a codec per video, or for all of them at once — **1080p H.264** (plays
+anywhere), **720p H.264**, **4K**, **Best quality**, **Audio M4A**, **Audio MP3**, or any
+resolution and codec by hand. *You get* says what each video will really be: where a video lacks
+the codec at that height, it gets the nearest it has (*804p H.264*, *1080p VP9 (no H.264)*).
+**Download** or **Download later** queues the selected videos, by default in a folder named after
+the playlist inside `Video` (or `Music`, for sound only).
+
 **Videos from YouTube** come from the **Download with reIDM** button over the video: pick a
 quality and it appears in the list, named after the video. reIDM fetches them with yt-dlp, which
 it gets by itself the first time (see [YouTube](BROWSER_INTEGRATION.md#youtube)). They stop and
@@ -189,6 +199,7 @@ itself can import. Exports never include cookies.
 
 | Option | |
 |---|---|
+| **General** tab: | |
 | Default download folder | where new downloads go unless Add URL says otherwise |
 | Connections per download | 1–32 (default 8) |
 | Downloads at the same time | 1–16 here (default 4); the rest wait in line |
@@ -198,6 +209,10 @@ itself can import. Exports never include cookies.
 | Fill Add URL with links from the clipboard | |
 | Browser | whether the extension is connected, and *Set up…* |
 | Updates | *Check now*. reIDM also checks once shortly after it starts |
+| **Folders** tab: | |
+| Save each download in the folder for its type | IDM's categories, on by default: videos in `Video`, archives in `Compressed`, installers in `Programs`, and `Documents`, `Images`, `Music`; anything else in the download folder itself |
+| One folder per type | each defaults to the folder of that name under the download folder (shown greyed), and follows it if the download folder moves; *Browse…* puts it anywhere, *Default* puts it back |
+| Temporary folder | where unfinished downloads wait (default: `parts` in the [data folder](#where-reidm-keeps-things)); each moves to its folder when complete, so the download folder only ever holds finished files. On another drive, that move is a copy |
 
 ## Keyboard shortcuts
 
@@ -230,8 +245,14 @@ In the data folder:
 | `browser-extension/` | the extension folder your browser loads |
 | `tools/` | yt-dlp and, where needed, Deno and ffmpeg, fetched for video downloads; safe to delete — they are fetched again when needed |
 
-An unfinished download is written to `<name>.reidm` next to where the file will be, and renamed
-when it completes.
+An unfinished download is written to the temporary folder (`parts/` in the data folder, or the
+one set in Options › Folders) as `<id>-<name>.reidm`, and moved to its folder when it completes;
+a video's pieces wait in `parts/video-<id>/`. A download begun before reIDM 0.6 carries on beside
+its file, where it started.
+
+| | |
+|---|---|
+| `parts/` | unfinished downloads; a leftover belongs to a download removed without *delete the file*, and is safe to delete |
 
 **The web view.** `reidm ui` opens the same list in a web browser at `http://127.0.0.1:61002/` —
 handy over SSH or on a machine without a desktop.

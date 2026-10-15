@@ -39,11 +39,14 @@ official "IDM Integration Module" extension can hand downloads to it too.
 - Starts reIDM by itself if it isn't running. Form submissions, page-generated files, Alt-clicks and sites you exclude stay with the browser.
 - Finds video and audio on a page (HLS, DASH, progressive), lists every quality, and grabs every link, image, video and file a page offers.
 - **YouTube**: pick any quality from the list over the video and reIDM downloads it, picture and sound joined into one file. It uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), which it fetches and keeps up to date by itself.
+- **YouTube playlists**: every video listed with the resolutions and codecs it comes in; choose per video or for all.
+- IDM's **Download file info** dialog before each download: name, folder, size; Start, Later or Cancel.
 
 **Download engine**
 - Up to 32 connections per download with **dynamic segmentation**: a connection that finishes early takes over half of the slowest one's remaining part.
 - Survives crashes, restarts and servers that cap connections; never splices a file that changed on the server (`If-Range` and size checks).
 - Global and per-download **speed limiter**, a **queue** and a **scheduler** (start and stop times, weekdays).
+- Files sorted into **category folders** (Video, Compressed, Programs…), with unfinished downloads kept in a temporary folder until complete.
 - **Refresh an expired link** and carry on where it stopped — by pasting the new address, or by clicking the link in the browser again.
 
 **Everything else IDM users expect**

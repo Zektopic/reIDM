@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.6.0
+
+### IDM's "Download file info" dialog
+
+* Before a download starts, the extension shows the address, the file name (to change if you
+  like), the folder it will go to and its size, with **Start download**, **Download later** and
+  **Cancel** — for downloads it takes from the browser, clicked file links, the right-click menu
+  and a video's qualities. Cancel means nobody downloads it, neither reIDM nor the browser. *Don't
+  ask again*, or *Ask before each download* in the extension's Options, turns it off.
+* Notifications alone weren't enough: with Windows' notifications switched off, nothing at all
+  said a download had started.
+
+### Folders
+
+* **Downloads are filed by type**, as in IDM: `Compressed`, `Documents`, `Images`, `Music`,
+  `Programs` and `Video` under the download folder, anything else in the download folder itself.
+  **Options › Folders** — a new tab — moves any of them, or turns sorting off.
+* **Unfinished downloads wait in a temporary folder** (`parts` in the data folder, or one set in
+  Options › Folders) and move to their folder when complete, so the download folder no longer
+  fills with `.reidm` and yt-dlp part files. Downloads already under way carry on where they are.
+* The window's categories (and the new *Images*) follow the same rules as the folders.
+* `GET`/`POST /api/settings` carry `sort_by_category`, `category_dirs` and `temp_dir`.
+
+### YouTube playlists
+
+* **Tasks › Add YouTube playlist…** lists every video of a playlist or a channel, with its length
+  and — looked up in the background — the resolutions and codecs it comes in. Pick a resolution
+  and codec per video, or for all at once (*1080p H.264*, *720p H.264*, *4K*, *Best quality*,
+  *Audio M4A*, *Audio MP3*); *You get* shows what each will really be. Download now or later, by
+  default into a folder named after the playlist.
+* New endpoints `POST /api/media/playlist` and `POST /api/media/info`; `media.audio` converts the
+  sound to MP3 or Opus.
+
 ## 0.5.1
 
 * **A notification when reIDM takes a download.** The extension shows *Downloading in reIDM* with

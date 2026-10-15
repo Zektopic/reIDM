@@ -202,6 +202,7 @@ pub fn file_card(p: &Painter, r: Rect, cat: crate::model::Category, dark: bool) 
     let fill = match cat {
         C::Video => Color32::from_rgb(0x8B, 0x5C, 0xF6),
         C::Music => Color32::from_rgb(0xE0, 0x4A, 0x9B),
+        C::Images => Color32::from_rgb(0x14, 0xA3, 0xB8),
         C::Documents => Color32::from_rgb(0x2A, 0x84, 0xE0),
         C::Compressed => Color32::from_rgb(0xD9, 0x8A, 0x1F),
         C::Programs => Color32::from_rgb(0x2E, 0xA0, 0x53),
@@ -243,6 +244,15 @@ pub fn file_card(p: &Painter, r: Rect, cat: crate::model::Category, dark: bool) 
                 Stroke::new(w * 0.07, ink),
             );
             p.circle_filled(Pos2::new(c.x + w * 0.01, c.y + w * 0.11), w * 0.08, ink);
+        }
+        // A mountain under a sun.
+        C::Images => {
+            p.add(Shape::convex_polygon(
+                vec![Pos2::new(c.x - w * 0.17, c.y + w * 0.14), Pos2::new(c.x - w * 0.03, c.y - w * 0.06), Pos2::new(c.x + w * 0.11, c.y + w * 0.14)],
+                ink,
+                Stroke::NONE,
+            ));
+            p.circle_filled(Pos2::new(c.x + w * 0.10, c.y - w * 0.11), w * 0.06, ink);
         }
         // Text lines.
         C::Documents => {

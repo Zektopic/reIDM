@@ -9,6 +9,7 @@ mod api;
 mod app;
 mod icons;
 mod model;
+mod playlist;
 mod prefs;
 mod theme;
 
