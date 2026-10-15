@@ -445,11 +445,14 @@
       : pageMeta.source || 'video';
     panel.appendChild(hd);
 
-    const anyCiphered = fs.some((f) => f.ciphered);
+    // On YouTube every format goes through reIDM's yt-dlp, which finds its own address: the
+    // page's are scrambled (`signatureCipher`) or missing. Elsewhere a format needs an address.
+    const viaReidm = pageMeta.source === 'youtube';
+    const anyUnusable = !viaReidm && fs.some((f) => !f.url);
 
     for (const f of sortFormats(fs)) {
       const row = document.createElement('div');
-      const unusable = !f.url || f.ciphered;
+      const unusable = !f.url && !viaReidm;
       row.className = unusable ? 'row no' : 'row';
 
       const q = document.createElement('span');
@@ -462,6 +465,7 @@
       if (f.videoCodec) bits.push(f.videoCodec);
       if (f.audioCodec) bits.push(f.audioCodec);
       if (!bits.length && f.codecs) bits.push(f.codecs);
+      if (f.drc) bits.push('stable volume');
       if (f.fps) bits.push(`${f.fps}fps`);
       if (f.bitrate) bits.push(`${Math.round(f.bitrate / 1000)} kbps`);
       if (f.mime) bits.push(f.mime.replace(/^video\/|^audio\//, ''));
@@ -499,7 +503,7 @@
                 itag: f.itag ?? null, quality: f.quality ?? null,
                 videoCodec: f.videoCodec ?? null, audioCodec: f.audioCodec ?? null,
                 mime: f.mime ?? null, bitrate: f.bitrate ?? null,
-                height: f.height ?? null, audioOnly: !!f.audioOnly,
+                height: f.height ?? null, audioOnly: !!f.audioOnly, hasAudio: !!f.hasAudio,
               },
             })
             .then((r) => {
@@ -519,11 +523,16 @@
       panel.appendChild(row);
     }
 
-    if (anyCiphered) {
+    if (anyUnusable) {
       const n = document.createElement('div');
       n.className = 'note';
-      n.textContent =
-        'Some formats need the player’s signature and are shown greyed out. Those need a resolver (yt-dlp) on the reIDM side.';
+      n.textContent = 'Greyed-out formats have no address the page gives away.';
+      panel.appendChild(n);
+    }
+    if (viaReidm) {
+      const n = document.createElement('div');
+      n.className = 'note';
+      n.textContent = 'reIDM fetches YouTube videos with yt-dlp; the first one takes a moment while it gets it.';
       panel.appendChild(n);
     }
   }

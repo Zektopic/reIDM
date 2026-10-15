@@ -65,10 +65,12 @@ after any change to the capture path.
 - **Streams aren't merged.** reIDM downloads an HLS playlist or a DASH representation as a file;
   it doesn't mux segments into one video. DRM-protected streams (Widevine, PlayReady, FairPlay)
   can't be captured by any tool — the keys never reach the page.
-- **Signature-protected formats are listed but greyed out.** Most YouTube formats carry a
-  `signatureCipher` that only the player's own obfuscated code unscrambles. An extension
-  mustn't reimplement that; making them downloadable needs a resolver on reIDM's side, which
-  doesn't exist yet.
+- **YouTube's formats are resolved by reIDM, not here.** They carry a `signatureCipher` (or no
+  address at all) that only the player's own obfuscated code unscrambles; an extension mustn't
+  reimplement that. On YouTube the picker sends the page and a yt-dlp format selector instead
+  (`media` in `/ext/add`, built by `ytdlpFormat()` in `service-worker.js`), and reIDM runs
+  yt-dlp. A reIDM older than 0.5 says nothing about `media` in `/ext/ping`; the extension then
+  refuses rather than have it save the watch page.
 - **Addresses built and used inside a Web Worker, WebSocket or WebAssembly player** are outside
   the page hook's reach; `chrome.webRequest` still sees the resulting requests, so most media is
   found anyway.

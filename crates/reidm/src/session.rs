@@ -106,6 +106,7 @@ impl Session {
             user_agent: nonempty(K_UA),
             filename: nonempty(K_NAME),
             dir: None,
+            media: None,
         })
     }
 

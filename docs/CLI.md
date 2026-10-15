@@ -87,11 +87,26 @@ reidm get 'https://example.com/report?id=7' -o report.pdf --cookie 'session=abc'
 ### `add`
 
 ```text
-reidm add URL... [--referer URL] [-o NAME] [--later]
+reidm add URL... [--referer URL] [-o NAME] [--later] [--video [FORMAT]]
 ```
 
 Queues one or more addresses in the service. `--output` names the file and is only allowed with
 a single address; `--later` puts them in the scheduled queue without starting them.
+
+`--video` says the addresses are pages with a video — YouTube, and the
+[many other sites yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)
+— and reIDM fetches each through yt-dlp (see
+[YouTube](BROWSER_INTEGRATION.md#youtube) for what it fetches the first time). `FORMAT` is a
+[yt-dlp format selector](https://github.com/yt-dlp/yt-dlp#format-selection); without one, the
+best video with its sound. Without `--output`, the file is named after the video's title and
+height:
+
+```text
+$ reidm add --video 'bestvideo[height<=720]+bestaudio/best[height<=720]' 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'
+1 queued, 0 resumed, 0 already complete, 0 failed
+$ reidm list
+   7  Done        153.7 MiB/153.7 MiB   /home/me/Downloads/Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film [aqz-KE-bpKQ] 720p.mp4
+```
 
 Adding an address reIDM already has doesn't create a duplicate: a stopped download carries on,
 and one that is finished — with the file still there — is reported as already complete. The

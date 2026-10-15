@@ -87,6 +87,21 @@ cookies, a referrer, or a particular user agent. Downloads handed over by the ex
 three. From the command line, pass `--cookie` and `--referer` to `reidm get`, or add the link
 through the browser (right-click › *Download with reIDM*).
 
+**A YouTube download fails.** Its error is yt-dlp's own, in the list's tooltip and in
+Properties:
+
+| It says | What to do |
+|---|---|
+| *Requested format is not available* | that format isn't offered any more; pick another quality. The list's choices fall back to the nearest quality by themselves, so this comes from a hand-written `reidm add --video` format |
+| *Sign in to confirm you're not a bot* | open the video in the browser while signed in to YouTube and start it from there: your cookies go with it |
+| *…need ffmpeg to be joined* | install ffmpeg (`sudo apt install ffmpeg`, `brew install ffmpeg`), or pick a format with sound (360p and below usually have it). On Windows reIDM fetches ffmpeg itself |
+| *could not get yt-dlp* | reIDM couldn't reach GitHub to fetch it. Check the connection, or install yt-dlp yourself and put it on the `PATH` |
+| *Video unavailable*, *Private video* | the video can't be watched from your account or country, so it can't be downloaded either |
+
+When YouTube changes something, yt-dlp usually follows within days. reIDM checks for a newer
+yt-dlp once a day; to force it, delete the `tools` folder in the
+[data folder](USER_GUIDE.md#where-reidm-keeps-things).
+
 **Resume capability: No.** The server doesn't serve byte ranges. The download uses one connection,
 and stopping it means starting again. Nothing in reIDM can change that.
 

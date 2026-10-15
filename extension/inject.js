@@ -70,11 +70,16 @@
         codecs: (codecs || '').replace(/codecs="?|"?/g, '').trim() || null,
         videoCodec: names.video,
         audioCodec: names.audio,
-        // `qualityLabel` is the friendly one ("1080p60"); `quality` is the raw tag.
-        quality: f.qualityLabel || f.quality || (hasAudio && !hasVideo ? 'audio' : null),
+        // `qualityLabel` is the friendly one ("1080p60"). Audio has none, and its raw `quality`
+        // ("tiny") means nothing to a person: its bitrate says more.
+        quality: f.qualityLabel || (hasAudio && !hasVideo ? (f.bitrate ? `${Math.round(f.bitrate / 1000)}k` : 'audio') : f.quality || null),
+        // YouTube lists some audio twice: as published, and loudness-normalised ("stable volume").
+        drc: !!f.isDrc,
         bitrate: f.bitrate || null,
         size: f.contentLength ? Number(f.contentLength) : null,
         audioOnly: adaptive && hasAudio && !hasVideo,
+        hasAudio,
+        height: f.height || null,
         // A ciphered URL needs the player's signature logic, which an extension must not
         // reimplement. The picker still lists the format and says so.
         url: f.url || null,

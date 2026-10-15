@@ -10,6 +10,14 @@ pub struct Request {
     pub referer: Option<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// A video fetched through yt-dlp: `url` is then the page, and this the format asked for.
+    #[serde(default)]
+    pub media: Option<Media>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct Media {
+    pub format: String,
 }
 
 /// One byte range of a download and how far it has got.

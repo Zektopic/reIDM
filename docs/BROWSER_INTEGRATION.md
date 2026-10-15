@@ -134,12 +134,43 @@ When a video plays, a **Download with reIDM** button appears over it. It opens a
 player actually offers — resolution, codec, frame rate, bitrate and size, best first, audio-only
 tracks last. It understands YouTube's player data, HLS master playlists and DASH manifests.
 
+### YouTube
+
+On YouTube every quality in the list can be clicked. YouTube doesn't give the browser plain
+addresses for its videos — they are scrambled, or missing — so reIDM hands the page and your
+choice to [yt-dlp](https://github.com/yt-dlp/yt-dlp), which keeps up with YouTube's changes:
+
+- **The quality you click is the one you get** when yt-dlp's list has it; otherwise the best at
+  that height, H.264 with AAC first (it plays anywhere).
+- **Picture and sound arrive as one file.** Qualities above 360p come from YouTube as separate
+  video and audio; reIDM has ffmpeg join them.
+- The file is named after the video and the quality, e.g. *Me at the zoo 240p.mp4*.
+- The download sits in reIDM's list like any other: progress, stop, resume (yt-dlp carries on
+  where it stopped), *Downloads at the same time*, the speed limit.
+- Your YouTube cookies go with it, so what you can watch signed in (age-checked videos, members'
+  videos) you can download. They are written to a file only yt-dlp reads, and deleted when it
+  finishes.
+- The toolbar popup offers the video on a YouTube page as one row, in the best quality.
+
+**The first YouTube download takes a minute longer:** reIDM fetches what it needs, once, into
+the `tools` folder of its data folder, from each project's GitHub releases, and checks each file
+against the SHA-256 the release publishes:
+
+| | Size | When |
+|---|---|---|
+| yt-dlp | about 20–40 MB | the first time; checked for a newer release once a day |
+| Deno, the JavaScript runtime yt-dlp needs to read YouTube's player | about 40 MB download | only if no Deno, Node or Bun is installed |
+| ffmpeg (Windows only) | about 90 MB download | the first time a quality above 360p is chosen. On macOS and Linux, install it yourself: `brew install ffmpeg`, `sudo apt install ffmpeg` (the `.deb` recommends it) |
+
+`reidm add --video URL` does the same from a terminal, for YouTube and the
+[many other sites yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
+
+### Limits
+
 Limits that come from the platforms, not from the extension:
 
-- reIDM downloads the stream file you pick (a playlist or a single representation); it does not
-  merge HLS/DASH segments into one video file.
-- Most YouTube formats are signature-protected. They're listed but greyed out: unscrambling them
-  needs the player's own code, which an extension must not reimplement.
+- Elsewhere, reIDM downloads the stream file you pick (a playlist or a single representation); it
+  does not merge HLS/DASH segments into one video file.
 - DRM-protected streams (Widevine, PlayReady, FairPlay) can't be captured by any tool.
 
 ## The resource grabber

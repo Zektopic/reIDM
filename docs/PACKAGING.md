@@ -36,6 +36,13 @@ browsers and copies the extension out, as it does at every start.
   Items* (the window opens; closing it leaves the service running). It isn't needed for the
   browser: the extension starts reIDM when it isn't running.
 
+**What the packages don't contain: yt-dlp, Deno, ffmpeg.** reIDM fetches them at run time,
+into `tools/` in the user's data folder, the first time a video download needs them, and checks
+each against the SHA-256 its release publishes (see
+[BROWSER_INTEGRATION.md](BROWSER_INTEGRATION.md#youtube)). Bundling them would add about 150 MB to
+every package, and a bundled yt-dlp stops working with YouTube within weeks. The `.deb`
+*recommends* `ffmpeg`, so apt installs it by default.
+
 **The browser extension in every package.** The service looks for the extension next to its own
 binary — `extension/` beside `reidm.exe`, `../share/reidm/extension` from `/usr/bin` or
 `~/.local/bin`, `Resources/extension` in the app bundle — and copies it to

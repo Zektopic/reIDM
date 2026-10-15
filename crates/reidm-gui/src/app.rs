@@ -686,6 +686,10 @@ impl App {
     }
 
     fn open_refresh(&mut self, id: u64) {
+        if self.item(id).is_some_and(|i| i.request.media.is_some()) {
+            self.toast("A video download finds its own address each time it starts: there is nothing to refresh. Start it again.");
+            return;
+        }
         let old_url = self.item(id).map(|i| i.request.url.clone()).unwrap_or_default();
         self.refresh = Some(RefreshState { id, url: String::new(), busy: None, error: None, capturing: false, old_url });
     }
@@ -2229,6 +2233,9 @@ impl App {
                     if let Some(ua) = &it.request.user_agent {
                         row(ui, "Sent as", ua.clone());
                     }
+                    if let Some(m) = &it.request.media {
+                        row(ui, "Fetched with", format!("yt-dlp, format {}", m.format));
+                    }
                     row(ui, "Saved to", it.path.display().to_string());
                     let status = match &it.status {
                         Status::Failed(e) => format!("Error: {e}"),
@@ -2253,8 +2260,12 @@ impl App {
                     if let Some(t) = it.finished_at {
                         row(ui, "Completed", since_human(t, now_secs()));
                     }
-                    row(ui, "Resume capability", if it.resumable { "Yes".into() } else if it.size.is_some() { "No — a stop means starting over".into() } else { "Unknown".into() });
-                    row(ui, "Connections", format!("{} working on {} part(s)", it.connections(), it.segments.len().max(1)));
+                    if it.request.media.is_some() {
+                        row(ui, "Resume capability", "Yes — yt-dlp carries on where it stopped".into());
+                    } else {
+                        row(ui, "Resume capability", if it.resumable { "Yes".into() } else if it.size.is_some() { "No — a stop means starting over".into() } else { "Unknown".into() });
+                        row(ui, "Connections", format!("{} working on {} part(s)", it.connections(), it.segments.len().max(1)));
+                    }
                 });
                 ui.add_space(8.0);
                 segment_map(ui, p, &it);

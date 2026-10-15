@@ -151,7 +151,8 @@ function renderMedia() {
     const kind = (it.kind || 'media').toLowerCase();
     const meta = el('span', 'meta');
     const bits = [it.mime, humanBytes(it.size), it.formats && it.formats.length ? `${it.formats.length} qualities` : null].filter(Boolean);
-    meta.append(el('div', 'fn', baseName(it.url)), el('div', 'sub', bits.length ? `${bits.join(' · ')} — ${it.url}` : it.url));
+    if (it.ytdlp) bits.push('best quality, through yt-dlp');
+    meta.append(el('div', 'fn', it.title || baseName(it.url)), el('div', 'sub', bits.length ? `${bits.join(' · ')} — ${it.url}` : it.url));
     meta.lastChild.title = it.url;
     row.append(cb, el('span', `kind ${kind}`, kind), meta);
     box.appendChild(row);
@@ -162,7 +163,10 @@ async function queue(urls) {
   let ok = 0;
   const errors = [];
   for (const url of urls) {
-    const r = await ask({ type: 'add', details: { url, filename: baseName(url) || undefined, referer: tab ? tab.url : undefined } });
+    const video = media.find((m) => m.url === url && m.ytdlp);
+    const r = video
+      ? await ask({ type: 'download-video', page: url, title: video.title, incognito: !!(tab && tab.incognito) })
+      : await ask({ type: 'add', details: { url, filename: baseName(url) || undefined, referer: tab ? tab.url : undefined } });
     if (r && r.ok) ok++;
     else errors.push(`${baseName(url)}: ${(r && r.error) || 'failed'}`);
   }
@@ -204,6 +208,8 @@ function addTyped() {
   queue([v]);
 }
 
+const isYouTubeVideo = (u) => /^https?:\/\/(www\.|m\.|music\.)?youtube\.com\/(watch\?|shorts\/|live\/)|^https?:\/\/youtu\.be\//i.test(u || '');
+
 // ── startup ──────────────────────────────────────────────────────────────
 
 (async () => {
@@ -217,6 +223,12 @@ function addTyped() {
     media = ((r && r.items) || []).filter((m) => m.kind !== 'link');
     // Streams first (they carry the qualities), then newest first.
     media.sort((a, b) => (b.kind === 'stream') - (a.kind === 'stream') || (b.at || 0) - (a.at || 0));
+    // On a YouTube video what the page loads is the player's own traffic, not files: offer the
+    // video itself instead, which reIDM fetches through yt-dlp.
+    if (isYouTubeVideo(tab.url)) {
+      media = media.filter((m) => !['formats', 'mse', 'media', 'stream'].includes(m.kind));
+      media.unshift({ url: tab.url, kind: 'video', title: (tab.title || '').replace(/ - YouTube$/, '') || null, ytdlp: true, at: Date.now() });
+    }
   }
   renderMedia();
 })();
