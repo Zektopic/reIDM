@@ -24,6 +24,201 @@ use tokio::io::AsyncBufReadExt;
 pub struct Media {
     /// A yt-dlp format selector, e.g. `137+bestaudio/bestvideo[height<=1080]+bestaudio`.
     pub format: String,
+    /// Keep only the sound, converted to this format (`mp3`, `m4a`, `opus`); needs ffmpeg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
+}
+
+/// The audio formats [`Media::audio`] may name.
+pub const AUDIO_FORMATS: [&str; 3] = ["mp3", "m4a", "opus"];
+
+/// A video codec to prefer, for [`selector`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoCodec {
+    /// Whatever is best at that resolution.
+    Any,
+    /// Plays anywhere: every phone, TV and editor.
+    H264,
+    Vp9,
+    Av1,
+}
+
+impl VideoCodec {
+    pub const ALL: [VideoCodec; 4] = [VideoCodec::Any, VideoCodec::H264, VideoCodec::Vp9, VideoCodec::Av1];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoCodec::Any => "Best available",
+            VideoCodec::H264 => "H.264",
+            VideoCodec::Vp9 => "VP9",
+            VideoCodec::Av1 => "AV1",
+        }
+    }
+
+    /// yt-dlp's filter for it.
+    fn filter(self) -> &'static str {
+        match self {
+            VideoCodec::Any => "",
+            VideoCodec::H264 => "[vcodec^=avc1]",
+            VideoCodec::Vp9 => "[vcodec^=vp]",
+            VideoCodec::Av1 => "[vcodec^=av01]",
+        }
+    }
+
+    /// The codec a yt-dlp `vcodec` value names, if one of these.
+    fn of(vcodec: &str) -> Option<VideoCodec> {
+        let v = vcodec.to_ascii_lowercase();
+        if v.starts_with("avc1") || v.starts_with("h264") {
+            Some(VideoCodec::H264)
+        } else if v.starts_with("vp09") || v.starts_with("vp9") {
+            Some(VideoCodec::Vp9)
+        } else if v.starts_with("av01") {
+            Some(VideoCodec::Av1)
+        } else {
+            None
+        }
+    }
+}
+
+/// The format selector for "this resolution, this codec": the best video at most `height`
+/// tall (any height for `None`) in `codec`, with the best sound — and, where the video has no
+/// such format, the best at that height in any codec, then the best there is. A choice made for
+/// a whole playlist must not fail on the one video that lacks it.
+pub fn selector(height: Option<u32>, codec: VideoCodec) -> String {
+    let cap = height.map(|h| format!("[height<={h}]")).unwrap_or_default();
+    let c = codec.filter();
+    let mut alts = Vec::new();
+    if !c.is_empty() {
+        alts.push(format!("bestvideo{cap}{c}+bestaudio[ext=m4a]"));
+        alts.push(format!("bestvideo{cap}{c}+bestaudio"));
+    }
+    alts.push(format!("bestvideo{cap}+bestaudio"));
+    alts.push(format!("best{cap}"));
+    alts.push("best".into());
+    alts.join("/")
+}
+
+/// The selector for sound only: `audio` names the format wanted (see [`AUDIO_FORMATS`]).
+pub fn audio_selector(audio: &str) -> String {
+    match audio {
+        "m4a" => "bestaudio[ext=m4a]/bestaudio".into(),
+        "opus" => "bestaudio[acodec=opus]/bestaudio".into(),
+        _ => "bestaudio/best".into(),
+    }
+}
+
+/// One video of a playlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistEntry {
+    pub url: String,
+    pub id: String,
+    pub title: String,
+    /// Seconds.
+    pub duration: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Playlist {
+    pub title: String,
+    pub entries: Vec<PlaylistEntry>,
+}
+
+/// What one video offers: each height, with the codecs it comes in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoInfo {
+    pub title: String,
+    /// Tallest first.
+    pub heights: Vec<HeightInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeightInfo {
+    pub height: u32,
+    pub codecs: Vec<VideoCodec>,
+    /// The largest of its formats, in bytes, sound not included.
+    pub size: Option<u64>,
+}
+
+/// Run yt-dlp for information only (`-J`), and parse what it prints.
+async fn ytdlp_json(m: &Manager, args: &[&str], url: &str) -> Result<serde_json::Value> {
+    let data_dir = m.data_dir().to_path_buf();
+    let exe = ytdlp(&m.0.http, &data_dir).await?;
+    let js = js_runtime(&m.0.http, &data_dir).await;
+    let mut cmd = tokio::process::Command::new(&exe);
+    cmd.args(["-J", "--no-warnings", "--no-colors", "--encoding", "utf-8"]).args(args);
+    if let Some(js) = &js {
+        cmd.args(["--js-runtimes", js]);
+    }
+    cmd.arg("--").arg(url);
+    cmd.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1").stdin(std::process::Stdio::null()).kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    let out = tokio::time::timeout(Duration::from_secs(300), cmd.output()).await.context("yt-dlp took too long to answer")??;
+    if !out.status.success() {
+        let err: Vec<String> = String::from_utf8_lossy(&out.stderr).lines().map(String::from).collect();
+        bail!("{}", explain(&err, out.status.code()));
+    }
+    serde_json::from_slice(&out.stdout).context("yt-dlp's answer was not JSON")
+}
+
+impl Manager {
+    /// The videos of a playlist (or a channel's tab), without looking into each: quick even for
+    /// hundreds. A single video's address gives a list of one.
+    pub async fn playlist(&self, url: &str) -> Result<Playlist> {
+        let page = url::Url::parse(url.trim()).context("invalid URL")?;
+        if !matches!(page.scheme(), "http" | "https") {
+            bail!("unsupported scheme {:?}", page.scheme());
+        }
+        let v = ytdlp_json(self, &["--flat-playlist"], page.as_str()).await?;
+        let s = |v: &serde_json::Value, k: &str| v[k].as_str().map(str::to_string);
+        let entry = |e: &serde_json::Value| -> Option<PlaylistEntry> {
+            let id = s(e, "id")?;
+            let url = s(e, "webpage_url").or_else(|| s(e, "url").filter(|u| u.starts_with("http"))).unwrap_or_else(|| format!("https://www.youtube.com/watch?v={id}"));
+            // Deleted and private videos are listed with placeholder titles and nothing to fetch.
+            let title = s(e, "title").unwrap_or_else(|| id.clone());
+            if title == "[Deleted video]" || title == "[Private video]" {
+                return None;
+            }
+            Some(PlaylistEntry { url, id, title, duration: e["duration"].as_f64() })
+        };
+        let entries: Vec<PlaylistEntry> = match v["entries"].as_array() {
+            Some(list) => list.iter().filter_map(entry).collect(),
+            None => entry(&v).into_iter().collect(),
+        };
+        if entries.is_empty() {
+            bail!("no videos found at that address");
+        }
+        Ok(Playlist { title: s(&v, "title").unwrap_or_else(|| "Playlist".into()), entries })
+    }
+
+    /// The heights and codecs one video comes in.
+    pub async fn video_info(&self, url: &str) -> Result<VideoInfo> {
+        let v = ytdlp_json(self, &["--no-playlist"], url.trim()).await?;
+        let mut by: BTreeMap<u32, (Vec<VideoCodec>, Option<u64>)> = BTreeMap::new();
+        for f in v["formats"].as_array().into_iter().flatten() {
+            let (Some(h), Some(vc)) = (f["height"].as_u64(), f["vcodec"].as_str()) else { continue };
+            if vc == "none" || h == 0 {
+                continue;
+            }
+            let e = by.entry(h as u32).or_default();
+            if let Some(c) = VideoCodec::of(vc) {
+                if !e.0.contains(&c) {
+                    e.0.push(c);
+                }
+            }
+            let size = f["filesize"].as_u64().or(f["filesize_approx"].as_u64());
+            e.1 = e.1.max(size);
+        }
+        let heights = by
+            .into_iter()
+            .rev()
+            .map(|(height, (mut codecs, size))| {
+                codecs.sort_by_key(|c| VideoCodec::ALL.iter().position(|x| x == c));
+                HeightInfo { height, codecs, size }
+            })
+            .collect();
+        Ok(VideoInfo { title: v["title"].as_str().unwrap_or("").to_string(), heights })
+    }
 }
 
 /// A selector reIDM will pass on: yt-dlp's selector syntax, nothing else. It is an argument of
@@ -320,6 +515,12 @@ fn no_window(c: &mut std::process::Command) {
     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 }
 
+/// Where yt-dlp keeps download `id`'s pieces until the file is complete: a folder of its own
+/// in the temporary folder, so they never fill the download folder.
+pub(crate) fn work_dir(temp: &Path, id: u64) -> PathBuf {
+    temp.join(format!("video-{id}"))
+}
+
 /// yt-dlp's leftovers for a download saved as `path`: its `.part` files, the unmerged video
 /// and audio (`name.f137.mp4`), and its resume notes.
 pub(crate) fn leftovers(path: &Path) -> Vec<PathBuf> {
@@ -435,7 +636,7 @@ impl Manager {
             self.set_note(id, Some("getting Deno for yt-dlp (first time only)"));
         }
         let js = js_runtime(&self.0.http, &data_dir).await;
-        let merging = media.format.contains('+');
+        let merging = media.format.contains('+') || media.audio.is_some();
         if merging && cfg!(windows) && !tools.join("ffmpeg").join("ffmpeg.exe").is_file() && find_on_path("ffmpeg").is_none() {
             self.set_note(id, Some("getting ffmpeg (first time only)"));
         }
@@ -452,12 +653,19 @@ impl Manager {
         let dir = item.path.parent().context("download has no folder")?.to_path_buf();
         std::fs::create_dir_all(&dir)?;
         // The name the browser suggested ("Title 1080p"), or else the video's own title.
-        let template = match item.request.filename.as_deref().and_then(|_| item.path.file_stem()).and_then(|s| s.to_str()) {
-            Some(stem) => dir.join(format!("{}.%(ext)s", stem.replace('%', "%%"))),
+        let name = match item.request.filename.as_deref().and_then(|_| item.path.file_stem()).and_then(|s| s.to_str()) {
+            Some(stem) => format!("{}.%(ext)s", stem.replace('%', "%%")),
             // The height keeps two qualities of one video apart: with the same name, yt-dlp
             // would take the first file for the second and download nothing.
-            None => dir.join("%(title).150B [%(id)s] %(height&{}p|audio)s.%(ext)s"),
+            None => "%(title).150B [%(id)s] %(height&{}p|audio)s.%(ext)s".to_string(),
         };
+        // Pieces in a folder of their own in the temporary folder, the finished file in `dir`.
+        // A download begun before there was a temporary folder carries on beside its file.
+        let work = work_dir(&self.temp_dir(), id);
+        let beside = !leftovers(&item.path).is_empty();
+        if !beside {
+            std::fs::create_dir_all(&work)?;
+        }
 
         let mut cmd = tokio::process::Command::new(&ytdlp);
         // As many connections as a normal download: yt-dlp fetches a format's pieces in
@@ -475,14 +683,20 @@ impl Manager {
             .args(["--print", "before_dl:REIDM-SIZE %(filesize,filesize_approx)s"])
             .args(["--print", "after_move:REIDM-FILE %(filepath)s"])
             .args(["-f", &media.format])
-            .args(["--merge-output-format", "mp4/webm/mkv"])
-            .arg("-o")
-            .arg(&template);
+            .args(["--merge-output-format", "mp4/webm/mkv"]);
+        if beside {
+            cmd.arg("-o").arg(dir.join(&name));
+        } else {
+            cmd.arg("-P").arg(format!("home:{}", dir.display())).arg("-P").arg(format!("temp:{}", work.display())).arg("-o").arg(&name);
+        }
         if let Some(f) = &ffmpeg {
             cmd.arg("--ffmpeg-location").arg(f);
         }
         if let Some(js) = &js {
             cmd.args(["--js-runtimes", js]);
+        }
+        if let Some(a) = media.audio.as_deref().filter(|a| AUDIO_FORMATS.contains(a)) {
+            cmd.args(["-x", "--audio-format", a]);
         }
         let global = self.0.settings.lock().unwrap().effective_limit();
         let rate = match (item.speed_limit.unwrap_or(0), global) {
@@ -615,6 +829,7 @@ impl Manager {
             bail!("{}", explain(&stderr, status.code()));
         }
         let path = final_path.filter(|p| p.is_file()).context("yt-dlp finished but did not say where it saved the file")?;
+        let _ = std::fs::remove_dir_all(&work);
         let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         live.progress.store(len, Ordering::Relaxed);
         if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
@@ -681,6 +896,21 @@ mod tests {
         got.sort();
         assert_eq!(got, ["Talk 1080p.f137.mp4.part", "Talk 1080p.f137.mp4.ytdl", "Talk 1080p.f140.m4a"]);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn every_choice_makes_a_valid_selector_with_fallbacks() {
+        for h in [None, Some(2160), Some(1080), Some(360)] {
+            for c in VideoCodec::ALL {
+                let sel = selector(h, c);
+                assert!(valid_format(&sel), "{sel}");
+                assert!(sel.ends_with("/best"), "always something to fall back on: {sel}");
+            }
+        }
+        assert_eq!(selector(Some(1080), VideoCodec::H264), "bestvideo[height<=1080][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=1080][vcodec^=avc1]+bestaudio/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best");
+        for a in AUDIO_FORMATS {
+            assert!(valid_format(&audio_selector(a)));
+        }
     }
 
     #[test]

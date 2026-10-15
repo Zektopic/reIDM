@@ -16,6 +16,7 @@ const DEFAULTS = {
   captureIncognito: false,
   launchReidm: true,
   notifications: true,
+  askBeforeDownload: true,
   sniffMedia: true,
   ignore: ['blob:', 'data:', 'chrome:', 'chrome-extension://', 'about:', 'file://', 'filesystem:'],
 };
@@ -33,7 +34,7 @@ function setStatus(text, cls = '') {
 }
 
 function show(s) {
-  for (const k of ['capture', 'interceptClicks', 'captureAll', 'captureIncognito', 'launchReidm', 'notifications', 'sniffMedia']) $(k).checked = !!s[k];
+  for (const k of ['capture', 'interceptClicks', 'captureAll', 'captureIncognito', 'launchReidm', 'notifications', 'askBeforeDownload', 'sniffMedia']) $(k).checked = !!s[k];
   $('port').value = s.port;
   $('minSizeKB').value = s.minSizeKB;
   $('fileTypes').value = s.fileTypes;
@@ -86,6 +87,7 @@ $('save').addEventListener('click', async () => {
     captureIncognito: $('captureIncognito').checked,
     launchReidm: $('launchReidm').checked,
     notifications: $('notifications').checked,
+    askBeforeDownload: $('askBeforeDownload').checked,
     sniffMedia: $('sniffMedia').checked,
     ignore: lines('ignore'),
   });

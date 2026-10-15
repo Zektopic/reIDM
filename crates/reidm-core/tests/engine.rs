@@ -491,3 +491,33 @@ async fn a_file_link_that_is_really_a_web_page_is_refused_when_asked() {
     // And without the flag (a download the browser had already decided to save) nothing is second-guessed.
     m.add_checked(Request { url: srv.url("/setup.zip"), dir: Some(dl), ..Default::default() }, AddOptions::default()).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_are_filed_by_type_and_wait_in_the_temporary_folder() {
+    // IDM's categories: with no folder asked for, an archive goes to Compressed under the
+    // download folder, and until it is complete its part file sits in the temporary folder,
+    // not among the finished files.
+    let data = body(512 << 10, 9);
+    let srv = serve(Cfg { throttle: Some(256 << 10), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/pack.zip".into(), data.clone());
+    srv.cfg.files.lock().unwrap().insert("/notes.txt".into(), b"hello".to_vec());
+    let (m, dl) = manager("folders", 2);
+    let parts = m.temp_dir();
+
+    let id = m.add(Request { url: srv.url("/pack.zip"), ..Default::default() }).unwrap();
+    wait_until("the transfer starts", || m.get(id).unwrap().downloaded > 0);
+    let in_parts = std::fs::read_dir(&parts).map(|d| d.flatten().filter(|e| e.file_name().to_string_lossy().ends_with(".reidm")).count()).unwrap_or(0);
+    assert_eq!(in_parts, 1, "the unfinished file waits in {}", parts.display());
+    assert!(!dl.join("Compressed").join("pack.zip.reidm").exists(), "nothing unfinished in the download folder");
+    wait_until("download completes", || matches!(state(&m, id), Status::Done | Status::Failed(_)));
+    assert_eq!(state(&m, id), Status::Done);
+    assert_eq!(m.get(id).unwrap().path, dl.join("Compressed").join("pack.zip"));
+    assert_eq!(std::fs::read(dl.join("Compressed").join("pack.zip")).unwrap(), data);
+    assert_eq!(std::fs::read_dir(&parts).unwrap().count(), 0, "the part file moved into place");
+
+    // Sorting off: straight into the download folder.
+    m.update_settings(SettingsPatch { sort_by_category: Some(false), ..Default::default() }).unwrap();
+    let id = m.add(Request { url: srv.url("/notes.txt"), ..Default::default() }).unwrap();
+    wait_until("download completes", || matches!(state(&m, id), Status::Done | Status::Failed(_)));
+    assert_eq!(m.get(id).unwrap().path, dl.join("notes.txt"));
+}

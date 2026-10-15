@@ -9,8 +9,10 @@
 // (`Input.dispatchMouseEvent`), because the extension deliberately ignores synthetic clicks.
 //
 // What it checks, against a local test site and a real reIDM daemon:
-//   1. a file link is taken on click: reIDM has it, the browser never requested it, and a
-//      notification says so;
+//   1. a file link is taken on click, after the "Download file info" dialog shows its name and
+//      size and the user presses Start download: reIDM has it, the browser never requested it,
+//      and a notification says so;
+//   1b. Cancel in that dialog, for a download the browser started: nobody downloads it;
 //   2. a download only recognisable from its response headers is taken from the browser:
 //      reIDM has it and the browser kept nothing — not even a 2 KB file;
 //   3. cookies reach reIDM, so a download behind a login works;
@@ -87,6 +89,7 @@ const FILES = {
   '/private/secret.bin': body(1 << 20, 5),
   '/dl/launched': body(512 << 10, 6),
   '/dl/fallback': body(300 << 10, 7),
+  '/dl/cancelled': body(100 << 10, 8),
 };
 const log = [];
 
@@ -100,6 +103,7 @@ const PAGE = `<!doctype html><html><head><title>capture test</title>
 <a id="fake" href="/files/fake.zip">fake.zip (really a web page)</a>
 <a id="launched" href="/dl/launched?id=9">launched (reIDM stopped, host registered)</a>
 <a id="fallback" href="/dl/fallback?id=10">fallback (reIDM stopped, no host)</a>
+<a id="cancelled" href="/dl/cancelled?id=11">cancelled (Cancel in the dialog)</a>
 <form method="post" action="/post/export"><input type="hidden" name="q" value="1">
 <button id="post" type="submit">POST export</button></form>
 </body></html>`;
@@ -414,6 +418,19 @@ async function grabberChecks() {
   await cdp.send('Target.closeTarget', { targetId });
 }
 
+/** The "Download file info" dialog the extension opens, once it is up: a session in it. */
+async function dialog() {
+  const t = await waitFor('the download dialog', async () => {
+    const { targetInfos } = await cdp.send('Target.getTargets');
+    return targetInfos.find((x) => x.type === 'page' && x.url.startsWith(`chrome-extension://${EXT_ID}/confirm.html`));
+  }, 10000);
+  if (!t) return null;
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
+  await cdp.send('Runtime.enable', {}, sessionId);
+  const run = async (expression) => (await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, sessionId)).result.value;
+  return { run, targetId: t.targetId, session: sessionId };
+}
+
 async function main() {
   await new Promise((r) => site.listen(SITE_PORT, '127.0.0.1', r));
   await startDaemon();
@@ -427,8 +444,22 @@ async function main() {
 
   await openPage(`http://127.0.0.1:${SITE_PORT}/`);
 
-  // 1. a file link, taken on click
+  // 1. a file link, taken on click — after the dialog
   await click('#file');
+  const dlg = await dialog();
+  check('file link: the "Download file info" dialog opens', !!dlg);
+  if (dlg) {
+    const shown = await waitFor('the size in the dialog', async () => {
+      const v = await dlg.run(`({ name: document.getElementById('name').value, size: document.getElementById('size').textContent })`);
+      return v && !/checking/.test(v.size) ? v : null;
+    });
+    check('file link: the dialog shows the name and the size', shown && shown.name === 'app.zip' && shown.size === '3.00 MB', JSON.stringify(shown));
+    if (process.env.REIDM_SHOT_DIR) {
+      const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, dlg.session);
+      fs.writeFileSync(path.join(process.env.REIDM_SHOT_DIR, 'download-dialog.png'), Buffer.from(data, 'base64'));
+    }
+    await dlg.run(`document.getElementById('start').click()`);
+  }
   let it = await waitFor('app.zip in reIDM', async () => itemFor(await reidmItems(), '/files/app.zip'));
   check('file link: reIDM has it', !!it);
   it = await waitFor('app.zip done', async () => {
@@ -440,6 +471,18 @@ async function main() {
   const shown = await inWorker('chrome.notifications.getAll().then(n => Object.keys(n))');
   check('file link: a notification says reIDM is downloading it', shown.some((k) => k.startsWith('reidm-')), JSON.stringify(shown));
   if (it) check('file link: bytes are right', Buffer.compare(fs.readFileSync(it.path), FILES['/files/app.zip']) === 0);
+
+  // 1b. Cancel, for a download the browser started (known only from its headers)
+  await click('#cancelled');
+  const cdlg = await dialog();
+  check('Cancel: the dialog opens for a download the browser started', !!cdlg);
+  if (cdlg) await cdlg.run(`document.getElementById('cancel').click()`);
+  await sleep(2500);
+  check('Cancel: reIDM did not take it', !itemFor(await reidmItems(), '/dl/cancelled'));
+  check('Cancel: the browser kept no download either', !(await inWorker('chrome.downloads.search({}).then(d => d.length)')) && !browserFiles().some((f) => f.startsWith('cancelled')));
+  // The rest of the checks are about the hand-off itself: no dialog.
+  await inWorker('chrome.storage.sync.set({ askBeforeDownload: false })');
+  await sleep(300);
 
   // 2. downloads only recognisable from their headers: taken from the browser
   for (const [sel, p] of [['#report', '/dl/report'], ['#tiny', '/dl/tiny']]) {

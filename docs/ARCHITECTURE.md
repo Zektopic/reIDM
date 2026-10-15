@@ -177,8 +177,12 @@ while asleep starts the queue on waking, unless the stop time also passed.
 | `gui.json` | the window's preferences |
 
 Files are written to a temporary name and renamed, so a crash leaves the old version rather than
-half a file. The data being downloaded goes to `<file>.reidm`, pre-allocated to full size when the
-size is known, and renamed when complete.
+half a file. The data being downloaded goes to `<id>-<file>.reidm` in the temporary folder
+(`parts/` in the data folder unless set), pre-allocated to full size when the size is known, and
+moved to its folder when complete — a rename, or a copy and delete across drives. The folder is
+its type's (`category.rs`: Compressed, Documents, Images, Music, Programs, Video, else the
+download folder), chosen from the likely name when added and again from the server's name after
+the probe. A part file already beside its final file (from before 0.6) is used where it is.
 
 On start, downloads that were running are marked paused. Before resuming one, the engine checks
 that the part file holds at least as much as the list says was written; if not — the file was

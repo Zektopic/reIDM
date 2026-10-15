@@ -54,6 +54,8 @@ const DEFAULTS = {
   launchReidm: true,
   // A desktop notification when reIDM takes a download, or can't.
   notifications: true,
+  // IDM's "Download file info" dialog before each download: Start, Download later, Cancel.
+  askBeforeDownload: true,
   sniffMedia: true,
   ignore: ['blob:', 'data:', 'chrome:', 'chrome-extension://', 'about:', 'file://', 'filesystem:'],
 };
@@ -141,7 +143,7 @@ async function ping() {
     const r = await fetch(api(`/ext/ping?v=${encodeURIComponent(VERSION)}`), { cache: 'no-store', signal: ctl.signal });
     if (!r.ok) return null;
     const info = await r.json();
-    publishStatus({ up: true, version: info.version || null, media: !!info.media });
+    publishStatus({ up: true, version: info.version || null, media: !!info.media, dir: info.default_dir || null, folders: info.folders || null });
     return info;
   } catch {
     publishStatus({ up: false, version: null });
@@ -338,6 +340,19 @@ async function takeOver(item, suggest) {
       user_agent: navigator.userAgent,
       verify: true,
     };
+    // The browser's copy stays paused, and its "Save as" unopened, while the user decides.
+    const choice = await maybeAsk({ url, filename: details.filename, size: item.totalBytes > 0 ? item.totalBytes : null, incognito: item.incognito, nameFromServer: false });
+    if (choice.action === 'cancel') {
+      // IDM's Cancel: nobody downloads it, neither reIDM nor the browser.
+      await callback((done) => chrome.downloads.cancel(item.id, done));
+      await callback((done) => chrome.downloads.erase({ id: item.id }, done));
+      await pendingUpdate((p) => delete p[item.id]);
+      release();
+      recordCapture({ url, filename: details.filename, error: 'cancelled' });
+      return;
+    }
+    details.filename = choice.filename || details.filename;
+    if (choice.action === 'later') details.later = true;
     let r = await send(details);
     // A redirect's target can be bound to the request that produced it; the original address
     // is worth one more try before giving up.
@@ -346,6 +361,7 @@ async function takeOver(item, suggest) {
     }
     await pendingUpdate((p) => delete p[item.id]);
 
+    choice.report(r);
     if (r.ok) {
       // reIDM has it, and has already fetched its first byte: the browser's copy is redundant.
       await callback((done) => chrome.downloads.cancel(item.id, done));
@@ -447,6 +463,137 @@ function badge(text, color, clearAfterMs) {
   if (clearAfterMs) badgeTimer = setTimeout(() => chrome.action.setBadgeText({ text: '' }).catch(() => {}), clearAfterMs);
 }
 
+// ── the "Download file info" dialog ─────────────────────────────────────
+
+/** Dialogs waiting for an answer: id -> { req, resolve, port }. */
+const asking = new Map();
+let askSeq = 0;
+
+/** The folder reIDM will save `name` in, as far as the extension knows: its category's folder
+ *  when reIDM sorts by category, else the download folder. */
+function folderFor(name) {
+  const f = status.folders;
+  if (f && f.sort && f.dirs) {
+    const ext = String(name || '').split('.').pop().toLowerCase();
+    for (const [cat, exts] of Object.entries(f.types || {})) if (exts.includes(ext) && f.dirs[cat]) return f.dirs[cat];
+    if (f.dirs.General) return f.dirs.General;
+  }
+  return status.dir || null;
+}
+
+/** The first byte of `url`, for its size and the server's file name. The browser's cookies go
+ *  with it, as they would with the download. Never for incognito: that would use the normal
+ *  profile's cookies. */
+async function probeSize(url) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 8000);
+  try {
+    const r = await fetch(url, { headers: { Range: 'bytes=0-0' }, credentials: 'include', cache: 'no-store', signal: ctl.signal });
+    const total = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || '');
+    const size = total ? Number(total[1]) : r.status === 200 ? Number(r.headers.get('content-length')) || null : null;
+    const cd = r.headers.get('content-disposition') || '';
+    const m = /filename\*=(?:UTF-8'')?([^;]+)/i.exec(cd) || /filename="?([^";]+)"?/i.exec(cd);
+    let filename = null;
+    try {
+      filename = m ? decodeURIComponent(m[1].trim().replace(/^"|"$/g, '')) : null;
+    } catch {
+      filename = m ? m[1] : null;
+    }
+    ctl.abort();
+    return { size, filename };
+  } catch {
+    return { size: null, filename: null };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/**
+ * Ask the user first, as IDM's "Download file info" dialog does: what is about to be
+ * downloaded, where, and how big, with Start download, Download later and Cancel.
+ * `req`: { url, filename, size?, sizeNote?, probe?: false, incognito? }. Resolves to
+ * { action: 'start' | 'later' | 'cancel', filename, report(result) }; `report` closes the dialog,
+ * or shows reIDM's refusal in it.
+ */
+async function askUser(req) {
+  const id = `${Date.now().toString(36)}-${++askSeq}`;
+  const answer = new Promise((resolve) => asking.set(id, { req, resolve, port: null }));
+  const width = 560;
+  const height = 380;
+  const opts = { url: chrome.runtime.getURL(`confirm.html?id=${id}`), type: 'popup', width, height, focused: true };
+  const w = await chrome.windows.getLastFocused().catch(() => null);
+  if (w && w.width && w.left != null) {
+    opts.left = Math.max(0, Math.round(w.left + (w.width - width) / 2));
+    opts.top = Math.max(0, Math.round(w.top + (w.height - height) / 3));
+  }
+  try {
+    await chrome.windows.create(opts);
+  } catch (e) {
+    // No window can be opened (a kiosk, a policy): don't hold the download hostage to it.
+    console.warn('reIDM: could not open the download dialog', e);
+    asking.delete(id);
+    return { action: 'start', filename: req.filename, report: () => {} };
+  }
+  return answer;
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (!port.name.startsWith('confirm:')) return;
+  const id = port.name.slice('confirm:'.length);
+  const a = asking.get(id);
+  if (!a) {
+    port.postMessage({ type: 'error', error: 'This download is no longer waiting. Start it again from the page.' });
+    return;
+  }
+  a.port = port;
+  const report = (r) => {
+    try {
+      if (r && r.ok) port.postMessage({ type: 'done' });
+      else port.postMessage({ type: 'error', error: `reIDM could not take it: ${(r && r.error) || 'unknown error'}` });
+    } catch {
+      /* the dialog was closed */
+    }
+  };
+  port.onMessage.addListener(async (m) => {
+    if (m.type === 'hello') {
+      const r = a.req;
+      port.postMessage({ type: 'info', url: r.url, filename: r.filename, size: r.size, sizeNote: r.sizeNote, dir: folderFor(r.filename) });
+      if (!(r.size > 0) && r.probe !== false && !r.incognito && isHttp(r.url)) {
+        const p = await probeSize(r.url);
+        try {
+          port.postMessage({ type: 'size', size: p.size, note: 'unknown — the server does not say', filename: r.nameFromServer ? p.filename : null });
+        } catch {
+          /* closed meanwhile */
+        }
+      } else if (!(r.size > 0)) {
+        port.postMessage({ type: 'size', size: null, note: r.sizeNote || 'unknown' });
+      }
+    } else if (m.type === 'answer') {
+      if (m.noAsk) {
+        settings.askBeforeDownload = false;
+        chrome.storage.sync.set({ askBeforeDownload: false }).catch(() => {});
+      }
+      if (!asking.has(id)) return;
+      asking.delete(id);
+      a.resolve({ action: m.action, filename: m.filename || a.req.filename, report });
+    }
+  });
+  port.onDisconnect.addListener(() => {
+    // Closing the window is Cancel, as in IDM.
+    if (asking.has(id)) {
+      asking.delete(id);
+      a.resolve({ action: 'cancel', filename: a.req.filename, report: () => {} });
+    }
+  });
+});
+
+/** Ask when the user wants to be asked; otherwise the answer is "start", with nothing to report to. */
+async function maybeAsk(req) {
+  await settingsReady;
+  if (!settings.askBeforeDownload) return { action: 'start', filename: req.filename, report: () => {} };
+  return askUser(req);
+}
+
 // ── 2. links the content script took on click ───────────────────────────
 
 /** A link the user clicked, which the content script stopped before the browser requested
@@ -458,7 +605,12 @@ async function captureLink(msg, sender) {
   if (!settings.capture || !isHttp(url) || isIgnored(url) || hostSkipped(url)) return { ok: false, error: 'not captured' };
   const incognito = !!(sender.tab && sender.tab.incognito);
   if (incognito && !settings.captureIncognito) return { ok: false, error: 'incognito' };
-  const filename = msg.filename || nameFromUrl(url) || undefined;
+  let filename = msg.filename || nameFromUrl(url) || undefined;
+  const choice = await maybeAsk({ url, filename, incognito, nameFromServer: !msg.filename });
+  // Cancelled: the click is used up and nothing downloads. `ok` so the page doesn't hand the
+  // click back to the browser.
+  if (choice.action === 'cancel') return { ok: true, cancelled: true };
+  filename = choice.filename || filename;
   const r = await send({
     url,
     filename,
@@ -467,7 +619,9 @@ async function captureLink(msg, sender) {
     user_agent: navigator.userAgent,
     verify: true,
     refuse_html: true,
+    later: choice.action === 'later',
   });
+  choice.report(r);
   if (r.ok) {
     recordCapture({ url, filename, outcome: r.outcome, id: r.id });
     badge(r.outcome === 'already_complete' ? '=' : '✓', '#2ea053', 2500);
@@ -754,15 +908,26 @@ async function reidmResolves() {
 async function downloadVideoPage(page, title, f, incognito) {
   const can = await reidmResolves();
   if (!can.ok) return can;
+  const proposed = f && (f.itag != null || f.quality) ? formatFilename(title, f, page) : undefined;
+  const choice = await maybeAsk({
+    url: page,
+    filename: proposed || `${title || 'video'}.mp4`,
+    size: f && f.size > 0 ? f.size : null,
+    sizeNote: 'known once the download starts',
+    probe: false,
+  });
+  if (choice.action === 'cancel') return { ok: true, cancelled: true };
   const r = await send({
     url: page,
-    filename: f && (f.itag != null || f.quality) ? formatFilename(title, f, page) : undefined,
+    filename: choice.filename !== (proposed || `${title || 'video'}.mp4`) ? choice.filename : proposed,
+    later: choice.action === 'later',
     referer: page,
     // The signed-in user's cookies let yt-dlp fetch what they can watch (age checks, members).
     cookie: await cookieHeader(page, incognito ? 'incognito' : undefined),
     user_agent: navigator.userAgent,
     media: { format: ytdlpFormat(f) },
   });
+  choice.report(r);
   if (r.ok) {
     badge('✓', '#2ea053', 2500);
     const q = f && f.quality ? ` (${f.quality})` : '';
@@ -784,16 +949,20 @@ async function downloadFormat(msg, sender) {
     return downloadVideoPage(msg.page, msg.title, f, incognito);
   }
   if (!msg.url) return { ok: false, error: 'this format has no address to download from' };
+  const choice = await maybeAsk({ url: msg.url, filename: formatFilename(msg.title, f, msg.url), size: f.size > 0 ? f.size : null, incognito });
+  if (choice.action === 'cancel') return { ok: true, cancelled: true };
   const r = await send({
     url: msg.url,
-    filename: formatFilename(msg.title, f, msg.url),
+    filename: choice.filename || formatFilename(msg.title, f, msg.url),
     referer: msg.page || undefined,
     cookie: await cookieHeader(msg.url, incognito ? 'incognito' : undefined),
     user_agent: navigator.userAgent,
+    later: choice.action === 'later',
   });
+  choice.report(r);
   if (r.ok) {
     badge('✓', '#2ea053', 2500);
-    announce(r, formatFilename(msg.title, f, msg.url));
+    announce(r, choice.filename || formatFilename(msg.title, f, msg.url));
   } else notify('reIDM could not take the video', r.error || 'unknown error');
   return r;
 }
@@ -933,14 +1102,18 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === MENU.link || info.menuItemId === MENU.media) {
     const url = info.linkUrl || info.srcUrl;
     if (!url) return;
+    const choice = await maybeAsk({ url, filename: nameFromUrl(url) || undefined, incognito, nameFromServer: true });
+    if (choice.action === 'cancel') return;
     const r = await send({
       url,
       referer,
-      filename: nameFromUrl(url) || undefined,
+      filename: choice.filename || nameFromUrl(url) || undefined,
       cookie: await cookieHeader(url, incognito ? 'incognito' : undefined),
       user_agent: navigator.userAgent,
+      later: choice.action === 'later',
     });
-    flash(r, nameFromUrl(url));
+    choice.report(r);
+    flash(r, choice.filename || nameFromUrl(url));
     return;
   }
 
