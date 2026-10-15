@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+
+* **Windows: installing over a running reIDM failed with "DeleteFile failed; code 5".** reIDM's
+  service runs all the time, so an upgrade found `reidm.exe` in use and Setup couldn't replace it.
+  Setup now stops the reIDM programs running from the install folder first (the service, the
+  window, a native host the browser started), and starts the service again when it's done. The
+  uninstaller stops them too. Unfinished downloads resume where they were.
+
 ## 0.4.0
 
 The browser now hands its downloads to reIDM *before* saving anything, the engine gains IDM's
