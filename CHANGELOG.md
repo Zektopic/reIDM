@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2
+
+### Fixed
+
+* **Windows: Setup still failed with "DeleteFile failed; code 5" when reIDM had been started as
+  administrator.** Setup runs with your normal rights, so it can neither stop such a reIDM nor
+  see where it runs from. It now notices one, and stops with a message saying how to close it,
+  instead of failing on the first file. The uninstaller does the same.
+
 ## 0.4.1
 
 ### Fixed
