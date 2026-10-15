@@ -17,13 +17,13 @@ for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
 file=$(printf '%s' "$out" | sed 's/%(ext)s/mp4/; s/%(title)\.150B/Clip/; s/%(id)s/abc/; s/%(height&{}p|audio)s/360p/')
 case "$(cat "$here/mode" 2>/dev/null)" in
   fail) echo "WARNING: [youtube] something minor" >&2; echo "ERROR: [youtube] abc: Video unavailable" >&2; exit 1 ;;
-  slow) echo "REIDM-NAME $file"
-        i=0; while [ $i -lt 600 ]; do echo "REIDM-PROGRESS $((i * 1000)) 600000 NA 18"; i=$((i + 1)); sleep 0.05; done ;;
+  slow) echo "REIDM-NAME $file"; echo "REIDM-SIZE 650000.0"
+        i=0; while [ $i -lt 600 ]; do echo "REIDM-PROGRESS $((i * 1000)) 600000 NA NA 18"; i=$((i + 1)); sleep 0.05; done ;;
 esac
 echo "REIDM-NAME $file"
-echo "REIDM-PROGRESS 500 1000 NA 137"
-echo "REIDM-PROGRESS 1000 1000 NA 137"
-echo "REIDM-PROGRESS 200 200 NA 140"
+echo "REIDM-PROGRESS 500 1000 NA NA 137"
+echo "REIDM-PROGRESS 1000 1000 NA NA 137"
+echo "REIDM-PROGRESS 200 200 NA NA 140"
 printf 'video' > "$file"
 echo "REIDM-FILE $file"
 "#;
@@ -108,7 +108,7 @@ async fn stopping_a_video_stops_ytdlp_at_once() {
     let id = m.add(video(&dl, "18")).unwrap();
     let it = wait_for(&m, id, |_| m.get(id).is_some_and(|i| i.downloaded > 0)).await;
     assert_eq!(it.path, dl.join("Clip [abc] 360p.mp4"), "named as soon as yt-dlp said where it was going");
-    assert_eq!(it.size, Some(600_000));
+    assert_eq!(it.size, Some(650_000), "the size yt-dlp announced before starting");
     let asked = Instant::now();
     m.pause(id);
     wait_for(&m, id, |s| *s == Status::Paused).await;

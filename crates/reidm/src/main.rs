@@ -694,6 +694,9 @@ async fn main() -> Result<()> {
                 if let Some(e) = it["status"]["error"].as_str() {
                     println!("      {e}");
                 }
+                if let Some(n) = it["note"].as_str().filter(|_| state == "Running") {
+                    println!("      {n}…");
+                }
             }
         }
         Cmd::Pause { id } => drop(send_to_daemon(vec![ctl(session::T_CTL_PAUSE, id, None)]).await?),

@@ -15,6 +15,7 @@ const DEFAULTS = {
   skipHosts: [],
   captureIncognito: false,
   launchReidm: true,
+  notifications: true,
   sniffMedia: true,
   ignore: ['blob:', 'data:', 'chrome:', 'chrome-extension://', 'about:', 'file://', 'filesystem:'],
 };
@@ -32,7 +33,7 @@ function setStatus(text, cls = '') {
 }
 
 function show(s) {
-  for (const k of ['capture', 'interceptClicks', 'captureAll', 'captureIncognito', 'launchReidm', 'sniffMedia']) $(k).checked = !!s[k];
+  for (const k of ['capture', 'interceptClicks', 'captureAll', 'captureIncognito', 'launchReidm', 'notifications', 'sniffMedia']) $(k).checked = !!s[k];
   $('port').value = s.port;
   $('minSizeKB').value = s.minSizeKB;
   $('fileTypes').value = s.fileTypes;
@@ -84,6 +85,7 @@ $('save').addEventListener('click', async () => {
     skipHosts: lines('skipHosts').map((h) => h.toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '')),
     captureIncognito: $('captureIncognito').checked,
     launchReidm: $('launchReidm').checked,
+    notifications: $('notifications').checked,
     sniffMedia: $('sniffMedia').checked,
     ignore: lines('ignore'),
   });

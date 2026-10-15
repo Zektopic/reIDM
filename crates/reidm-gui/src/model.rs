@@ -90,6 +90,9 @@ pub struct Item {
     /// In the scheduled queue (*Download Later*).
     #[serde(default)]
     pub scheduled: bool,
+    /// What a running download is busy with ("looking up the video"), when progress can't say.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 impl Item {

@@ -349,14 +349,19 @@ struct Progress {
     format: String,
 }
 
+/// `REIDM-PROGRESS <done> <total> <format's size> <estimate> <format id>`; yt-dlp writes `NA`
+/// for what it doesn't know. The total, when there is one, else the size YouTube gives for the
+/// format, else yt-dlp's running estimate — which, for a format fetched in pieces, swings
+/// wildly until the end.
 fn parse_progress(line: &str) -> Option<Progress> {
     let mut it = line.strip_prefix("REIDM-PROGRESS ")?.split_whitespace();
     let num = |s: Option<&str>| s.and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).map(|v| v as u64);
     let done = num(it.next())?;
     let exact = num(it.next());
+    let declared = num(it.next()).filter(|n| *n > 0);
     let estimate = num(it.next());
     let format = it.next().unwrap_or("").to_string();
-    Some(Progress { done, total: exact.or(estimate), format })
+    Some(Progress { done, total: exact.or(declared).or(estimate), format })
 }
 
 /// The cookie header the browser sent, as the cookies file yt-dlp reads.
@@ -419,12 +424,26 @@ impl Manager {
     pub(crate) async fn run_media(&self, id: u64, live: Live, item: Item) -> Result<bool> {
         let media = item.request.media.clone().context("not a media download")?;
         let data_dir = self.data_dir().to_path_buf();
+        let tools = tools_dir(&data_dir);
+        // Say so while fetching a tool: the first video can wait minutes on it, with nothing
+        // else to show.
+        if !tools.join(format!("yt-dlp{EXE}")).is_file() {
+            self.set_note(id, Some("getting yt-dlp (first time only)"));
+        }
         let ytdlp = ytdlp(&self.0.http, &data_dir).await?;
+        if !tools.join(format!("deno{EXE}")).is_file() && ["deno", "node", "bun"].iter().all(|n| find_on_path(n).is_none()) {
+            self.set_note(id, Some("getting Deno for yt-dlp (first time only)"));
+        }
         let js = js_runtime(&self.0.http, &data_dir).await;
-        let ffmpeg = if media.format.contains('+') { ffmpeg(&self.0.http, &data_dir).await.unwrap_or_else(|e| {
+        let merging = media.format.contains('+');
+        if merging && cfg!(windows) && !tools.join("ffmpeg").join("ffmpeg.exe").is_file() && find_on_path("ffmpeg").is_none() {
+            self.set_note(id, Some("getting ffmpeg (first time only)"));
+        }
+        let ffmpeg = if merging { ffmpeg(&self.0.http, &data_dir).await.unwrap_or_else(|e| {
             tracing::warn!("ffmpeg unavailable: {e:#}");
             None
         }) } else { None };
+        self.set_note(id, Some("looking up the video"));
         if live.cancel.load(Ordering::SeqCst) {
             return Ok(false);
         }
@@ -441,9 +460,19 @@ impl Manager {
         };
 
         let mut cmd = tokio::process::Command::new(&ytdlp);
+        // As many connections as a normal download: yt-dlp fetches a format's pieces in
+        // parallel. For YouTube that needs its formats treated as pieces ("dashy"); one
+        // connection is throttled, and a long one is often cut off with a 403.
+        let connections = self.0.settings.lock().unwrap().connections.clamp(1, 16);
+        cmd.args(["--concurrent-fragments", &connections.to_string()]);
+        if page.host_str().is_some_and(|h| h == "youtu.be" || h == "youtube.com" || h.ends_with(".youtube.com")) {
+            cmd.args(["--extractor-args", "youtube:formats=dashy"]);
+        }
         cmd.args(["--newline", "--no-colors", "--no-playlist", "--continue", "--no-mtime", "--progress", "--encoding", "utf-8"])
-            .args(["--progress-template", "download:REIDM-PROGRESS %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s %(info.format_id)s"])
+            .args(["--progress-template", "download:REIDM-PROGRESS %(progress.downloaded_bytes)s %(progress.total_bytes)s %(info.filesize,info.filesize_approx)s %(progress.total_bytes_estimate)s %(info.format_id)s"])
             .args(["--print", "before_dl:REIDM-NAME %(filename)s"])
+            // The whole download's size, video and audio together, known before either starts.
+            .args(["--print", "before_dl:REIDM-SIZE %(filesize,filesize_approx)s"])
             .args(["--print", "after_move:REIDM-FILE %(filepath)s"])
             .args(["-f", &media.format])
             .args(["--merge-output-format", "mp4/webm/mkv"])
@@ -507,6 +536,7 @@ impl Manager {
         };
 
         let mut parts: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+        let mut whole: Option<u64> = None;
         let mut final_path: Option<PathBuf> = None;
         let mut last_save = Instant::now();
         let mut stopped = false;
@@ -522,9 +552,21 @@ impl Manager {
                 line = out.next_line() => match line {
                     Ok(Some(l)) => {
                         if let Some(p) = parse_progress(&l) {
+                            if parts.is_empty() {
+                                self.set_note(id, None);
+                            }
+                            let complete = p.total.is_some_and(|t| p.done >= t);
                             parts.insert(p.format, (p.done, p.total));
+                            // The last piece in: what follows is ffmpeg joining the two.
+                            if complete && parts.len() >= 2 && parts.values().all(|(d, t)| t.is_some_and(|t| *d >= t)) {
+                                self.set_note(id, Some("joining video and audio"));
+                            }
                             let done: u64 = parts.values().map(|v| v.0).sum();
-                            let size = parts.values().map(|v| v.1).sum::<Option<u64>>();
+                            // The size announced up front, unless the parts turn out bigger.
+                            let size = match (whole, parts.values().map(|v| v.1).sum::<Option<u64>>()) {
+                                (Some(w), Some(p)) => Some(w.max(p)),
+                                (w, p) => w.or(p),
+                            };
                             live.progress.store(done, Ordering::Relaxed);
                             if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
                                 it.downloaded = done;
@@ -538,6 +580,11 @@ impl Manager {
                             }
                         } else if let Some(f) = l.strip_prefix("REIDM-FILE ") {
                             final_path = Some(PathBuf::from(f.trim()));
+                        } else if let Some(n) = l.strip_prefix("REIDM-SIZE ") {
+                            whole = n.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0).map(|v| v as u64);
+                            if let (Some(w), Some(it)) = (whole, self.0.db.lock().unwrap().items.get_mut(&id)) {
+                                it.size = Some(w);
+                            }
                         } else if let Some(f) = l.strip_prefix("REIDM-NAME ") {
                             // Where it is going, known before the first byte: the list shows the
                             // real name at once, and removing the download finds its pieces.
@@ -596,14 +643,19 @@ mod tests {
     #[test]
     fn progress_lines_parse() {
         assert_eq!(
-            parse_progress("REIDM-PROGRESS 1024 4096 NA 137"),
+            parse_progress("REIDM-PROGRESS 1024 4096 NA NA 137"),
             Some(Progress { done: 1024, total: Some(4096), format: "137".into() })
         );
         assert_eq!(
-            parse_progress("REIDM-PROGRESS 10 NA 5000.5 251"),
+            parse_progress("REIDM-PROGRESS 10 NA NA 5000.5 251"),
             Some(Progress { done: 10, total: Some(5000), format: "251".into() })
         );
-        assert_eq!(parse_progress("REIDM-PROGRESS NA NA NA 18"), None);
+        // In pieces: the format's declared size beats the swinging estimate.
+        assert_eq!(
+            parse_progress("REIDM-PROGRESS 68828573 NA 401308743 2370693360.0 400"),
+            Some(Progress { done: 68828573, total: Some(401308743), format: "400".into() })
+        );
+        assert_eq!(parse_progress("REIDM-PROGRESS NA NA NA NA 18"), None);
         assert_eq!(parse_progress("[download] 50%"), None);
     }
 

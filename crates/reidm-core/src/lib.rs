@@ -207,6 +207,10 @@ pub struct Item {
     /// Part of the scheduled queue (*Download Later*).
     #[serde(default)]
     pub scheduled: bool,
+    /// What a running download is busy with when its progress can't say it: a video download
+    /// fetching yt-dlp, looking up the video, joining video and audio. Cleared when it stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl Item {
@@ -851,6 +855,7 @@ impl Manager {
                 last_modified: None,
                 speed_limit: None,
                 scheduled: opts.later,
+                note: None,
             };
             if let Some(p) = probe {
                 let n = self.0.settings.lock().unwrap().connections as u64;
@@ -1249,6 +1254,7 @@ impl Manager {
                 let mut db = me.0.db.lock().unwrap();
                 if let Some(it) = db.items.get_mut(&id) {
                     it.downloaded = live.progress.load(Ordering::Relaxed);
+                    it.note = None;
                     if st == Status::Done {
                         it.finished_at = Some(now_secs());
                         // A finished download leaves the scheduled queue, as in IDM.
@@ -1269,7 +1275,23 @@ impl Manager {
             if st == Status::Running {
                 it.last_try = Some(now_secs());
             }
+            it.note = None;
             it.status = st;
+        }
+    }
+
+    /// Set (or clear) what a running download is busy with; see [`Item::note`].
+    fn set_note(&self, id: u64, note: Option<&str>) {
+        let changed = match self.0.db.lock().unwrap().items.get_mut(&id) {
+            Some(it) if it.note.as_deref() != note => {
+                it.note = note.map(str::to_string);
+                true
+            }
+            _ => false,
+        };
+        // Saved, since `reidm list` reads the saved list; notes change a few times a download.
+        if changed {
+            self.save();
         }
     }
 

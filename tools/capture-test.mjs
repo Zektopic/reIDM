@@ -9,7 +9,8 @@
 // (`Input.dispatchMouseEvent`), because the extension deliberately ignores synthetic clicks.
 //
 // What it checks, against a local test site and a real reIDM daemon:
-//   1. a file link is taken on click: reIDM has it and the browser never requested it;
+//   1. a file link is taken on click: reIDM has it, the browser never requested it, and a
+//      notification says so;
 //   2. a download only recognisable from its response headers is taken from the browser:
 //      reIDM has it and the browser kept nothing — not even a 2 KB file;
 //   3. cookies reach reIDM, so a download behind a login works;
@@ -436,6 +437,8 @@ async function main() {
   });
   check('file link: download completes', !!it, it ? '' : JSON.stringify(itemFor(await reidmItems(), '/files/app.zip')?.status));
   check('file link: the browser never requested it', !browserRequested('/files/app.zip'));
+  const shown = await inWorker('chrome.notifications.getAll().then(n => Object.keys(n))');
+  check('file link: a notification says reIDM is downloading it', shown.some((k) => k.startsWith('reidm-')), JSON.stringify(shown));
   if (it) check('file link: bytes are right', Buffer.compare(fs.readFileSync(it.path), FILES['/files/app.zip']) === 0);
 
   // 2. downloads only recognisable from their headers: taken from the browser
