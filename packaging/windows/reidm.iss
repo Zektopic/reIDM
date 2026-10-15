@@ -69,7 +69,11 @@ Filename: "{app}\reidm-gui.exe"; Description: "Open reIDM now"; Flags: nowait po
 // fails with "DeleteFile failed; code 5" (access denied) on reidm.exe. Only processes started
 // from this folder are stopped, never another copy of reIDM. The service saves its list as it
 // changes, so unfinished downloads resume where they were.
-procedure StopReidm(const Dir: String);
+//
+// A reIDM started as administrator can't be stopped from here, and its path can't even be read.
+// It is reported instead, so Setup can say what to do rather than fail on the first file.
+// Returns False when such a process is left.
+function StopReidm(const Dir: String): Boolean;
 var
   Folder, Script: String;
   Code: Integer;
@@ -77,23 +81,35 @@ begin
   // A quote in the folder name would end PowerShell's string early; doubled, it is literal.
   Folder := AddBackslash(Dir);
   StringChangeEx(Folder, '''', '''''', True);
-  Script := 'Get-CimInstance Win32_Process | Where-Object { $_.Name -like ''reidm*'' -and $_.ExecutablePath -and $_.ExecutablePath.StartsWith(''' +
-    Folder + ''', [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }';
-  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+  Script :=
+    '$f = ''' + Folder + '''; ' +
+    '$mine = { $_.Name -like ''reidm*'' -and (-not $_.ExecutablePath -or $_.ExecutablePath.StartsWith($f, [StringComparison]::OrdinalIgnoreCase)) }; ' +
+    'Get-CimInstance Win32_Process | Where-Object $mine | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; ' +
+    // Windows releases a stopped program's files a moment after it exits.
+    'Start-Sleep -Milliseconds 800; ' +
+    'if (Get-CimInstance Win32_Process | Where-Object $mine) { exit 1 }';
+  // If PowerShell itself can't run, carry on as before rather than block the install.
+  Result := not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Script + '"',
-    '', SW_HIDE, ewWaitUntilTerminated, Code);
-  // Windows releases a stopped program's files a moment after it exits.
-  Sleep(800);
+    '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 1);
 end;
+
+const
+  StillRunning = 'reIDM is still running, and Setup can''t stop it: it was probably started as ' +
+    'administrator.' + #13#10#13#10 + 'Close it in Task Manager (Details tab: end reidm.exe and ' +
+    'reidm-gui.exe), or restart Windows, then run Setup again.';
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  StopReidm(ExpandConstant('{app}'));
-  Result := '';
+  if StopReidm(ExpandConstant('{app}')) then
+    Result := ''
+  else
+    Result := StillRunning;
 end;
 
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+function InitializeUninstall(): Boolean;
 begin
-  if CurUninstallStep = usUninstall then
-    StopReidm(ExpandConstant('{app}'));
+  Result := StopReidm(ExpandConstant('{app}'));
+  if not Result then
+    MsgBox(StillRunning, mbError, MB_OK);
 end;
