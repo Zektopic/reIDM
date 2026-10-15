@@ -36,38 +36,104 @@ enum Cmd {
     },
     /// Download a URL right now in this terminal (no daemon needed).
     Get {
+        /// The address to download.
         url: String,
+        /// Parallel connections.
         #[arg(short, long, default_value_t = 8)]
         connections: usize,
+        /// Folder to save into (default: your Downloads folder).
         #[arg(short, long)]
         dir: Option<PathBuf>,
+        /// File name to save as (default: the server's name).
         #[arg(short, long)]
         output: Option<String>,
+        /// Referer header to send.
         #[arg(long)]
         referer: Option<String>,
+        /// Cookie header to send, e.g. "session=abc; theme=dark".
         #[arg(long)]
         cookie: Option<String>,
     },
     /// Queue one or more URLs in the running daemon. Re-adding a URL resumes it.
     Add {
+        /// One or more addresses.
         #[arg(required = true)]
         urls: Vec<String>,
+        /// Referer header to send with every address.
         #[arg(long)]
         referer: Option<String>,
+        /// File name to save as (a single address only).
         #[arg(short, long)]
         output: Option<String>,
+        /// Add to the scheduled queue without starting (IDM's "Download Later").
+        #[arg(long)]
+        later: bool,
     },
-    /// Queue every URL in a text file (one per line, `#` comments); `-` reads stdin.
+    /// Queue a numbered or lettered series: `reidm batch 'https://x/img*.jpg' --from 1 --to 50 --width 3`.
+    Batch {
+        /// An address with one `*`, replaced by each value of the range.
+        pattern: String,
+        /// First value: a number, or a single letter for a letter range.
+        #[arg(long, default_value = "1")]
+        from: String,
+        /// Last value.
+        #[arg(long)]
+        to: String,
+        /// Zero-pad numbers to this many digits.
+        #[arg(long, default_value_t = 0)]
+        width: usize,
+        /// Only print the addresses.
+        #[arg(long)]
+        dry_run: bool,
+        /// Add to the scheduled queue without starting.
+        #[arg(long)]
+        later: bool,
+    },
+    /// Queue every URL in a text file (one per line, `#` comments) or an IDM `.ef2` export;
+    /// `-` reads stdin.
     Import {
+        /// The list or `.ef2` file; `-` reads stdin.
         file: String,
+        /// Folder to save into (default: reIDM's download folder).
         #[arg(short, long)]
         dir: Option<PathBuf>,
+        /// Add to the scheduled queue without starting.
+        #[arg(long)]
+        later: bool,
     },
-    /// Write the URLs of the current list to a text file (`-` for stdout).
+    /// Write the current list to a file (`-` for stdout): plain URLs, or IDM's `.ef2` format.
     Export {
+        /// Where to write; `-` writes to stdout.
         #[arg(default_value = "-")]
         file: String,
+        /// `txt` or `ef2`; by default taken from the file's extension.
+        #[arg(long)]
+        format: Option<String>,
     },
+    /// Show or set the global speed limit: `reidm limit 500K`, `reidm limit off`.
+    Limit {
+        /// A rate like `800K`, `2M` or `1.5MB` (per second), `on`, or `off`.
+        rate: Option<String>,
+    },
+    /// Start or stop the scheduled queue now.
+    Queue {
+        /// `start` or `stop`.
+        action: String,
+    },
+    /// Give an unfinished download a new address for the same file (an expired link, a mirror).
+    Refresh {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+        /// The file's new address.
+        url: String,
+    },
+    /// Start a download again from the first byte.
+    Restart {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+    },
+    /// Print where reIDM's browser extension is, for the browser's "Load unpacked".
+    Extension,
     /// Scan a page for downloadable files without downloading anything.
     Grab {
         url: String,
@@ -98,19 +164,40 @@ enum Cmd {
     },
     /// List downloads known to the daemon.
     List,
-    Pause { id: u64 },
-    Resume { id: u64 },
+    /// Pause a download.
+    Pause {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+    },
+    /// Resume a paused or failed download.
+    Resume {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+    },
     /// Remove a download from the list (add --purge to delete its files).
-    Rm { id: u64, #[arg(long)] purge: bool },
+    Rm {
+        /// The download's number, as `reidm list` shows it.
+        id: u64,
+        /// Also delete the file, finished or partial.
+        #[arg(long)]
+        purge: bool,
+    },
     /// Open the web UI in your browser (starts the daemon if needed).
     Ui,
     /// Check GitHub for a newer release.
     UpdateCheck,
-    /// Register the native-messaging host (com.tonec.idm) with installed browsers.
+    /// Register the native-messaging hosts (com.zektopic.reidm for reIDM's extension,
+    /// com.tonec.idm for Tonec's) with the installed browsers.
     InstallHost,
+    /// Remove the native-messaging host registrations.
     UninstallHost,
     /// Make a local copy of the official IDM extension usable on this OS (see docs/EXTENSION.md).
-    PatchExtension { src: PathBuf, dst: PathBuf },
+    PatchExtension {
+        /// The unpacked official extension.
+        src: PathBuf,
+        /// Where to write the patched copy (a new folder).
+        dst: PathBuf,
+    },
 }
 
 fn human(n: u64) -> String {
@@ -176,6 +263,59 @@ async fn api_post(path: &str, body: serde_json::Value) -> Result<serde_json::Val
     serde_json::from_str(&text).context("decoding the daemon's reply")
 }
 
+/// GET from the daemon and return the body.
+async fn api_get(path: &str) -> Result<String> {
+    let url = format!("http://127.0.0.1:{}{path}", web::UI_PORT);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("X-Reidm-Token", api_token()?)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .with_context(|| format!("cannot reach the daemon at {url} (start it with `reidm daemon`)"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("daemon said {status}: {text}");
+    }
+    Ok(text)
+}
+
+/// POST JSON to an endpoint that answers with no body.
+async fn api_post_empty(path: &str, body: serde_json::Value) -> Result<()> {
+    let url = format!("http://127.0.0.1:{}{path}", web::UI_PORT);
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("X-Reidm-Token", api_token()?)
+        .json(&body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .with_context(|| format!("cannot reach the daemon at {url} (start it with `reidm daemon`)"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("{}", resp.text().await.unwrap_or_else(|_| status.to_string()));
+    }
+    Ok(())
+}
+
+/// `500K`, `2M`, `1.5MB`, `800kb`, `1048576` -> bytes per second (binary units, as IDM uses).
+fn parse_rate(s: &str) -> Result<u64> {
+    let t = s.trim().to_ascii_lowercase();
+    let t = t.trim_end_matches("/s").trim_end_matches("ps").trim_end_matches('b');
+    let (num, mul) = match t.chars().last() {
+        Some('k') => (&t[..t.len() - 1], 1024.0),
+        Some('m') => (&t[..t.len() - 1], 1024.0 * 1024.0),
+        Some('g') => (&t[..t.len() - 1], 1024.0 * 1024.0 * 1024.0),
+        _ => (t, 1.0),
+    };
+    let v: f64 = num.trim().parse().with_context(|| format!("{s:?} is not a rate (try 500K or 2M)"))?;
+    if v.is_nan() || v <= 0.0 {
+        bail!("a speed limit must be above zero; use `reidm limit off` to remove it");
+    }
+    Ok((v * mul) as u64)
+}
+
 /// Read a file, or stdin when the path is `-`.
 fn read_input(path: &str) -> Result<String> {
     if path == "-" {
@@ -231,6 +371,26 @@ async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Daemon { connections, dir, no_idm_port } => {
             let mgr = Manager::open(&default_data_dir(), dir.unwrap_or_else(default_download_dir), connections)?;
+            mgr.spawn_scheduler();
+            // Keep browser integration current: a fresh copy of the extension for "Load unpacked",
+            // and the native host the extension uses to start reIDM. Both are idempotent and only
+            // write what changed, so doing it at every start is what keeps them right after an
+            // update or a move.
+            std::thread::spawn(|| {
+                match install::stage_extension() {
+                    Ok((dir, true)) => tracing::info!("browser extension updated in {}", dir.display()),
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!("browser extension not staged: {e:#}"),
+                }
+                match install::ensure_reidm_host() {
+                    Ok(changes) => {
+                        for c in changes {
+                            tracing::info!("native host: {c}");
+                        }
+                    }
+                    Err(e) => tracing::debug!("native host not registered: {e:#}"),
+                }
+            });
             let idm_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             if !no_idm_port {
                 let m = mgr.clone();
@@ -296,60 +456,153 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Add { urls, referer, output } => {
+        Cmd::Add { urls, referer, output, later } => {
             if output.is_some() && urls.len() > 1 {
                 bail!("--output only makes sense for a single URL");
             }
             // `referer` applies to the whole batch; `output` (a file name) is only meaningful
-            // for one URL. Both go through the single-URL path when given.
-            if referer.is_some() || output.is_some() {
-                let mut body = serde_json::json!({ "urls": urls });
-                if let Some(r) = referer {
-                    body["referer"] = serde_json::Value::String(r);
-                }
-                if let Some(o) = output {
-                    body["filename"] = serde_json::Value::String(o);
-                }
-                let v = api_post("/api/downloads/batch", body).await?;
-                report_batch(&v);
-            } else {
-                let v = api_post("/api/downloads/batch", serde_json::json!({ "urls": urls })).await?;
-                report_batch(&v);
+            // for one URL.
+            let mut body = serde_json::json!({ "urls": urls, "later": later });
+            if let Some(r) = referer {
+                body["referer"] = serde_json::Value::String(r);
             }
+            if let Some(o) = output {
+                body["filename"] = serde_json::Value::String(o);
+            }
+            let v = api_post("/api/downloads/batch", body).await?;
+            report_batch(&v);
         }
-        Cmd::Import { file, dir } => {
-            let text = read_input(&file)?;
-            let urls = reidm_core::grabber::parse_url_list(&text);
-            if urls.is_empty() {
-                bail!("no http(s) URLs found in {file}");
+        Cmd::Batch { pattern, from, to, width, dry_run, later } => {
+            use reidm_core::lists::{expand_pattern, Sequence};
+            let seq = match (from.parse::<u64>(), to.parse::<u64>()) {
+                (Ok(from), Ok(to)) => Sequence::Numbers { from, to, width },
+                _ => {
+                    let one = |s: &str| {
+                        let mut c = s.chars();
+                        match (c.next(), c.next()) {
+                            (Some(ch), None) => Ok(ch),
+                            _ => Err(anyhow::anyhow!("{s:?} is neither a number nor a single letter")),
+                        }
+                    };
+                    Sequence::Letters { from: one(&from)?, to: one(&to)? }
+                }
+            };
+            let urls = expand_pattern(&pattern, &seq)?;
+            if dry_run {
+                for u in &urls {
+                    println!("{u}");
+                }
+                return Ok(());
             }
-            println!("importing {} URL(s)", urls.len());
-            let mut body = serde_json::json!({ "urls": urls });
+            println!("queueing {} URL(s)", urls.len());
+            let v = api_post("/api/downloads/batch", serde_json::json!({ "urls": urls, "later": later })).await?;
+            report_batch(&v);
+        }
+        Cmd::Import { file, dir, later } => {
+            let text = read_input(&file)?;
+            let mut body = if reidm_core::lists::looks_like_ef2(&text) {
+                let items = reidm_core::lists::parse_ef2(&text);
+                if items.is_empty() {
+                    bail!("no downloads found in {file}");
+                }
+                println!("importing {} download(s) from an IDM export", items.len());
+                serde_json::json!({ "items": items })
+            } else {
+                let urls = reidm_core::grabber::parse_url_list(&text);
+                if urls.is_empty() {
+                    bail!("no http(s) URLs found in {file}");
+                }
+                println!("importing {} URL(s)", urls.len());
+                serde_json::json!({ "urls": urls })
+            };
+            body["later"] = serde_json::Value::Bool(later);
             if let Some(d) = dir {
                 body["dir"] = serde_json::Value::String(d.to_string_lossy().into_owned());
             }
             let v = api_post("/api/downloads/batch", body).await?;
             report_batch(&v);
         }
-        Cmd::Export { file } => {
-            let path = default_data_dir().join("downloads.json");
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no downloads yet ({})", path.display()))?)?;
-            let mut urls: Vec<String> = v["items"]
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter_map(|(_, it)| it["request"]["url"].as_str().map(str::to_string))
-                .collect();
-            urls.sort();
-            urls.dedup();
-            let text = reidm_core::grabber::url_list_text(&urls);
+        Cmd::Export { file, format } => {
+            let format = format.unwrap_or_else(|| if file.to_ascii_lowercase().ends_with(".ef2") { "ef2".into() } else { "txt".into() });
+            let text = match api_get(&format!("/api/export?format={format}")).await {
+                Ok(t) => t,
+                // No daemon: read the list straight from disk.
+                Err(_) => {
+                    let path = default_data_dir().join("downloads.json");
+                    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no downloads yet ({})", path.display()))?)?;
+                    let items: Vec<&serde_json::Value> = v["items"].as_object().into_iter().flatten().map(|(_, it)| it).collect();
+                    if format == "ef2" {
+                        let entries: Vec<reidm_core::lists::Entry> = items
+                            .iter()
+                            .filter_map(|it| {
+                                Some(reidm_core::lists::Entry {
+                                    url: it["request"]["url"].as_str()?.to_string(),
+                                    referer: it["request"]["referer"].as_str().map(str::to_string),
+                                    cookie: None,
+                                    user_agent: it["request"]["user_agent"].as_str().map(str::to_string),
+                                    post_data: None,
+                                })
+                            })
+                            .collect();
+                        reidm_core::lists::write_ef2(&entries)
+                    } else {
+                        let mut urls: Vec<String> = items.iter().filter_map(|it| it["request"]["url"].as_str().map(str::to_string)).collect();
+                        urls.sort();
+                        urls.dedup();
+                        reidm_core::grabber::url_list_text(&urls)
+                    }
+                }
+            };
             match file.as_str() {
                 "-" => print!("{text}"),
                 f => {
                     std::fs::write(f, &text)?;
-                    println!("wrote {} URL(s) to {f}", urls.len());
+                    println!("wrote {f}");
                 }
             }
+        }
+        Cmd::Limit { rate } => {
+            let body = match rate.as_deref().map(str::trim) {
+                None => {
+                    let s: serde_json::Value = serde_json::from_str(&api_get("/api/settings").await?)?;
+                    let on = s["limit_enabled"].as_bool().unwrap_or(false);
+                    let r = s["speed_limit"].as_u64().unwrap_or(0);
+                    if on && r > 0 {
+                        println!("speed limit: {}/s", human(r));
+                    } else {
+                        println!("speed limit: off{}", if r > 0 { format!(" (set to {}/s when on)", human(r)) } else { String::new() });
+                    }
+                    return Ok(());
+                }
+                Some("off") => serde_json::json!({ "limit_enabled": false }),
+                Some("on") => serde_json::json!({ "limit_enabled": true }),
+                Some(r) => serde_json::json!({ "limit_enabled": true, "speed_limit": parse_rate(r)? }),
+            };
+            api_post_empty("/api/settings", body).await?;
+            println!("ok");
+        }
+        Cmd::Queue { action } => {
+            if action != "start" && action != "stop" {
+                bail!("use `reidm queue start` or `reidm queue stop`");
+            }
+            let v = api_post(&format!("/api/queue/{action}"), serde_json::json!({})).await?;
+            println!("{} download(s) {}", v["count"].as_u64().unwrap_or(0), if action == "start" { "started" } else { "stopped" });
+        }
+        Cmd::Refresh { id, url } => {
+            api_post_empty(&format!("/api/downloads/{id}/refresh"), serde_json::json!({ "url": url })).await?;
+            println!("download #{id} continues from {url}");
+        }
+        Cmd::Restart { id } => {
+            api_post_empty(&format!("/api/downloads/{id}/restart"), serde_json::json!({})).await?;
+            println!("download #{id} restarted");
+        }
+        Cmd::Extension => {
+            let (dir, _) = install::stage_extension()?;
+            println!("{}", dir.display());
+            eprintln!(
+                "Load it once: open chrome://extensions (or edge://, brave://), turn on Developer mode, \
+                 choose \"Load unpacked\" and pick the folder above. reIDM keeps that folder up to date."
+            );
         }
         Cmd::Grab { url, depth, types, same_host, include, exclude, sizes, export, add } => {
             let mut opts = reidm_core::grabber::Options {
@@ -397,15 +650,27 @@ async fn main() -> Result<()> {
         Cmd::List => {
             let path = default_data_dir().join("downloads.json");
             let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no downloads yet ({})", path.display()))?)?;
-            for (id, it) in v["items"].as_object().into_iter().flatten() {
+            let items = v["items"].as_object().filter(|m| !m.is_empty());
+            if items.is_none() {
+                println!("no downloads");
+            }
+            for (id, it) in items.into_iter().flatten() {
+                let state = match it["status"]["state"].as_str().unwrap_or("?") {
+                    // Download Later: stopped, but waiting for the queue rather than for the user.
+                    "Paused" if it["scheduled"].as_bool() == Some(true) => "Scheduled",
+                    s => s,
+                };
                 println!(
                     "{:>4}  {:<10} {:>10}/{:<10}  {}",
                     id,
-                    it["status"]["state"].as_str().unwrap_or("?"),
+                    state,
                     human(it["downloaded"].as_u64().unwrap_or(0)),
                     it["size"].as_u64().map(human).unwrap_or("?".into()),
                     it["path"].as_str().unwrap_or("")
                 );
+                if let Some(e) = it["status"]["error"].as_str() {
+                    println!("      {e}");
+                }
             }
         }
         Cmd::Pause { id } => drop(send_to_daemon(vec![ctl(session::T_CTL_PAUSE, id, None)]).await?),
@@ -502,4 +767,20 @@ fn patch_extension(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     std::fs::write(&bg, js)?;
     println!("patched extension written to {}\nLoad it via chrome://extensions -> Developer mode -> Load unpacked.", dst.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rate;
+
+    #[test]
+    fn rates() {
+        assert_eq!(parse_rate("500K").unwrap(), 500 * 1024);
+        assert_eq!(parse_rate("2M").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_rate("1.5MB").unwrap(), 1_572_864);
+        assert_eq!(parse_rate("800kb/s").unwrap(), 800 * 1024);
+        assert_eq!(parse_rate("4096").unwrap(), 4096);
+        assert!(parse_rate("0").is_err());
+        assert!(parse_rate("fast").is_err());
+    }
 }

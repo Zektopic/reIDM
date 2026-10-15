@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Build reIDM-<version>.dmg from universal binaries.
+# Build reIDM-<version>.dmg from universal binaries: a drag-to-Applications disk image whose
+# window shows reIDM.app, an arrow, and the Applications folder.
 # Usage: make-dmg.sh <version> <reidm> <reidm-host> <reidm-gui> <out.dmg>
+#
+# Needs dmgbuild (`python3 -m pip install dmgbuild`), which lays out the window without
+# scripting Finder. Everything reIDM needs is inside the app: the service and the browser's
+# native host beside the window's binary in Contents/MacOS, the extension in Resources. The
+# service registers the native host and copies the extension out each time it starts, so
+# dragging the app to Applications and opening it once is the whole installation.
 #
 # Signing: set MACOS_SIGN_IDENTITY to a "Developer ID Application: …" identity to sign for
 # distribution, and MACOS_NOTARY_PROFILE to a notarytool keychain profile to notarize. With
@@ -22,32 +29,45 @@ sign() {  # sign <path> [--deep]
     codesign --force --options runtime --timestamp "$@" --sign "$SIGN_ID" "$path"
   fi
 }
-STAGE=$(mktemp -d)/reIDM
-APP="$STAGE/reIDM.app"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$STAGE/bin"
+command -v dmgbuild >/dev/null || { echo "dmgbuild not found: python3 -m pip install dmgbuild" >&2; exit 1; }
 
-cp "$REIDM" "$STAGE/bin/reidm"; cp "$HOST" "$STAGE/bin/reidm-host"
-cp "$GUI" "$APP/Contents/MacOS/reidm-gui"
-chmod 755 "$STAGE/bin/reidm" "$STAGE/bin/reidm-host" "$APP/Contents/MacOS/reidm-gui"
+WORK=$(mktemp -d)
+APP="$WORK/reIDM.app"
+BIN="$APP/Contents/MacOS"
+mkdir -p "$BIN" "$APP/Contents/Resources"
 
-# The daemon lives next to the app binary so `reidm-gui` can spawn it.
-cp "$STAGE/bin/reidm" "$APP/Contents/MacOS/reidm"
+# The window's binary, the service it starts, and the native host the browser starts, side by
+# side: each finds the others next to itself.
+cp "$GUI" "$BIN/reidm-gui"; cp "$REIDM" "$BIN/reidm"; cp "$HOST" "$BIN/reidm-host"
+chmod 755 "$BIN"/*
 
 # Re-sign what lipo produced; see the note at the top of this script.
-for b in "$STAGE/bin/reidm" "$STAGE/bin/reidm-host" "$APP/Contents/MacOS/reidm" "$APP/Contents/MacOS/reidm-gui"; do
+for b in "$BIN/reidm" "$BIN/reidm-host" "$BIN/reidm-gui"; do
   sign "$b"
 done
 echo "code signatures:"
 codesign -dv "$APP/Contents/MacOS/reidm-gui" 2>&1 | grep -E "^Identifier|^Signature|^TeamIdentifier" || true
 
-# Icon: assemble an .icns from the PNGs we ship.
+# Icon: assemble an .icns from the PNGs we ship. Each slot gets the size drawn for it rather
+# than a resampled large one: the small sizes are drawn differently (bolder arrow, no letters).
 ICONSET=$(mktemp -d)/reidm.iconset
 mkdir -p "$ICONSET"
-for s in 16 32 128 256 512; do
-  sips -z $s $s "$ROOT/packaging/icon/reidm-512.png" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
-  sips -z $((s*2)) $((s*2)) "$ROOT/packaging/icon/reidm-512.png" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
-done
+I="$ROOT/packaging/icon"
+cp "$I/reidm-16.png"   "$ICONSET/icon_16x16.png"
+cp "$I/reidm-32.png"   "$ICONSET/icon_16x16@2x.png"
+cp "$I/reidm-32.png"   "$ICONSET/icon_32x32.png"
+cp "$I/reidm-64.png"   "$ICONSET/icon_32x32@2x.png"
+cp "$I/reidm-128.png"  "$ICONSET/icon_128x128.png"
+cp "$I/reidm-256.png"  "$ICONSET/icon_128x128@2x.png"
+cp "$I/reidm-256.png"  "$ICONSET/icon_256x256.png"
+cp "$I/reidm-512.png"  "$ICONSET/icon_256x256@2x.png"
+cp "$I/reidm-512.png"  "$ICONSET/icon_512x512.png"
+cp "$I/reidm-1024.png" "$ICONSET/icon_512x512@2x.png"
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/reIDM.icns"
+
+# reIDM's browser extension. The service finds it here (next to the app binary, in Resources)
+# and keeps a copy the browser can load in ~/Library/Application Support.
+cp -R "$ROOT/extension" "$APP/Contents/Resources/extension"
 
 cat > "$APP/Contents/Info.plist" <<EOP
 <?xml version="1.0" encoding="UTF-8"?>
@@ -66,47 +86,24 @@ cat > "$APP/Contents/Info.plist" <<EOP
 </dict></plist>
 EOP
 
-cp "$ROOT/README.md" "$STAGE/README.md"; cp "$ROOT/docs/EXTENSION.md" "$STAGE/EXTENSION.md"; cp "$ROOT/CHANGELOG.md" "$STAGE/CHANGELOG.md"; cp "$ROOT/docs/PACKAGING.md" "$STAGE/PACKAGING.md"
-
-cat > "$STAGE/Install reIDM.command" <<'EOS'
-#!/usr/bin/env bash
-# Installs reIDM to ~/.local/bin, registers the native-messaging host and a login agent.
-set -euo pipefail
-cd "$(dirname "$0")"
-DEST="$HOME/.local/bin"; mkdir -p "$DEST"
-cp bin/reidm bin/reidm-host "$DEST/"
-# Keep the daemon beside the app too, so the window can start it itself.
-cp bin/reidm "reIDM.app/Contents/MacOS/reidm"
-xattr -dr com.apple.quarantine reIDM.app "$DEST/reidm" "$DEST/reidm-host" 2>/dev/null || true
-"$DEST/reidm" install-host
-PLIST="$HOME/Library/LaunchAgents/com.zektopic.reidm.plist"
-mkdir -p "$(dirname "$PLIST")"
-cat > "$PLIST" <<EOP
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>com.zektopic.reidm</string>
-<key>ProgramArguments</key><array><string>$DEST/reidm</string><string>daemon</string></array>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
-</dict></plist>
-EOP
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load "$PLIST"
-echo
-echo "reIDM installed."
-echo "  * Drag reIDM.app to /Applications to keep it."
-echo "  * Add \$HOME/.local/bin to PATH to use the 'reidm' command."
-EOS
-chmod 755 "$STAGE/Install reIDM.command"
-
 # Sign the bundle itself, last, once its contents are final.
 sign "$APP"
 codesign --verify --verbose=2 "$APP" 2>&1 | tail -2
 
-# Launch the installer when the image is opened.
-ln -s /Applications "$STAGE/Applications" 2>/dev/null || true
+# The window's background, at 1x and 2x in one file so Retina screens get the sharp one.
+# Drawn by tools/make_dmg_background.py.
+tiffutil -cathidpicheck "$ROOT/packaging/macos/background.png" "$ROOT/packaging/macos/background@2x.png" \
+  -out "$WORK/background.tiff"
 
-hdiutil create -volname "reIDM $VER" -srcfolder "$STAGE" -ov -format UDZO "$OUT"
+rm -f "$OUT"
+dmgbuild -s "$ROOT/packaging/macos/dmg-settings.py" \
+  -D app="$APP" -D background="$WORK/background.tiff" -D volume_icon="$APP/Contents/Resources/reIDM.icns" \
+  "reIDM $VER" "$OUT"
+
+# The image itself carries a signature too when there is a real identity to sign it with.
+if [ "$SIGN_ID" != "-" ]; then
+  codesign --force --timestamp --sign "$SIGN_ID" "$OUT"
+fi
 
 if [ -n "$NOTARY_PROFILE" ]; then
   echo "notarizing (this can take a few minutes)…"

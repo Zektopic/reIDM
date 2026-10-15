@@ -49,8 +49,16 @@ assets = [
   ["../../packaging/linux/com.tonec.idm.chromium.json", "etc/chromium/native-messaging-hosts/com.tonec.idm.json", "644"],
   ["../../packaging/linux/com.tonec.idm.chromium.json", "etc/opt/edge/native-messaging-hosts/com.tonec.idm.json", "644"],
   ["../../packaging/linux/com.tonec.idm.firefox.json", "usr/lib/mozilla/native-messaging-hosts/com.tonec.idm.json", "644"],
-  ["../../docs/EXTENSION.md", "usr/share/doc/reidm/EXTENSION.md", "644"],
+  # reIDM's own extension, and the host it uses to start reIDM on demand.
+  ["../../extension/*.js", "usr/share/reidm/extension/", "644"],
+  ["../../extension/*.html", "usr/share/reidm/extension/", "644"],
+  ["../../extension/*.json", "usr/share/reidm/extension/", "644"],
+  ["../../extension/*.md", "usr/share/reidm/extension/", "644"],
+  ["../../extension/icons/*.png", "usr/share/reidm/extension/icons/", "644"],
+  ["../../packaging/linux/com.zektopic.reidm.json", "etc/opt/chrome/native-messaging-hosts/com.zektopic.reidm.json", "644"],
+  ["../../packaging/linux/com.zektopic.reidm.json", "etc/chromium/native-messaging-hosts/com.zektopic.reidm.json", "644"],
+  ["../../packaging/linux/com.zektopic.reidm.json", "etc/opt/edge/native-messaging-hosts/com.zektopic.reidm.json", "644"],
+  ["../../docs/*.md", "usr/share/doc/reidm/", "644"],
   ["../../CHANGELOG.md", "usr/share/doc/reidm/CHANGELOG.md", "644"],
-  ["../../docs/PACKAGING.md", "usr/share/doc/reidm/PACKAGING.md", "644"],
   ["../../README.md", "usr/share/doc/reidm/README.md", "644"],
 ]

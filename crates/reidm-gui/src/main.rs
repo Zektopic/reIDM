@@ -9,6 +9,7 @@ mod api;
 mod app;
 mod icons;
 mod model;
+mod prefs;
 mod theme;
 
 /// The window/taskbar icon, decoded from the PNG shipped in the repository.

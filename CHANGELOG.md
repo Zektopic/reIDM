@@ -1,5 +1,114 @@
 # Changelog
 
+## 0.4.0
+
+The browser now hands its downloads to reIDM *before* saving anything, the engine gains IDM's
+remaining core features, and the desktop window catches up with IDM's.
+
+### Browser integration
+
+* **Downloads are taken before the browser saves them.** The extension holds Chrome's
+  file-name decision (`onDeterminingFilename`) for every download, pauses it, and asks reIDM to
+  take it with the browser's cookies, referrer and user agent. Only after reIDM has fetched the
+  first byte is the browser's copy cancelled and erased — so there is no download bubble, no
+  *Save as* dialog and no partial file, even for a 2 KB file or with *Ask where to save each
+  file* on. If reIDM can't take it, the download is resumed exactly as it was.
+* **File links are taken on click**, before the browser requests anything. Links that turn out to
+  be web pages (login walls, "your download will start" pages) are handed back to the browser.
+* **reIDM is started on demand.** A new native-messaging host, `com.zektopic.reidm`, lets the
+  extension start reIDM when it isn't running. The extension has a fixed ID, so the host admits
+  only it. The service re-registers the host with every Chromium-based browser at each start.
+* **Form submissions, `blob:`/`data:` files, other extensions' downloads, Alt+click, excluded
+  sites and incognito windows stay with the browser**, and the popup says which rule kept each one.
+* **Resource grabber.** Lists everything a page offers, from every frame — links, images (the
+  largest `srcset` candidate, lazy-load attributes, CSS backgrounds), video, audio, subtitles,
+  embeds, and every resource the page actually loaded — with filters, sizes on request, and one
+  batch hand-off, or *Download later*, or an `.ef2` export.
+* **New popup and options.** Status with *Start reIDM*, recent hand-offs, media on the page,
+  *Never on this site*; capture rules for file types, minimum size, excluded sites and incognito.
+* Media is also recognised by the type the server reports, with sizes from the response headers.
+* **Every installer ships the extension**, and reIDM keeps a copy in the data folder up to date,
+  so updating reIDM updates the extension. **Help › Browser integration** shows the folder to load
+  and whether the extension is connected; `reidm extension` prints it. Releases add
+  `reidm-extension-<version>.zip`.
+
+### Download engine
+
+* **Dynamic segmentation.** A connection that finishes its part takes over half of the largest
+  remaining one, so a download doesn't wait on its slowest connection.
+* **Servers that limit connections** (`429`, `503`) no longer fail a download: the refused
+  connection hands its range to the others.
+* **Never splices a changed file.** Resumed requests carry `If-Range` with the server's `ETag`,
+  and every range's total size is checked; a file that changed on the server stops the download
+  with a clear message, and *Restart* fetches the new one.
+* **Speed limiter**, global and per download, applied immediately to running transfers.
+* **Scheduled queue and scheduler.** *Download Later*, *Start/Stop Queue*, and start and stop
+  times on chosen weekdays, in local time, including overnight windows. A finished download
+  leaves the queue.
+* **Refresh download address.** Give a stopped download a new link to the same file — typed, or
+  captured from the browser's next download — and it carries on from where it was.
+* **Restart** a download from the first byte.
+* **IDM `.ef2` import and export**, with each download's referrer, cookies and user agent; form
+  (POST) entries are reported rather than fetched with a GET. **Batch downloads** from `*`
+  patterns, numbers or letters, up to 10,000 addresses.
+* Responses are no longer transparently decompressed, so the bytes saved are the bytes the
+  server stores.
+
+### Desktop window
+
+* Toolbar: Scheduler, Start Queue, Stop Queue, Site Grabber, Speed Limiter. Tree: Unfinished,
+  Finished and the scheduled queue next to the file types.
+* **Properties** with a live segment map — each range, its progress, and where each connection is
+  writing — and the download's own speed limit.
+* Windows for refreshing an address, batch downloads, the scheduler, the speed limiter, browser
+  integration, and IDM's *Download complete*.
+* *Add URL* takes a folder, offers *Download later*, and fills itself from the clipboard.
+* Multi-select delete; keyboard shortcuts (Delete, Ctrl+A, Enter, Ctrl+N/Insert, Ctrl+V); the
+  rate is averaged over three seconds instead of flickering; preferences persist in `gui.json`.
+
+### Command line and API
+
+* New commands: `batch`, `limit`, `queue`, `refresh`, `restart`, `extension`; `add --later`,
+  `import` of `.ef2` files, `export --format ef2`. `list` shows scheduled downloads and why a
+  download failed.
+* New endpoints for each of the above, and `/api/status` reports the connected extension.
+* Documentation: a user guide, browser integration, command-line and HTTP API references,
+  architecture and security model, troubleshooting and building guides.
+* `REIDM_DATA_DIR` moves the data folder on every system, for a separate instance or a test.
+
+### Packages
+
+* **The macOS disk image is a proper drag-to-Applications installer**: its window shows reIDM,
+  an arrow and the Applications folder on a drawn background, and nothing else. Everything
+  reIDM needs is inside the app now — the service, the browser's native host, the extension — so
+  there is no install script to run; open reIDM once and it registers itself with your browsers.
+* The real-browser test (`tools/capture-test.mjs`) runs on Windows too.
+
+### New look
+
+* A new icon: a download button in front of a globe, with a small "re". Generated by
+  `tools/make_icon.py`, with the small sizes drawn rather than scaled.
+
+### Fixed
+
+* **Two transfers could run the same download** when two parts of reIDM started queued downloads
+  at the same moment; they wrote one file until one renamed it away from the other. The slot is
+  now reserved under the lock that chooses it.
+* **IDM's Alt-click and Insert-click didn't work with Tonec's extension.** reIDM sent 0 for the
+  key masks in its settings message, which disabled both; it now sends IDM's defaults (found by
+  reading the extension's code side by side with the decompiled IDM).
+* On Windows, a reIDM service started through the browser's native host is no longer killed
+  when the browser closes the host: it now leaves the browser's job object.
+* **On Windows, the browser couldn't start reIDM when reIDM had registered its native host
+  itself** (rather than the installer): the registration named the host by an extended-length
+  path (`\\?\C:\…`), which browsers can't launch — Chrome said only "Error when communicating
+  with the native messaging host". Paths are now written plainly, and existing registrations are
+  rewritten at the next start. Found by running the browser test on Windows.
+* On Windows, registering the native host no longer writes "The operation completed
+  successfully." into the service's log, or flashes a console window.
+* The release workflow's notes had an unindented line that made the whole file invalid YAML,
+  so the 0.4.0 release would not have built.
+
 ## 0.3.1
 
 ### Added

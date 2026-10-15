@@ -1,17 +1,49 @@
 # Packaging and signing
 
-How the three release artifacts are produced, and what is still needed to sign them.
+How the release artifacts are produced, and what is still needed to sign them. The commands to
+build each one are in [BUILDING.md](BUILDING.md#packaging).
 
 ## What a release contains
 
 | Artifact | Built by | Contents |
 |---|---|---|
-| `reIDM-setup-<v>.exe` | Inno Setup, `packaging/windows/reidm.iss` | `reidm.exe`, `reidm-gui.exe`, `reidm-host.exe`, docs, icon; registers the `com.tonec.idm` native-messaging host and a login autostart |
-| `reidm_<v>-1_amd64.deb` | `cargo deb -p reidm` | the three binaries, a `.desktop` entry, hicolor icons, a systemd user unit, and native-messaging manifests for Chrome/Chromium/Edge/Firefox |
-| `reIDM-<v>-universal.dmg` | `packaging/macos/make-dmg.sh` | a `reIDM.app` bundle (universal, with icon), the two CLI binaries, `Install reIDM.command`, docs |
+| `reIDM-setup-<v>.exe` | Inno Setup, `packaging/windows/reidm.iss` | `reidm.exe`, `reidm-gui.exe`, `reidm-host.exe`, the browser extension, docs, icon; registers both native-messaging hosts (`com.zektopic.reidm` for Chrome, Edge, Brave and Vivaldi; `com.tonec.idm` for Chrome, Edge, Brave and Firefox) and a login autostart; Start-menu entries for the user guide and the extension folder |
+| `reidm_<v>-1_amd64.deb` | `cargo deb -p reidm` | the three binaries, the browser extension in `/usr/share/reidm/extension`, a `.desktop` entry, hicolor icons, a systemd user unit, both native-messaging hosts system-wide for Chrome, Chromium and Edge (`com.tonec.idm` also for Firefox), and the docs |
+| `reIDM-<v>-universal.dmg` | `packaging/macos/make-dmg.sh` | a drag-to-Applications disk image holding `reIDM.app` (universal, with icon): the window, the service and the native host in `Contents/MacOS`, the extension in `Contents/Resources` |
+| `reidm-extension-<v>.zip` | `zip` in the release workflow | the browser extension alone |
 
-The DMG is **not** a bare copy of binaries: `reIDM.app` is assembled with an `Info.plist` and an
-`.icns`, so it can be dragged to `/Applications` and launched from Finder.
+**The macOS disk image** opens to a window showing `reIDM.app`, an arrow, and a link to
+`/Applications` over a drawn background — drag one onto the other and that's the installation.
+There is no install script: the service and the native host sit beside the window's binary in
+`Contents/MacOS`, so the first time reIDM opens, the service registers the native host with the
+browsers and copies the extension out, as it does at every start.
+
+- The window's layout (`.DS_Store`) is written by [dmgbuild](https://github.com/dmgbuild/dmgbuild)
+  from `packaging/macos/dmg-settings.py`, with no Finder scripting, so it builds on a CI runner
+  with nobody logged in. `python3 -m pip install dmgbuild` (or `pipx install dmgbuild`) before
+  running `make-dmg.sh`.
+- The background is `packaging/macos/background.png` and `background@2x.png`, drawn by
+  `tools/make_dmg_background.py` (Pillow, Open Sans) and joined into one Retina-aware TIFF with
+  `tiffutil` at build time. The icon positions in `dmg-settings.py` and in the drawing script
+  must agree.
+- For the command line, link the binaries inside the app onto your `PATH`:
+
+  ```sh
+  sudo ln -sf /Applications/reIDM.app/Contents/MacOS/reidm /usr/local/bin/reidm
+  ```
+
+- To start reIDM at login rather than on demand, add it in *System Settings › General › Login
+  Items* (the window opens; closing it leaves the service running). It isn't needed for the
+  browser: the extension starts reIDM when it isn't running.
+
+**The browser extension in every package.** The service looks for the extension next to its own
+binary — `extension/` beside `reidm.exe`, `../share/reidm/extension` from `/usr/bin` or
+`~/.local/bin`, `Resources/extension` in the app bundle — and copies it to
+`browser-extension/` in the user's data folder at every start. Browsers load it from there, so
+updating reIDM updates the extension without the user re-loading it. Its ID,
+`pgeonmdaagbiccimgojpafdjcipcfnlc`, is fixed by the public `key` in `extension/manifest.json`,
+which is what lets the `com.zektopic.reidm` host manifests name it in `allowed_origins` ahead of
+time.
 
 ## macOS signing
 

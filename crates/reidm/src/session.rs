@@ -13,6 +13,17 @@ const MANAGER_VERSION: i64 = (6 << 24) | (43 << 16) | (15 << 8);
 /// File types captured from browser downloads by default (IDM's stock list).
 const DEFAULT_FILE_TYPES: &str = "3GP|7Z|AAC|ACE|AIF|ARJ|ASF|AVI|BIN|BZ2|DEB|DMG|EXE|GZ|GZIP|IMG|ISO|LZH|M4A|M4V|MKV|MOV|MP3|MP4|MPA|MPE|MPEG|MPG|MSI|MSU|OGG|OGV|PDF|PKG|PLJ|PPS|PPT|QT|RA|RAR|RM|RPM|SEA|SIT|SITX|TAR|TIF|TIFF|WAV|WMA|WMV|XZ|Z|ZIP|ZST";
 
+/// Keys a user holds while clicking, as the extension encodes them (`va` in `background.js`
+/// 6.43.1: Shift 1, Ctrl 2, Alt 4, Insert 8, Delete 16).
+const KEY_ALT: i64 = 4;
+const KEY_INSERT: i64 = 8;
+/// IDM's own defaults: hold Insert to force a capture the file-type list would not make, hold
+/// Alt to let the browser keep a download. Settings args 0 and 1 carry them; the extension
+/// stores them as `j[-32]`/`j[-33]` and tests them in `rb` (force) and `qb` (prevent). Sending
+/// 0 for both, as reIDM did before, silently disabled both keys.
+const FORCE_KEYS: i64 = KEY_INSERT;
+const PREVENT_KEYS: i64 = KEY_ALT;
+
 /// Property names the content script hooks to spot XHR/fetch downloads (key 23).
 const PAGE_HOOKS: &str = "XMLHttpRequest|open|send|setRequestHeader|upload|loadend|responseText|fetch|headers|body|text|json|getReader|pipeThrough|Headers|accept|*/*|application/vnd.t1c|Response|url|get";
 
@@ -78,7 +89,8 @@ impl Session {
         // type 3: [proto, ?, ?, ?, dpi, manager-version, client-id, ?, zoom%]
         let ack = Message::new(nid(), T_HELLO_ACK, 1, 0).with_args([SERVER_PROTO, 0, 0, 0, 96, MANAGER_VERSION, 1, 0, 100]);
         // type 4: capture settings. flags: 64 auto-capture, 32 sniffing UI, 256/512 menu items, 1024 ext. mode
-        let mut set = Message::new(nid(), T_SETTINGS, 1, 64 | 32 | 256 | 512 | 1024).with_args([0, 0, MANAGER_VERSION, 0]);
+        // args: [force-capture keys, prevent-capture keys, manager version, feature bits]
+        let mut set = Message::new(nid(), T_SETTINGS, 1, 64 | 32 | 256 | 512 | 1024).with_args([FORCE_KEYS, PREVENT_KEYS, MANAGER_VERSION, 0]);
         set.keys.insert(1, Value::Str(DEFAULT_FILE_TYPES.into()));
         set.keys.insert(23, Value::Str(PAGE_HOOKS.into()));
         vec![ack, set]
@@ -193,6 +205,16 @@ mod tests {
         for m in &out {
             Message::decode(m.encode().as_bytes()).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn settings_enable_idms_alt_and_insert_keys() {
+        let mut s = Session::new(mgr());
+        let out = s.handle(&Message::new(1, T_HELLO, 5, 0).with_args([113, 93]));
+        let settings = out.iter().find(|m| m.ty == T_SETTINGS).unwrap();
+        assert_eq!(settings.arg(0), Some(8), "Insert forces a capture");
+        assert_eq!(settings.arg(1), Some(4), "Alt lets the browser keep a download");
+        assert_eq!(settings.arg(2), Some(MANAGER_VERSION));
     }
 
     #[tokio::test]

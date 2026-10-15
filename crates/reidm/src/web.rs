@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use reidm_core::{Manager, Request};
+use reidm_core::{AddOptions, Manager, Request, SettingsPatch};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -24,6 +24,16 @@ struct App {
     /// that is the difference between "works out of the box" and "another download manager got
     /// there first", which is worth telling the user about rather than burying in a log.
     idm_port: Arc<std::sync::atomic::AtomicBool>,
+    /// When reIDM's own extension last checked in, so the window can say whether browser
+    /// capture is actually connected rather than guessing.
+    ext: Arc<std::sync::Mutex<Option<ExtSeen>>>,
+}
+
+#[derive(Clone)]
+struct ExtSeen {
+    at: std::time::SystemTime,
+    version: String,
+    browser: String,
 }
 
 fn random_token() -> String {
@@ -109,16 +119,35 @@ async fn list(State(app): State<App>, h: HeaderMap) -> Response {
 #[derive(Deserialize)]
 struct AddBody {
     url: String,
+    #[serde(default)]
     referer: Option<String>,
+    #[serde(default)]
     filename: Option<String>,
+    #[serde(default)]
+    cookie: Option<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+    #[serde(default)]
+    dir: Option<String>,
+    /// *Download Later*: list it in the scheduled queue without starting it.
+    #[serde(default)]
+    later: bool,
 }
 
 async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Response {
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    match app.mgr.add(Request { url: b.url.trim().into(), referer: b.referer, filename: b.filename, ..Default::default() }) {
-        Ok(id) => Json(serde_json::json!({ "id": id })).into_response(),
+    let req = Request {
+        url: b.url.trim().into(),
+        referer: b.referer,
+        filename: b.filename.filter(|f| !f.trim().is_empty()),
+        cookie: b.cookie,
+        user_agent: b.user_agent,
+        dir: b.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from),
+    };
+    match app.mgr.add_with(req, AddOptions { later: b.later, ..Default::default() }) {
+        Ok(o) => Json(serde_json::json!({ "id": o.id, "outcome": o.outcome })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
 }
@@ -138,9 +167,123 @@ async fn act(State(app): State<App>, h: HeaderMap, Path((id, what)): Path<(u64, 
             let Some(it) = app.mgr.get(id) else { return StatusCode::NOT_FOUND.into_response() };
             crate::launch::open_path(&it.path, what == "folder");
         }
+        "restart" => {
+            if let Err(e) = app.mgr.restart(id).await {
+                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
+            }
+        }
+        "schedule" | "unschedule" => {
+            if let Err(e) = app.mgr.set_scheduled(id, what == "schedule") {
+                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
+            }
+        }
+        // Take the next link the browser hands over as this download's new address.
+        "refresh-capture" => {
+            if let Err(e) = app.mgr.arm_refresh(id) {
+                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
+            }
+        }
         _ => return StatusCode::NOT_FOUND.into_response(),
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct RefreshBody {
+    url: String,
+    #[serde(default)]
+    referer: Option<String>,
+    #[serde(default)]
+    cookie: Option<String>,
+}
+
+/// *Refresh download address*: point an unfinished download at a new URL for the same file.
+async fn refresh(State(app): State<App>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<RefreshBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let req = Request { url: b.url, referer: b.referer, cookie: b.cookie, ..Default::default() };
+    match app.mgr.refresh_address(id, req).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct LimitBody {
+    /// Bytes per second; `null` or 0 lifts this download's own cap.
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+async fn set_limit(State(app): State<App>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<LimitBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    match app.mgr.set_speed_limit(id, b.limit) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// *Start queue* / *Stop queue* for the scheduled downloads.
+async fn queue(State(app): State<App>, h: HeaderMap, Path(what): Path<String>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let n = match what.as_str() {
+        "start" => app.mgr.start_queue(),
+        "stop" => app.mgr.stop_queue(),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    Json(serde_json::json!({ "count": n })).into_response()
+}
+
+/// Stop waiting for the browser to supply a new address.
+async fn refresh_cancel(State(app): State<App>, h: HeaderMap) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    app.mgr.disarm_refresh();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// The download list as IDM's `.ef2` or a plain URL list. Cookies are never included: an export
+/// file is the kind of thing people share.
+async fn export(State(app): State<App>, h: HeaderMap, Query(q): Query<ExportQuery>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let items = app.mgr.list();
+    let body = match q.format.as_deref().unwrap_or("txt") {
+        "ef2" => {
+            let entries: Vec<reidm_core::lists::Entry> = items
+                .iter()
+                .map(|i| reidm_core::lists::Entry {
+                    url: i.request.url.clone(),
+                    referer: i.request.referer.clone(),
+                    cookie: None,
+                    user_agent: i.request.user_agent.clone(),
+                    post_data: None,
+                })
+                .collect();
+            reidm_core::lists::write_ef2(&entries)
+        }
+        "txt" => {
+            let mut urls: Vec<String> = items.iter().map(|i| i.request.url.clone()).collect();
+            urls.sort();
+            urls.dedup();
+            reidm_core::grabber::url_list_text(&urls)
+        }
+        other => return (StatusCode::BAD_REQUEST, format!("unknown format {other:?} (use ef2 or txt)")).into_response(),
+    };
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
 
 // ── endpoints for reIDM's own browser extension ──────────────────────────
@@ -197,10 +340,27 @@ async fn ext_preflight(h: HeaderMap) -> Response {
     r
 }
 
+#[derive(Deserialize, Default)]
+struct PingQuery {
+    /// The extension's version, so the window can show which one is connected.
+    #[serde(default)]
+    v: Option<String>,
+}
+
 /// What the extension answers on start-up to decide whether reIDM is running.
-async fn ext_ping(State(app): State<App>, h: HeaderMap) -> Response {
+async fn ext_ping(State(app): State<App>, h: HeaderMap, Query(q): Query<PingQuery>) -> Response {
     if let Err(c) = extension_caller(&h) {
         return c.into_response();
+    }
+    // Chrome attaches `Origin` to an extension's POSTs but not to its GETs, so the version
+    // parameter, which only reIDM's extension sends, is what identifies the ping.
+    if q.v.is_some() || is_extension_origin(&h) {
+        let browser = h.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(browser_name).unwrap_or_default();
+        *app.ext.lock().unwrap() = Some(ExtSeen {
+            at: std::time::SystemTime::now(),
+            version: q.v.unwrap_or_default().chars().take(32).collect(),
+            browser,
+        });
     }
     let s = app.mgr.settings();
     Json(serde_json::json!({
@@ -211,6 +371,17 @@ async fn ext_ping(State(app): State<App>, h: HeaderMap) -> Response {
         "max_concurrent": s.max_concurrent,
     }))
     .into_response()
+}
+
+/// The browser's name and major version from its user agent, for display only.
+fn browser_name(ua: &str) -> String {
+    for (token, name) in [("Edg/", "Edge"), ("OPR/", "Opera"), ("Vivaldi/", "Vivaldi"), ("Brave/", "Brave"), ("Chrome/", "Chrome"), ("Firefox/", "Firefox")] {
+        if let Some(rest) = ua.split(token).nth(1) {
+            let major = rest.split(['.', ' ']).next().unwrap_or("");
+            return format!("{name} {major}").trim().to_string();
+        }
+    }
+    String::new()
 }
 
 #[derive(Deserialize)]
@@ -224,6 +395,19 @@ struct ExtAdd {
     cookie: Option<String>,
     #[serde(default)]
     user_agent: Option<String>,
+    /// Check the address works before accepting. The extension asks for this when it is
+    /// holding a browser download: a refusal hands the download back to the browser intact.
+    #[serde(default)]
+    verify: bool,
+    /// With `verify`: refuse an address that turns out to be a web page.
+    #[serde(default)]
+    refuse_html: bool,
+    #[serde(default)]
+    later: bool,
+}
+
+fn ext_error(e: anyhow::Error) -> Response {
+    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "error": format!("{e:#}") }))).into_response()
 }
 
 async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) -> Response {
@@ -232,23 +416,95 @@ async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) ->
     }
     let req = Request {
         url: b.url.trim().to_string(),
-        filename: b.filename,
-        referer: b.referer,
-        cookie: b.cookie,
-        user_agent: b.user_agent,
+        filename: b.filename.filter(|f| !f.trim().is_empty()),
+        referer: b.referer.filter(|r| !r.is_empty()),
+        cookie: b.cookie.filter(|c| !c.is_empty()),
+        user_agent: b.user_agent.filter(|u| !u.is_empty()),
         dir: None,
     };
-    match app.mgr.add_detailed(req) {
-        Ok(o) => Json(serde_json::json!({ "ok": true, "id": o.id, "outcome": o.outcome })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "error": format!("{e:#}") }))).into_response(),
+
+    // A download waiting for a fresh address takes the next link that is the same file.
+    if let Some(id) = app.mgr.refresh_armed() {
+        match app.mgr.refresh_address(id, req.clone()).await {
+            Ok(()) => {
+                app.mgr.disarm_refresh();
+                tracing::info!("download #{id} continues from a new address");
+                return Json(serde_json::json!({ "ok": true, "id": id, "outcome": "refreshed" })).into_response();
+            }
+            // Some other file: treat it as the ordinary new download it is, and keep waiting.
+            Err(e) => tracing::info!("browser link is not the download being refreshed: {e:#}"),
+        }
     }
+
+    let opts = AddOptions { later: b.later, refuse_html: b.refuse_html };
+    let r = if b.verify { app.mgr.add_checked(req, opts).await } else { app.mgr.add_with(req, opts) };
+    match r {
+        Ok(o) => Json(serde_json::json!({ "ok": true, "id": o.id, "outcome": o.outcome })).into_response(),
+        Err(e) => ext_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExtBatchItem {
+    url: String,
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    referer: Option<String>,
+    #[serde(default)]
+    cookie: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExtBatch {
+    items: Vec<ExtBatchItem>,
+    #[serde(default)]
+    user_agent: Option<String>,
+    #[serde(default)]
+    later: bool,
+}
+
+/// Many links at once, from the extension's resource grabber. Answers per URL.
+async fn ext_add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtBatch>) -> Response {
+    if let Err(c) = extension_caller(&h) {
+        return c.into_response();
+    }
+    if b.items.len() > 5000 {
+        return ext_error(anyhow::anyhow!("{} links is more than one batch may hold (5000)", b.items.len()));
+    }
+    let reqs = b
+        .items
+        .into_iter()
+        .map(|i| Request {
+            url: i.url.trim().to_string(),
+            filename: i.filename.filter(|f| !f.trim().is_empty()),
+            referer: i.referer.filter(|r| !r.is_empty()),
+            cookie: i.cookie.filter(|c| !c.is_empty()),
+            user_agent: b.user_agent.clone().filter(|u| !u.is_empty()),
+            dir: None,
+        })
+        .collect();
+    let results: Vec<serde_json::Value> = app
+        .mgr
+        .add_many_with(reqs, AddOptions { later: b.later, ..Default::default() })
+        .into_iter()
+        .map(|(url, r)| match r {
+            Ok(o) => serde_json::json!({ "url": url, "id": o.id, "outcome": o.outcome }),
+            Err(e) => serde_json::json!({ "url": url, "error": format!("{e:#}") }),
+        })
+        .collect();
+    Json(serde_json::json!({ "ok": true, "results": results })).into_response()
 }
 
 // ── batch and grabber ────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct BatchBody {
+    #[serde(default)]
     urls: Vec<String>,
+    /// Entries with their own referer/cookie/user agent, e.g. from an `.ef2` import.
+    #[serde(default)]
+    items: Vec<reidm_core::lists::Entry>,
     #[serde(default)]
     dir: Option<String>,
     /// Applied to every URL in the batch.
@@ -257,6 +513,9 @@ struct BatchBody {
     /// Only meaningful for a single URL.
     #[serde(default)]
     filename: Option<String>,
+    /// *Download Later* for the whole batch.
+    #[serde(default)]
+    later: bool,
 }
 
 /// Queue many URLs at once. Answers per URL, so the caller can say what happened to each.
@@ -264,9 +523,9 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    let dir = b.dir.map(std::path::PathBuf::from);
-    let single = b.urls.len() == 1;
-    let reqs: Vec<Request> = b
+    let dir = b.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from);
+    let single = b.urls.len() + b.items.len() == 1;
+    let mut reqs: Vec<Request> = b
         .urls
         .into_iter()
         .map(|u| u.trim().to_string())
@@ -279,19 +538,33 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
             ..Default::default()
         })
         .collect();
-    let results: Vec<serde_json::Value> = app
+    // A download that came from a form needs its POST body sent again, which reIDM's engine does
+    // not do; fetching the address with a GET instead would quietly save some other response.
+    let (posts, items): (Vec<_>, Vec<_>) = b.items.into_iter().partition(|e| e.post_data.is_some());
+    reqs.extend(items.into_iter().filter(|e| !e.url.trim().is_empty()).map(|e| Request {
+        url: e.url.trim().to_string(),
+        dir: dir.clone(),
+        referer: e.referer.or_else(|| b.referer.clone()),
+        cookie: e.cookie,
+        user_agent: e.user_agent,
+        filename: if single { b.filename.clone() } else { None },
+    }));
+    let mut results: Vec<serde_json::Value> = app
         .mgr
-        .add_many(reqs)
+        .add_many_with(reqs, AddOptions { later: b.later, ..Default::default() })
         .into_iter()
         .map(|(url, r)| match r {
             Ok(o) => serde_json::json!({ "url": url, "id": o.id, "outcome": o.outcome }),
             Err(e) => serde_json::json!({ "url": url, "error": format!("{e:#}") }),
         })
         .collect();
+    results.extend(posts.into_iter().map(|e| {
+        serde_json::json!({ "url": e.url, "error": "this download came from a form (POST), which reIDM cannot repeat; start it from the page in the browser" })
+    }));
     Json(serde_json::json!({ "results": results })).into_response()
 }
 
-/// Backwards-compatible alias used by the engine CLI: `POST /api/downloads?batch=1`.
+/// A page to scan, and how.
 #[derive(Deserialize)]
 struct GrabBody {
     url: String,
@@ -318,6 +591,12 @@ struct SettingsBody {
     connections: Option<usize>,
     #[serde(default)]
     max_concurrent: Option<usize>,
+    #[serde(default)]
+    speed_limit: Option<u64>,
+    #[serde(default)]
+    limit_enabled: Option<bool>,
+    #[serde(default)]
+    schedule: Option<reidm_core::schedule::Schedule>,
 }
 
 /// What the daemon is actually able to offer right now.
@@ -325,12 +604,23 @@ async fn status(State(app): State<App>, h: HeaderMap) -> Response {
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
+    let ext = app.ext.lock().unwrap().clone().map(|e| {
+        serde_json::json!({
+            "seconds_ago": e.at.elapsed().map(|d| d.as_secs()).unwrap_or(0),
+            "version": e.version,
+            "browser": e.browser,
+        })
+    });
     Json(serde_json::json!({
         "idm_port": app.idm_port.load(std::sync::atomic::Ordering::Relaxed),
         "idm_port_number": crate::ws::IDM_PORT,
         "local_port": crate::ws::LOCAL_PORT,
         "ui_port": UI_PORT,
         "platform": std::env::consts::OS,
+        "version": env!("CARGO_PKG_VERSION"),
+        "extension": ext,
+        "refresh_armed": app.mgr.refresh_armed(),
+        "extension_dir": crate::install::extension_dir().map(|p| p.to_string_lossy().into_owned()),
     }))
     .into_response()
 }
@@ -344,6 +634,9 @@ async fn settings(State(app): State<App>, h: HeaderMap) -> Response {
         "default_dir": s.default_dir.to_string_lossy(),
         "connections": s.connections,
         "max_concurrent": s.max_concurrent,
+        "speed_limit": s.speed_limit,
+        "limit_enabled": s.limit_enabled,
+        "schedule": s.schedule,
     }))
     .into_response()
 }
@@ -353,7 +646,15 @@ async fn set_settings(State(app): State<App>, h: HeaderMap, Json(b): Json<Settin
         return c.into_response();
     }
     let dir = b.default_dir.map(std::path::PathBuf::from).filter(|d| !d.as_os_str().is_empty());
-    match app.mgr.set_settings(dir, b.connections, b.max_concurrent) {
+    let patch = SettingsPatch {
+        default_dir: dir,
+        connections: b.connections,
+        max_concurrent: b.max_concurrent,
+        speed_limit: b.speed_limit,
+        limit_enabled: b.limit_enabled,
+        schedule: b.schedule,
+    };
+    match app.mgr.update_settings(patch) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
@@ -414,18 +715,24 @@ pub async fn serve(mgr: Manager, idm_port: Arc<std::sync::atomic::AtomicBool>) -
     let token = random_token();
     let data_dir = mgr.data_dir().to_path_buf();
     write_token_file(&data_dir, &token);
-    let app = App { mgr, token: Arc::new(token), idm_port };
+    let app = App { mgr, token: Arc::new(token), idm_port, ext: Default::default() };
     let router = Router::new()
         .route("/", get(index))
         .route("/api/downloads", get(list).post(add))
         .route("/api/downloads/:id", delete(remove))
+        .route("/api/downloads/:id/refresh", post(refresh))
+        .route("/api/downloads/:id/limit", post(set_limit))
         .route("/api/downloads/:id/:what", post(act))
+        .route("/api/queue/:what", post(queue))
+        .route("/api/refresh-capture/cancel", post(refresh_cancel))
+        .route("/api/export", get(export))
         .route("/api/settings", get(settings).post(set_settings))
         .route("/api/status", get(status))
         .route("/api/downloads/batch", post(add_batch))
         .route("/api/grab", post(grab))
         .route("/ext/ping", get(ext_ping).options(ext_preflight))
         .route("/ext/add", post(ext_add).options(ext_preflight))
+        .route("/ext/add-batch", post(ext_add_batch).options(ext_preflight))
         .with_state(app);
     tracing::info!("web UI at http://127.0.0.1:{UI_PORT}/");
     let r = axum::serve(l, router).await;

@@ -24,8 +24,12 @@ jobs:
       - run: cargo build --release --locked
       - run: cargo install cargo-deb --locked --version 2.7.0
       - run: cargo deb -p reidm --no-build --output dist/
+      - name: Browser extension zip
+        run: |
+          V="${GITHUB_REF_NAME#v}"; [ "$GITHUB_REF_TYPE" = tag ] || V="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)-dev"
+          (cd extension && zip -r -X "../dist/reidm-extension-$V.zip" .)
       - uses: actions/upload-artifact@v4
-        with: { name: deb, path: dist/*.deb }
+        with: { name: deb, path: "dist/*" }
 
   windows-exe:
     runs-on: windows-2022
@@ -38,7 +42,8 @@ jobs:
       - name: Inno Setup
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}".TrimStart("v"); if (-not $v -or $v -eq "main") { $v = "0.0.0" }
+          # A manual run on a branch builds a test installer; only tags are versioned releases.
+          $v = "${{ github.ref_name }}".TrimStart("v"); if ("${{ github.ref_type }}" -ne "tag") { $v = "0.0.0" }
           $iscc = Get-Command iscc -ErrorAction SilentlyContinue
           if (-not $iscc) { choco install innosetup -y --no-progress; $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" } else { $iscc = $iscc.Source }
           & $iscc "/DAppVersion=$v" packaging\windows\reidm.iss
@@ -81,6 +86,8 @@ jobs:
         run: |
           xcrun notarytool store-credentials reidm-notary \
             --apple-id "$MACOS_APPLE_ID" --password "$MACOS_APPLE_PASSWORD" --team-id "$MACOS_TEAM_ID"
+      # Lays out the disk image's window; see packaging/macos/dmg-settings.py.
+      - run: pipx install dmgbuild
       - name: Build the DMG
         env:
           # Only notarize when both a certificate and notary credentials were provided.
@@ -91,7 +98,7 @@ jobs:
           for b in reidm reidm-host reidm-gui; do
             lipo -create -output universal/$b target/x86_64-apple-darwin/release/$b target/aarch64-apple-darwin/release/$b
           done
-          V="${GITHUB_REF_NAME#v}"
+          V="${GITHUB_REF_NAME#v}"; [ "$GITHUB_REF_TYPE" = tag ] || V="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)-dev"
           packaging/macos/make-dmg.sh "$V" universal/reidm universal/reidm-host universal/reidm-gui "dist/reIDM-$V-universal.dmg"
       - uses: actions/upload-artifact@v4
         with: { name: dmg, path: dist/*.dmg }
@@ -109,12 +116,13 @@ jobs:
           ls -la dist
           gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" \
             --title "reIDM ${{ github.ref_name }}" --notes-file - <<'EON'
-          Cross-platform Rust download manager with a native desktop app, speaking the IDM browser-extension protocol.
+          A cross-platform download manager that takes over your browser's downloads. See CHANGELOG.md for what is new.
 
-          * `reIDM-setup-*.exe` – Windows installer (registers the native host, starts the daemon at login)
-          * `reidm_*_amd64.deb` – Debian/Ubuntu (desktop entry, system-wide native-host manifests, systemd user unit)
-          * `reIDM-*-universal.dmg` – macOS app bundle (Intel + Apple silicon; unsigned, see README for Gatekeeper)
+          * `reIDM-setup-*.exe` – Windows installer (the app, the browser extension, native hosts, start at login)
+          * `reidm_*_amd64.deb` – Debian/Ubuntu (desktop entry, the browser extension, native hosts, systemd user unit)
+          * `reIDM-*-universal.dmg` – macOS app bundle (Intel + Apple silicon; drag it to Applications; ad-hoc signed unless a Developer ID is configured)
+          * `reidm-extension-*.zip` – the browser extension on its own, for Chrome, Edge, Brave, Vivaldi and Opera
 
+          Install the app, then load the extension once: open the reIDM window and choose Help › Browser integration.
           The window is a front-end for the background service, so downloads keep running when it is closed.
-          Read docs/EXTENSION.md: the official extension only runs unmodified on Windows.
           EON

@@ -1,93 +1,89 @@
 # reIDM Integration (browser extension)
 
-A Manifest V3 extension that hands downloads, links and page media to the **reIDM** download
-manager. It is entirely reIDM's own — it does not depend on, or talk to, Tonec's IDM extension.
+A Manifest V3 extension for Chromium-based browsers (Chrome, Edge, Brave, Vivaldi, Opera,
+Chromium; version 120 or later) that hands the browser's downloads, links and page media to the
+**reIDM** download manager. It is reIDM's own and doesn't depend on, or talk to, Tonec's IDM
+extension.
 
-## What it does
+**For users:** installing, what it does with your downloads, every setting, and privacy are in
+[docs/BROWSER_INTEGRATION.md](../docs/BROWSER_INTEGRATION.md). This file is for working on the
+extension.
 
-| | |
-|---|---|
-| **Takes over browser downloads** | When Chromium starts saving a file, the extension pauses it, offers the URL to reIDM, and then either cancels the browser's copy (reIDM took it) or resumes it (reIDM did not). |
-| **Right-click a link** | *Download with reIDM*. Also works on video, audio and image elements. |
-| **Right-click a page** | *Download all links on this page with reIDM* — up to 500 links, duplicates skipped. |
-| **Right-click a selection** | *Download the selected link with reIDM*. |
-| **Finds media** | Watches network requests for HLS/DASH manifests and media files, plus a page-side scan of `<video>`/`<audio>`/`<source>`, and lists what it found in the popup so you can pick. This works inside cross-origin iframes, where a content script cannot see into the DOM. |
-| **Picks a video quality** | A *Download with reIDM* button appears over a playing video and opens a picker listing what the player actually offers — resolution, codec, fps, bitrate and size, best first. Understands YouTube's `streamingData`, HLS `#EXT-X-STREAM-INF` and DASH `<Representation>`. |
-| **Answers reIDM's own questions** | The toolbar badge shows how many media URLs were seen on the current tab. |
+## Loading it from this folder
 
-## Installing
-
-reIDM must be running (`reidm daemon`, or just open the reIDM window).
-
-1. Open `chrome://extensions` (or `brave://extensions`, `edge://extensions`).
+1. Open `chrome://extensions` (or `edge://`, `brave://`, `vivaldi://`, `opera://extensions`).
 2. Turn on **Developer mode**.
-3. **Load unpacked** → select this `extension/` directory.
+3. **Load unpacked** → this `extension/` folder.
 
-To keep it without developer mode, pack it (**Pack extension**) and install the `.crx`, or publish
-it. Note that packing generates a key, which fixes the extension ID — see *Origin* below.
+The ID is always `pgeonmdaagbiccimgojpafdjcipcfnlc`: it is derived from the public `key` in
+`manifest.json`, so the native-messaging host manifests can name it ahead of time. Keep the key
+when packing or publishing, or the ID — and with it the native host's `allowed_origins` — changes.
 
-## Options
+After editing a file, press the reload arrow on the extension's card. Run reIDM (`reidm daemon`,
+or open the window) for it to talk to.
 
-Open the extension's **Options** page to set the reIDM port (default `61002`), turn capture or
-media sniffing off, and list URL prefixes that should never be captured.
+## How it works
 
-## How it talks to reIDM
+| Part | Does |
+|---|---|
+| `service-worker.js` | Holds each browser download in `chrome.downloads.onDeterminingFilename`, pauses it, offers it to reIDM with the cookies for that address, and only then cancels the browser's copy (or resumes it, if reIDM refused). Also: the media list, context menus, the popup's data, starting reIDM through native messaging, and a once-a-minute check that reIDM is running. |
+| `content.js` | Stops plain left clicks on links to listed file types and asks the service worker to hand them over, replaying the click for the browser when reIDM declines. Scans the page for media and answers the grabber. Injects `inject.js`. |
+| `inject.js` | Runs in the page's own JavaScript context to see its `fetch`/XHR responses — YouTube player data, HLS and DASH manifests — which `chrome.webRequest` can't read. Observes only; never changes a request. |
+| `grabber.html`, `grabber.js` | The resource grabber: everything a page offers, from every frame, with filters, sizes, and batch hand-off. |
+| `popup.html`, `popup.js` | The toolbar popup: status, the capture switches, recent hand-offs, the media on this page. |
+| `options.html`, `options.js` | Capture rules, file types, excluded sites, the port, media detection. |
 
-`http://127.0.0.1:61002/ext/ping` and `/ext/add`. Two details matter:
+The rules for which downloads stay with the browser are in `keepReason()` in
+`service-worker.js`; the reasons it returns are what the popup shows under *Just now*.
 
-* **Requests are made from the service worker, never from a content script.** A content script's
+### Talking to reIDM
+
+Over HTTP to `http://127.0.0.1:61002`: `GET /ext/ping`, `POST /ext/add`, `POST /ext/add-batch`
+([docs/API.md](../docs/API.md#browser-extension-endpoints)). Two details matter:
+
+- **Requests come from the service worker, never from a content script.** A content script's
   `fetch` carries the *page's* origin and is subject to CORS; the service worker's POST carries
   `Origin: chrome-extension://<id>`, which reIDM accepts.
-* **reIDM authorises by origin, not by a token.** A web page cannot get past it: browsers set
-  `Origin` themselves, page script cannot forge it, and reIDM only answers a CORS preflight when
-  the asking origin is an extension's. `Host` is checked too, so DNS rebinding does not help.
-  `Origin` is still not a *credential* — any local process can send that header — but such a
-  process can already read reIDM's token file, so this grants it nothing new.
+- **reIDM authorises these endpoints by origin, not by a token** — the extension can't read
+  reIDM's token file. Browsers set `Origin` themselves, a page can't forge an extension's, and
+  reIDM answers CORS preflights only for extension origins.
 
-## Honest limitations
+To start reIDM, it sends `{"cmd":"launch"}` to the native-messaging host `com.zektopic.reidm`
+(`reidm-host`), which starts the service and replies once it answers.
 
-These are properties of the browser platform, not of this extension:
+### Debugging
 
-* **Very small downloads can slip past.** Chrome starts a sub-megabyte download immediately, and a
-  pause arriving a millisecond later may lose the race; the file then lands in the browser's own
-  download folder as well as reIDM's. There is no workaround. The extension always pauses *first*
-  and resumes on failure, so the failure mode is a duplicate, never a lost file.
-* **Stream URLs are not the video.** reIDM can download an `.m3u8` manifest and its segments, but it
-  does not mux them into a single playable file, and DRM-protected streams (Widevine, PlayReady,
-  FairPlay) cannot be captured by any tool — the keys never reach the page.
-* **URLs built entirely in JavaScript may be missed.** The page-side hook watches `fetch` and
-  `XMLHttpRequest`, which covers most players, but a URL constructed and used through a WebSocket,
-  a Web Worker, or a WebAssembly player is outside its reach. `chrome.webRequest` still sees the
-  resulting network requests, so most of these are caught anyway.
-* **A page with no extension in the URLs** (a signed CDN link, say) is only found through
-  `webRequest` if it looks like media by extension. There is no reliable content sniffing available
-  to an extension.
-* **Signature-protected formats are listed but greyed out.** Most real YouTube formats carry a
-  `signatureCipher` that must be unscrambled with the player's own obfuscated logic. An extension
-  must not reimplement that: it changes constantly and it is against YouTube's terms. Those rows are
-  shown so you can see they exist, and marked as unavailable rather than failing when clicked.
-  Making them downloadable needs a resolver on the reIDM side (a yt-dlp-style component), which is
-  not built yet.
+Click *service worker* on the extension's card for its console. `globalThis.reidm` exposes
+`reidm.status()`, `await reidm.ping()` and `await reidm.launchReidm()`.
 
-## Permissions, and why
+The end-to-end test, `tools/capture-test.mjs`, loads this folder into a real Chromium and checks
+the whole hand-off — see [docs/BUILDING.md](../docs/BUILDING.md#the-real-browser-tests). Run it
+after any change to the capture path.
+
+## Limits that come from the platform
+
+- **Streams aren't merged.** reIDM downloads an HLS playlist or a DASH representation as a file;
+  it doesn't mux segments into one video. DRM-protected streams (Widevine, PlayReady, FairPlay)
+  can't be captured by any tool — the keys never reach the page.
+- **Signature-protected formats are listed but greyed out.** Most YouTube formats carry a
+  `signatureCipher` that only the player's own obfuscated code unscrambles. An extension
+  mustn't reimplement that; making them downloadable needs a resolver on reIDM's side, which
+  doesn't exist yet.
+- **Addresses built and used inside a Web Worker, WebSocket or WebAssembly player** are outside
+  the page hook's reach; `chrome.webRequest` still sees the resulting requests, so most media is
+  found anyway.
+- **Firefox and Safari** aren't supported: the hold-and-hand-over relies on Chromium's
+  `onDeterminingFilename`.
+
+## Permissions
 
 | Permission | Why |
 |---|---|
-| `downloads` | pause / cancel / resume browser downloads |
+| `downloads` | hold, pause, cancel, erase and resume the browser's downloads |
+| `cookies` | the cookies a hand-off needs, read for that one address at that moment |
+| `nativeMessaging` | start reIDM when it isn't running |
+| `webRequest` | notice media and form submissions (observation only) |
 | `contextMenus` | the right-click entries |
-| `webRequest` | observe media requests (observation only — MV3 does not allow blocking for ordinary extensions) |
-| `storage` | remember the port and toggles |
-| `tabs` | know which tab a media URL belongs to |
-| `scripting` | collect a page's links for "download all" |
-| `host_permissions: <all_urls>` | required for `webRequest` to see media, and to scan pages. This is the broad permission the Web Store review will question most; it is genuinely needed for media sniffing, and media sniffing can be turned off to avoid it. |
-
-## Files
-
-| File | Role |
-|---|---|
-| `manifest.json` | MV3 manifest |
-| `service-worker.js` | download interception, media sniffing, context menus, messaging |
-| `content.js` | page scan; injects the MAIN-world hook |
-| `inject.js` | runs in the page's own context to see `fetch`/`XHR` and read manifest bodies |
-| `popup.html` / `popup.js` | the media list and manual URL entry |
-| `options.html` / `options.js` | port, capture and ignore settings |
+| `tabs`, `scripting` | per-tab media lists, the grabber, and collecting a page's links (up to 2,000) |
+| `storage`, `alarms` | settings and recent hand-offs; the once-a-minute check that reIDM is running |
+| host access to all sites | media detection, click interception, the grabber |

@@ -1,92 +1,112 @@
 // reIDM Integration — background service worker.
 //
-// Three jobs:
-//   1. Intercept downloads the browser is about to start and hand them to reIDM.
-//   2. Watch network requests for media (HLS/DASH manifests, progressive video/audio) so the
-//      popup can offer them, including media inside cross-origin iframes that a content script
-//      cannot see into.
-//   3. Answer the popup and the context menus.
+// Jobs:
+//   1. Take over the downloads the browser starts, so that reIDM — not the browser — downloads
+//      them. This is the extension's main job and most of this file.
+//   2. Take over download links the page's content script intercepted on click, before the
+//      browser has requested anything.
+//   3. Watch network requests for media (HLS/DASH manifests, progressive video/audio) so the
+//      popup and the quality picker can offer them, including inside cross-origin iframes.
+//   4. Answer the popup, the resource grabber page and the context menus.
 //
-// Architecture notes that are not obvious:
-//   * The download is *paused*, never cancelled, until reIDM has answered. Cancelling is
-//     irreversible: if reIDM is not running, or declines the URL, the download is already gone
-//     and the user has silently lost it. Pausing is reversible, so a refusal hands the download
-//     back to Chrome exactly as it was. The official IDM extension does the same thing —
-//     observed in `background.js` 6.43.1: `onCreated` calls `browser.downloads.pause()`, the
-//     decision is resolved in `onDeterminingFilename`, and the reply is applied by
-//     `kc()` = `browser.downloads.cancel()` when the result is 3 ("taken"), otherwise
-//     `browser.downloads.resume()`.
-//   * Pausing still loses the race for very small files: Chrome may finish a sub-megabyte
-//     download before the pause lands. That is a browser limitation with no workaround; the
-//     pause failing is handled below rather than assumed to succeed.
+// How a browser download is taken over (the same mechanism Tonec's own extension uses; see
+// `background.js` 6.43.1: `onCreated` pauses, `onDeterminingFilename` decides, then
+// `downloads.cancel()` for "taken", `downloads.resume()` otherwise):
+//
+//   * Chrome does not show a download in its download bubble or shelf, does not open a "Save as"
+//     dialog, and cannot finish writing the file, until the file name has been decided. An
+//     extension that answers `onDeterminingFilename` asynchronously holds that decision.
+//   * So the download is held there and paused, and reIDM is asked to take the URL — with the
+//     browser's cookies and user agent, and with `verify`, which makes reIDM fetch the first
+//     byte before saying yes.
+//   * Only once reIDM has said yes is the browser's copy cancelled and erased; the user never
+//     sees the browser download anything. If reIDM says no, or is not running and cannot be
+//     started, the download is resumed and released exactly as it was. The failure mode is
+//     "the browser downloads it", never "nobody does".
+//
+// Other architecture notes:
 //   * Requests to 127.0.0.1 go out from *here*, never from a content script: a content script's
 //     fetch carries the page's origin and would be subject to CORS, while this service worker's
-//     POST carries `Origin: chrome-extension://<id>`, which reIDM accepts.
-//   * `onCreated` also re-fires for downloads that already existed when the browser started, so
-//     the handler filters on `state` before doing anything.
+//     requests carry `Origin: chrome-extension://<id>`, which reIDM accepts.
+//   * Every listener is registered synchronously at the top level. Chrome wakes a service worker
+//     for an event only if the listener was declared in the first run of the script; a listener
+//     added after an `await` can miss the very event that woke the worker.
 
 const DEFAULTS = {
   port: 61002,
   capture: true,
+  // Take download links on click, before the browser requests them. Only for links whose
+  // address ends in one of `fileTypes`, or that carry a `download` attribute.
+  interceptClicks: true,
+  // Take every download the browser starts. Off: only those whose name matches `fileTypes`.
+  captureAll: true,
+  // IDM's stock list.
+  fileTypes:
+    '3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 DEB DMG EXE FLAC GZ GZIP IMG ISO LZH M4A M4V MKV MOV MP3 MP4 ' +
+    'MPA MPE MPEG MPG MSI MSU OGG OGV PDF PKG PLJ PPS PPT QT RA RAR RM RMVB RPM SEA SIT SITX TAR TGZ TIF TIFF ' +
+    'WAV WEBM WMA WMV XZ Z ZIP ZST',
+  // Leave downloads smaller than this (KB) to the browser. 0 = take everything.
+  minSizeKB: 0,
+  // Never take downloads from these hosts (and their subdomains).
+  skipHosts: [],
+  captureIncognito: false,
+  // Start reIDM through the native host when it is not running.
+  launchReidm: true,
   sniffMedia: true,
-  ignore: ['blob:', 'data:', 'chrome:', 'chrome-extension://', 'about:', 'file://'],
+  ignore: ['blob:', 'data:', 'chrome:', 'chrome-extension://', 'about:', 'file://', 'filesystem:'],
 };
 
-/** Settings are read before the listeners are registered, so `onCreated` never races them.
- *
- *  Listeners are registered *synchronously* at the top level, which is why this does not
- *  `await` its result. Chrome wakes a service worker because a listener for that event is
- *  declared in its top-level script; a listener added only after an `await` can miss the
- *  very event that started the worker — and in practice the worker may not start at all.
- *  So `settings` begins at the defaults and is corrected the moment storage answers; a
- *  first event handled against the defaults is the correct trade for a worker that runs. */
+/** Starts at the defaults and is corrected as soon as storage answers; handlers that decide
+ *  something important `await settingsReady` first, so a worker woken by a download never
+ *  acts on defaults the user has changed. */
 const settings = { ...DEFAULTS };
 
-async function loadSettings() {
+const settingsReady = (async () => {
   try {
     Object.assign(settings, await chrome.storage.sync.get(DEFAULTS));
   } catch {
     /* keep the defaults */
   }
-}
-loadSettings();
+})();
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'sync') return;
   for (const [k, v] of Object.entries(changes)) settings[k] = v.newValue;
 });
 
+const VERSION = chrome.runtime.getManifest().version;
+const NATIVE_HOST = 'com.zektopic.reidm';
 const api = (path) => `http://127.0.0.1:${settings.port}${path}`;
-
-// ── talking to reIDM ────────────────────────────────────────────────────
-
-async function ping() {
-  try {
-    const r = await fetch(api('/ext/ping'), { cache: 'no-store' });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch {
-    return null;
-  }
-}
-
-/** Queue one URL. Returns {ok, id?, outcome?, error?}. */
-async function send(details) {
-  try {
-    const r = await fetch(api('/ext/add'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(details),
-    });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) return { ok: false, error: j.error || `HTTP ${r.status}` };
-    return j;
-  } catch (e) {
-    return { ok: false, error: String(e && e.message ? e.message : e) };
-  }
-}
-
-const isIgnored = (url) => !url || settings.ignore.some((p) => url.startsWith(p));
 const isHttp = (url) => /^https?:/i.test(url || '');
+const isIgnored = (url) => !url || (settings.ignore || []).some((p) => url.startsWith(p));
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+/** `a.example.com` is skipped by an entry `example.com`. */
+function hostSkipped(url) {
+  const h = hostOf(url);
+  return !!h && (settings.skipHosts || []).some((s) => {
+    const e = String(s).trim().toLowerCase().replace(/^\*\./, '');
+    return e && (h === e || h.endsWith(`.${e}`));
+  });
+}
+
+function extOf(name) {
+  const m = /\.([a-z0-9]{1,8})$/i.exec(String(name || '').split(/[?#]/)[0]);
+  return m ? m[1].toUpperCase() : '';
+}
+
+function typeListed(name) {
+  const ext = extOf(name);
+  if (!ext) return false;
+  const list = String(settings.fileTypes || '').toUpperCase().split(/[\s,;|]+/).filter(Boolean);
+  return list.some((t) => (t.endsWith('*') ? ext.startsWith(t.slice(0, -1)) : t === ext));
+}
 
 /** A sensible file name for a URL, so reIDM does not have to guess. */
 function nameFromUrl(url) {
@@ -99,98 +119,295 @@ function nameFromUrl(url) {
   }
 }
 
-// ── 1. download interception ────────────────────────────────────────────
+const baseName = (p) => (p ? String(p).split(/[\\/]/).pop() || null : null);
 
-chrome.downloads.onCreated.addListener((item) => {
-  if (!settings.capture) return;
-  // Started by an extension (possibly us) — leave it alone.
-  if (item.byExtensionId) return;
-  // `onCreated` also fires for downloads restored at browser start-up.
-  if (item.state !== 'in_progress') return;
-  if (!isHttp(item.url) || isIgnored(item.url)) return;
-  capture(item);
-});
+// ── talking to reIDM ────────────────────────────────────────────────────
 
-/** In-flight hand-offs, so a service worker torn down mid-decision can be reconciled. */
-const PENDING_KEY = 'reidm-pending-captures';
+/** The last thing we know about reIDM, mirrored to `storage.local` so content scripts can
+ *  decide synchronously whether to intercept a click. */
+let status = { up: false, version: null, at: 0 };
 
-async function pendingGet() {
+function publishStatus(next) {
+  status = { ...next, at: Date.now() };
+  chrome.storage.local.set({ 'reidm-status': status }).catch(() => {});
+}
+
+async function ping() {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 3000);
   try {
-    return (await chrome.storage.session.get(PENDING_KEY))[PENDING_KEY] || {};
+    const r = await fetch(api(`/ext/ping?v=${encodeURIComponent(VERSION)}`), { cache: 'no-store', signal: ctl.signal });
+    if (!r.ok) return null;
+    const info = await r.json();
+    publishStatus({ up: true, version: info.version || null });
+    return info;
   } catch {
-    return {}; // no session storage; the reconcile step below simply does nothing
+    publishStatus({ up: false, version: null });
+    return null;
+  } finally {
+    clearTimeout(t);
   }
 }
 
-/** Pause, ask reIDM, then release the download one way or the other. Never cancel blind. */
-async function capture(item) {
-  // The reversible half of the hand-off, and it must happen first.
-  let paused = false;
+/** POST to reIDM. Never throws: `{ok:false, unreachable?, error}` on any failure. */
+async function post(path, body, timeoutMs = 25000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    await chrome.downloads.pause(item.id);
-    paused = true;
-  } catch {
-    // Refused, or the browser already finished a very small file. Carry on: if reIDM
-    // takes the URL we still cancel, and if it does not, nothing has changed.
+    const r = await fetch(api(path), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: ctl.signal,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!status.up) publishStatus({ up: true, version: status.version });
+    if (!r.ok) return { ok: false, error: j.error || `HTTP ${r.status}` };
+    return j;
+  } catch (e) {
+    if (e && e.name === 'AbortError') return { ok: false, error: 'reIDM did not answer in time' };
+    publishStatus({ up: false, version: null });
+    return { ok: false, unreachable: true, error: 'reIDM is not running' };
+  } finally {
+    clearTimeout(t);
   }
+}
 
-  const p = await pendingGet();
-  p[item.id] = { paused, at: Date.now() };
+/** Start reIDM through the native host. Resolves to whether it is now reachable. One launch
+ *  at a time: a burst of downloads must not start a burst of daemons. */
+let launching = null;
+function launchReidm() {
+  if (!settings.launchReidm || !chrome.runtime.sendNativeMessage) return Promise.resolve(false);
+  if (!launching) {
+    launching = (async () => {
+      try {
+        const r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: 'launch' });
+        if (!(r && r.ok)) return false;
+        return !!(await ping());
+      } catch {
+        return false; // host not registered: reIDM was installed without it, or not at all
+      } finally {
+        setTimeout(() => (launching = null), 2000);
+      }
+    })();
+  }
+  return launching;
+}
+
+/** Hand one URL to reIDM, starting reIDM first if it is not running. */
+async function send(details) {
+  let r = await post('/ext/add', details);
+  if (!r.ok && r.unreachable && (await launchReidm())) r = await post('/ext/add', details);
+  return r;
+}
+
+async function sendBatch(items, referer, later = false) {
+  const withCookies = await Promise.all(
+    items.map(async (it) => ({ ...it, referer: it.referer || referer, cookie: await cookieHeader(it.url) })),
+  );
+  const body = { items: withCookies, user_agent: navigator.userAgent, later: !!later };
+  let r = await post('/ext/add-batch', body, 60000);
+  if (!r.ok && r.unreachable && (await launchReidm())) r = await post('/ext/add-batch', body, 60000);
+  return r;
+}
+
+/** The `Cookie` header the browser itself would send for `url`, so reIDM can fetch what the
+ *  signed-in user can. Read only at the moment of a hand-off, for that one URL. */
+async function cookieHeader(url, storeId) {
+  if (!chrome.cookies || !isHttp(url)) return undefined;
   try {
+    const list = await chrome.cookies.getAll(storeId ? { url, storeId } : { url });
+    if (!list.length) return undefined;
+    // Longer paths first, as browsers send them.
+    list.sort((a, b) => b.path.length - a.path.length);
+    return list.map((c) => `${c.name}=${c.value}`).join('; ');
+  } catch {
+    return undefined;
+  }
+}
+
+// ── things the browser must keep ────────────────────────────────────────
+
+/** Form submissions that turned into downloads. reIDM would fetch the URL with GET, which the
+ *  server would answer differently (or not at all), so these stay with the browser. */
+const recentPosts = new Map(); // url -> time
+
+/** URLs the user asked the browser to handle itself: Alt+click, or a hand-off reIDM refused
+ *  that the content script then gave back to the browser. */
+const bypass = new Map(); // url -> expiry
+
+function prune(map, maxAgeMs) {
+  const now = Date.now();
+  for (const [k, t] of map) if (now - t > maxAgeMs) map.delete(k);
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (d) => {
+    if (d.method && d.method !== 'GET') {
+      recentPosts.set(d.url, Date.now());
+      if (recentPosts.size > 200) prune(recentPosts, 120000);
+    }
+  },
+  { urls: ['http://*/*', 'https://*/*'], types: ['main_frame', 'sub_frame'] },
+);
+
+function bypassed(...urls) {
+  const now = Date.now();
+  for (const u of urls) {
+    if (!u) continue;
+    const until = bypass.get(u);
+    if (until && until > now) {
+      bypass.delete(u);
+      return true;
+    }
+  }
+  return false;
+}
+
+// ── 1. taking over browser downloads ────────────────────────────────────
+
+/** In-flight hand-offs, so a worker torn down mid-decision can be reconciled. */
+const PENDING_KEY = 'reidm-pending-captures';
+
+async function pendingUpdate(fn) {
+  try {
+    const p = (await chrome.storage.session.get(PENDING_KEY))[PENDING_KEY] || {};
+    fn(p);
     await chrome.storage.session.set({ [PENDING_KEY]: p });
   } catch {
-    /* best effort */
+    /* no session storage; the reconcile step simply does nothing */
   }
+}
 
-  const r = await send({
-    url: item.url,
-    filename: item.filename ? item.filename.split(/[\\/]/).pop() : nameFromUrl(item.url),
-    referer: item.referrer || undefined,
-  });
+/** Why a download should stay with the browser, or null to take it. */
+function keepReason(item) {
+  if (!settings.capture) return 'capture is off';
+  if (item.byExtensionId) return 'started by an extension'; // including our own fall-backs
+  if (item.state && item.state !== 'in_progress') return 'not a new download';
+  const url = item.finalUrl || item.url;
+  if (!isHttp(item.url) || !isHttp(url)) return 'made by the page itself (blob/data), nothing to hand over';
+  if (isIgnored(item.url) || isIgnored(url)) return 'ignored address';
+  if (item.incognito && !settings.captureIncognito) return 'incognito';
+  if (hostSkipped(item.url) || hostSkipped(url)) return 'site is on the never-capture list';
+  if (bypassed(item.url, item.finalUrl)) return 'the user asked the browser to keep it';
+  const posted = recentPosts.get(item.url) || recentPosts.get(item.finalUrl);
+  if (posted && Date.now() - posted < 120000) return 'a form submission (POST) cannot be repeated by reIDM';
+  const kb = Number(settings.minSizeKB) || 0;
+  if (kb > 0 && item.totalBytes > 0 && item.totalBytes < kb * 1024) return 'smaller than the minimum size';
+  if (!settings.captureAll && !typeListed(item.filename) && !typeListed(url)) return 'file type not on the list';
+  return null;
+}
 
-  const q = await pendingGet();
-  delete q[item.id];
+const callback = (fn) => new Promise((resolve) => fn(() => resolve(!chrome.runtime.lastError)));
+
+/** The core hand-off. `suggest` releases Chrome's filename decision; it must be called exactly
+ *  once, and — when reIDM took the download — only after the browser's copy is cancelled, or
+ *  Chrome would carry on and open its "Save as" dialog. */
+async function takeOver(item, suggest) {
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      suggest();
+    } catch {
+      /* the download is gone already */
+    }
+  };
   try {
-    await chrome.storage.session.set({ [PENDING_KEY]: q });
-  } catch {
-    /* best effort */
-  }
+    await settingsReady;
+    const why = keepReason(item);
+    if (why) {
+      console.debug(`reIDM: leaving download ${item.id} to the browser: ${why}`);
+      return release();
+    }
 
-  if (r.ok) {
-    // reIDM has it: now the browser's copy is redundant.
-    chrome.downloads.cancel(item.id, () => void chrome.runtime.lastError);
-    chrome.downloads.erase({ id: item.id }, () => void chrome.runtime.lastError);
-    badge('✓', '#2ea053', 2500);
-  } else if (paused) {
-    // Put it back exactly as it was, tags and all.
-    chrome.downloads.resume(item.id, () => void chrome.runtime.lastError);
-    notify('reIDM could not take the download', r.error || 'unknown error');
-  } else {
-    notify('reIDM could not take the download', r.error || 'unknown error');
+    // The reversible half first: stop the transfer while reIDM is asked.
+    const paused = await callback((done) => chrome.downloads.pause(item.id, done));
+    await pendingUpdate((p) => (p[item.id] = { paused, at: Date.now() }));
+
+    const url = isHttp(item.finalUrl) ? item.finalUrl : item.url;
+    const store = item.incognito ? 'incognito' : undefined;
+    const details = {
+      url,
+      filename: baseName(item.filename) || nameFromUrl(url),
+      referer: item.referrer || undefined,
+      cookie: await cookieHeader(url, store),
+      user_agent: navigator.userAgent,
+      verify: true,
+    };
+    let r = await send(details);
+    // A redirect's target can be bound to the request that produced it; the original address
+    // is worth one more try before giving up.
+    if (!r.ok && !r.unreachable && item.url !== url && isHttp(item.url)) {
+      r = await send({ ...details, url: item.url, cookie: await cookieHeader(item.url, store) });
+    }
+    await pendingUpdate((p) => delete p[item.id]);
+
+    if (r.ok) {
+      // reIDM has it, and has already fetched its first byte: the browser's copy is redundant.
+      await callback((done) => chrome.downloads.cancel(item.id, done));
+      await callback((done) => chrome.downloads.erase({ id: item.id }, done));
+      release();
+      recordCapture({ url, filename: details.filename, outcome: r.outcome, id: r.id });
+      badge(r.outcome === 'already_complete' ? '=' : '✓', '#2ea053', 2500);
+      return;
+    }
+    if (paused) await callback((done) => chrome.downloads.resume(item.id, done));
+    release();
+    recordCapture({ url, filename: details.filename, error: r.error || 'refused' });
+    notify('the browser kept the download', r.error || 'reIDM refused it');
+  } catch (e) {
+    console.warn('reIDM: hand-off failed', e);
+    try {
+      chrome.downloads.resume(item.id, () => void chrome.runtime.lastError);
+    } catch {
+      /* ignore */
+    }
+    release();
   }
+}
+
+if (chrome.downloads.onDeterminingFilename) {
+  chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    takeOver(item, suggest);
+    return true; // answered asynchronously, by `takeOver`
+  });
+} else {
+  // A browser without `onDeterminingFilename` (not Chromium): pause on creation instead. Small
+  // files may finish before the pause lands there; the browser then keeps its copy too.
+  chrome.downloads.onCreated.addListener((item) => {
+    if (item.state === 'in_progress') takeOver(item, () => {});
+  });
 }
 
 /** A decision that never arrived must not leave a download stuck paused. */
 async function reconcilePending() {
-  const p = await pendingGet();
-  let changed = false;
-  for (const [id, e] of Object.entries(p)) {
-    if (Date.now() - e.at < 30000) continue; // still in flight
-    if (e.paused) chrome.downloads.resume(Number(id), () => void chrome.runtime.lastError);
-    delete p[id];
-    changed = true;
-  }
-  if (changed) {
-    try {
-      await chrome.storage.session.set({ [PENDING_KEY]: p });
-    } catch {
-      /* best effort */
+  const stale = [];
+  await pendingUpdate((p) => {
+    for (const [id, e] of Object.entries(p)) {
+      if (Date.now() - e.at < 60000) continue; // still in flight
+      if (e.paused) stale.push(Number(id));
+      delete p[id];
     }
+  });
+  for (const id of stale) chrome.downloads.resume(id, () => void chrome.runtime.lastError);
+}
+
+/** Recent hand-offs, for the popup's "what just happened". */
+const CAPTURES_KEY = 'reidm-recent-captures';
+async function recordCapture(entry) {
+  try {
+    const list = (await chrome.storage.session.get(CAPTURES_KEY))[CAPTURES_KEY] || [];
+    list.unshift({ ...entry, at: Date.now() });
+    await chrome.storage.session.set({ [CAPTURES_KEY]: list.slice(0, 20) });
+  } catch {
+    /* best effort */
   }
 }
 
 function notify(title, message) {
-  // A notification needs its own permission; the action badge is enough and needs nothing.
+  // A notification needs its own permission; the action badge and the popup are enough.
   console.warn(`reIDM: ${title}: ${message}`);
   badge('!', '#c02828', 4000);
 }
@@ -203,27 +420,57 @@ function badge(text, color, clearAfterMs) {
   if (clearAfterMs) badgeTimer = setTimeout(() => chrome.action.setBadgeText({ text: '' }).catch(() => {}), clearAfterMs);
 }
 
-// ── 2. media sniffing ───────────────────────────────────────────────────
+// ── 2. links the content script took on click ───────────────────────────
 
-const MEDIA_EXT = /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|flv|ts|mp3|m4a|flac|ogg|opus|wav|aac)(\?|#|$)/i;
+/** A link the user clicked, which the content script stopped before the browser requested
+ *  it. reIDM checks it first; `refuse_html` makes it decline a "file" link that actually
+ *  answers with a web page (a login wall, a download page), which the browser should then open. */
+async function captureLink(msg, sender) {
+  await settingsReady;
+  const url = msg.url;
+  if (!settings.capture || !isHttp(url) || isIgnored(url) || hostSkipped(url)) return { ok: false, error: 'not captured' };
+  const incognito = !!(sender.tab && sender.tab.incognito);
+  if (incognito && !settings.captureIncognito) return { ok: false, error: 'incognito' };
+  const filename = msg.filename || nameFromUrl(url) || undefined;
+  const r = await send({
+    url,
+    filename,
+    referer: msg.referer || (sender.tab && sender.tab.url) || undefined,
+    cookie: await cookieHeader(url, incognito ? 'incognito' : undefined),
+    user_agent: navigator.userAgent,
+    verify: true,
+    refuse_html: true,
+  });
+  if (r.ok) {
+    recordCapture({ url, filename, outcome: r.outcome, id: r.id });
+    badge(r.outcome === 'already_complete' ? '=' : '✓', '#2ea053', 2500);
+  } else {
+    recordCapture({ url, filename, error: r.error || 'refused' });
+  }
+  return r;
+}
+
+// ── 3. media sniffing ───────────────────────────────────────────────────
+
+const MEDIA_EXT = /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|flv|mp3|m4a|flac|ogg|opus|wav|aac)(\?|#|$)/i;
 const MANIFEST_EXT = /\.(m3u8|mpd)(\?|#|$)/i;
+/** Pieces of a stream, which are useless on their own and would bury the real entries. */
+const SEGMENT = /\.(ts|m4s|cmfv|cmfa)(\?|#|$)|[/_-](seg|segment|chunk|frag|fragment)[-_]?\d+|\/range\/\d+-\d+/i;
+const MANIFEST_MIME = /mpegurl|dash\+xml/i;
+const MEDIA_MIME = /^(video|audio)\//i;
+/** YouTube's own player traffic: its formats come through the quality picker instead. */
+const SKIP_MEDIA_HOST = /(^|\.)googlevideo\.com$/i;
 
-/** tabId -> Map(url -> {url, kind, at, formats?}) */
+/** tabId -> Map(url -> {url, kind, at, mime?, size?, formats?}) */
 const mediaByTab = new Map();
 
-// ── surviving the worker being torn down ────────────────────────────────
-//
-// An MV3 service worker is stopped whenever Chrome feels like it, and every module-scope
-// variable goes with it. Without this, the variants parsed out of a manifest disappear the
-// moment the worker idles, and the popup would come back empty on a page that is still
-// playing. `chrome.storage.session` is the right home: it lives as long as the browser
-// session, which is exactly the lifetime of "a page that is still open".
-
+// An MV3 service worker is stopped whenever Chrome likes, and module-scope state goes with it.
+// The per-tab media index is mirrored to session storage, which lives exactly as long as "a page
+// that is still open" can.
 const MEDIA_KEY = 'reidm-media-by-tab';
 let persistTimer = null;
 
 function persistMedia() {
-  // Every network request would otherwise rewrite the whole map.
   if (persistTimer) return;
   persistTimer = setTimeout(async () => {
     persistTimer = null;
@@ -241,28 +488,22 @@ async function restoreMedia() {
   try {
     const o = (await chrome.storage.session.get(MEDIA_KEY))[MEDIA_KEY] || {};
     for (const [tab, list] of Object.entries(o)) {
-      if (!mediaByTab.has(Number(tab))) {
-        mediaByTab.set(Number(tab), new Map(list.map((e) => [e.url, e])));
-      }
+      if (!mediaByTab.has(Number(tab))) mediaByTab.set(Number(tab), new Map(list.map((e) => [e.url, e])));
     }
   } catch {
     /* nothing to restore */
   }
 }
 
-/** Resolves once the stored map is back. Every reader must await this: a worker that has just
- *  been woken starts handling messages immediately, and reading `mediaByTab` before the
- *  restore lands would report an empty list for a page that is plainly playing video. */
+/** Every reader awaits this: a worker that has just been woken would otherwise report an empty
+ *  list for a page that is plainly playing video. */
 const mediaReady = restoreMedia();
 
 // ── manifest parsing, in the worker ─────────────────────────────────────
 //
 // The MAIN-world hook also parses manifests, but it can lose a race: a page that fetches its
-// manifest from an inline <script> does so before the injected hook has finished loading, and
-// the request is then invisible to it. `webRequest` sees the request regardless of what the
-// page did, so the worker re-fetches the manifest itself (it has host permissions) and parses
-// it here. That is the authoritative source; the hook's copy is a fallback for anything the
-// worker cannot re-fetch (a POST-only or signed URL).
+// manifest from an inline <script> does so before the hook exists. `webRequest` sees the request
+// regardless, so the worker re-fetches the manifest itself (it has host permissions).
 
 function codecNames(codecs) {
   const c = String(codecs || '').toLowerCase();
@@ -351,7 +592,19 @@ function record(tabId, url, kind, extra = {}) {
   if (tabId === undefined || tabId < 0 || !isHttp(url) || isIgnored(url)) return;
   if (!mediaByTab.has(tabId)) mediaByTab.set(tabId, new Map());
   const tab = mediaByTab.get(tabId);
-  if (tab.has(url)) return;
+  const prev = tab.get(url);
+  if (prev) {
+    // A later sighting may know more (a size, a MIME type); keep the first sighting's time.
+    let changed = false;
+    for (const [k, v] of Object.entries(extra)) {
+      if (v != null && prev[k] == null) {
+        prev[k] = v;
+        changed = true;
+      }
+    }
+    if (changed) persistMedia();
+    return;
+  }
   tab.set(url, { url, kind, at: Date.now(), ...extra });
   // Keep the per-tab list from growing without bound on a long-running player.
   if (tab.size > 200) {
@@ -362,106 +615,71 @@ function record(tabId, url, kind, extra = {}) {
   persistMedia();
 }
 
+function noteManifest(tabId, url, extra) {
+  record(tabId, url, 'stream', extra);
+  // Fetch and parse it out-of-band; the picker can then offer real variants even if the page
+  // fetched the manifest before our hook existed.
+  formatsForManifest(url).then(async (formats) => {
+    if (!formats.length) return;
+    await mediaReady;
+    const tab = mediaByTab.get(tabId);
+    const entry = tab && tab.get(url);
+    if (entry) {
+      entry.formats = formats;
+      persistMedia();
+    }
+  });
+}
+
 chrome.webRequest.onBeforeRequest.addListener(
   (d) => {
-    if (!settings.sniffMedia) return;
-    if (MANIFEST_EXT.test(d.url)) {
-      record(d.tabId, d.url, 'stream');
-      // Fetch and parse it out-of-band; the picker can then offer real variants even if the
-      // page fetched the manifest before our hook existed.
-      formatsForManifest(d.url).then(async (formats) => {
-        if (!formats.length) return;
-        await mediaReady;
-        const tab = mediaByTab.get(d.tabId);
-        const entry = tab && tab.get(d.url);
-        if (entry) {
-          entry.formats = formats;
-          persistMedia();
-        }
-      });
-    } else if (MEDIA_EXT.test(d.url)) {
-      record(d.tabId, d.url, 'media');
-    }
+    if (!settings.sniffMedia || SKIP_MEDIA_HOST.test(hostOf(d.url))) return;
+    if (MANIFEST_EXT.test(d.url)) noteManifest(d.tabId, d.url);
+    else if (MEDIA_EXT.test(d.url) && !SEGMENT.test(d.url)) record(d.tabId, d.url, 'media');
   },
   { urls: ['http://*/*', 'https://*/*'] },
 );
 
-// Some players load manifests through fetch with a query string and no recognisable extension.
-// The content script's MAIN-world hook reports those, since webRequest cannot see bodies.
-chrome.runtime.onMessage.addListener((msg, sender, reply) => {
-  if (!msg || typeof msg !== 'object') return;
-  const tabId = sender.tab ? sender.tab.id : msg.tabId;
-
-  if (msg.type === 'media') {
-    for (const m of msg.items || []) {
-      record(tabId, m.url, m.kind || 'media', { page: m.page, formats: m.formats });
-      // A later report for the same URL may carry the variants the first one lacked.
-      if (m.formats && m.formats.length) {
-        const tab = mediaByTab.get(tabId);
-        const e = tab && tab.get(m.url);
-        if (e) {
-          e.formats = m.formats;
-          persistMedia();
-        }
-      }
+// Many players fetch media from addresses with no recognisable extension. The response's own
+// Content-Type says what it is, and Content-Length/Content-Range how big.
+chrome.webRequest.onHeadersReceived.addListener(
+  (d) => {
+    if (!settings.sniffMedia || d.tabId < 0 || SKIP_MEDIA_HOST.test(hostOf(d.url))) return;
+    if (d.statusCode >= 400 || SEGMENT.test(d.url)) return;
+    let mime = '';
+    let size = null;
+    for (const h of d.responseHeaders || []) {
+      const n = h.name.toLowerCase();
+      if (n === 'content-type') mime = String(h.value || '').split(';')[0].trim().toLowerCase();
+      else if (n === 'content-range') {
+        const m = /\/(\d+)\s*$/.exec(h.value || '');
+        if (m) size = Number(m[1]);
+      } else if (n === 'content-length' && size == null && d.statusCode === 200) size = Number(h.value) || null;
     }
-    if (tabId !== undefined) badge(String((mediaByTab.get(tabId) || new Map()).size), '#0a60c8', null);
-    reply?.({ ok: true });
-    return true;
-  }
+    if (MANIFEST_MIME.test(mime)) noteManifest(d.tabId, d.url, { mime });
+    else if (MEDIA_MIME.test(mime) && mime !== 'video/mp2t') {
+      // Tiny responses are a player's probes and preview sprites, not something to download.
+      if (size == null || size > 64 * 1024) record(d.tabId, d.url, mime.startsWith('audio/') ? 'audio' : 'video', { mime, size });
+    }
+  },
+  { urls: ['http://*/*', 'https://*/*'], types: ['media', 'xmlhttprequest', 'other', 'object', 'sub_frame'] },
+  ['responseHeaders'],
+);
 
-  if (msg.type === 'formats-for-tab') {
-    // Everything this tab has, including the variants the worker parsed out of a manifest the
-    // page fetched before our hook existed. The content script merges this with the hook's view.
-    const want = msg.tabId !== undefined ? msg.tabId : tabId;
-    mediaReady.then(() => {
-      const entries = [...((mediaByTab.get(want) || new Map()).values())].filter(
-        (i) => i.formats && i.formats.length,
-      );
-      reply?.({ ok: true, entries });
-    });
-    return true; // async reply
-  }
-
-  if (msg.type === 'add') {
-    send(msg.details).then((r) => reply?.(r));
-    return true; // keep the channel open for the async reply
-  }
-
-  if (msg.type === 'download-format') {
-    downloadFormat(msg).then((r) => reply?.(r));
-    return true;
-  }
-
-  if (msg.type === 'ping') {
-    ping().then((info) => reply?.({ ok: !!info, info }));
-    return true;
-  }
-
-  if (msg.type === 'media-for-tab') {
-    reply?.({ items: [...(mediaByTab.get(msg.tabId) || new Map()).values()] });
-    return true;
-  }
-
-  if (msg.type === 'clear-tab') {
-    mediaByTab.delete(msg.tabId);
-    chrome.action.setBadgeText({ text: '' }).catch(() => {});
-    reply?.({ ok: true });
-    return true;
-  }
-  return false;
+chrome.tabs.onRemoved.addListener((tabId) => {
+  mediaByTab.delete(tabId);
+  persistMedia();
 });
-
-chrome.tabs.onRemoved.addListener((tabId) => mediaByTab.delete(tabId));
 chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status === 'loading' && info.url) {
     // A new document in the tab: the previous page's media is no longer relevant.
     mediaByTab.delete(tabId);
+    persistMedia();
     chrome.action.setBadgeText({ text: '' }).catch(() => {});
   }
 });
 
-// ── 2b. handing a chosen video format to reIDM ──────────────────────────
+// ── 3b. handing a chosen video format to reIDM ──────────────────────────
 
 /** A safe-ish file name: "Title 1080p.mp4". reIDM sanitises it again on its side. */
 function formatFilename(title, format, url) {
@@ -471,26 +689,18 @@ function formatFilename(title, format, url) {
     const u = /\.([a-z0-9]{2,4})(?:\?|#|$)/i.exec(url || '');
     return u ? u[1] : 'mp4';
   })();
-  const base = (title || 'video')
-    .replace(/[/\\?%*:|"<>]/g, '_')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 120);
+  const base = (title || 'video').replace(/[/\\?%*:|"<>]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 120);
   const q = format.quality ? ` ${format.quality}` : '';
   const a = format.audioOnly ? ' (audio)' : '';
   return `${base}${q}${a}.${ext}`;
 }
 
 /**
- * The user picked a format.
- *
- * A format that already has a direct URL is just a download, so it goes through the same path
- * as any other capture. One that does not is a URL the player protects with a signature
- * (`signatureCipher`); an extension must not reimplement that, so the page URL and the format
- * descriptor go across instead and the manager resolves it. reIDM has no resolver yet, and
- * saying so plainly beats handing it a URL that will 403.
+ * The user picked a format. A format that already has a direct URL is just a download. One
+ * that does not is protected by the player's signature (`signatureCipher`); an extension must
+ * not reimplement that, and reIDM has no resolver yet, so say so plainly.
  */
-async function downloadFormat(msg) {
+async function downloadFormat(msg, sender) {
   const f = msg.format || {};
   if (!msg.url) {
     return {
@@ -500,39 +710,153 @@ async function downloadFormat(msg) {
         '(it needs a yt-dlp-style resolver). Pick a format that is not greyed out.',
     };
   }
+  const incognito = !!(sender.tab && sender.tab.incognito);
   const r = await send({
     url: msg.url,
     filename: formatFilename(msg.title, f, msg.url),
     referer: msg.page || undefined,
+    cookie: await cookieHeader(msg.url, incognito ? 'incognito' : undefined),
+    user_agent: navigator.userAgent,
   });
-  if (r.ok) {
-    badge('✓', '#2ea053', 2500);
-  } else {
-    notify('reIDM could not take the video', r.error || 'unknown error');
-  }
+  if (r.ok) badge('✓', '#2ea053', 2500);
+  else notify('reIDM could not take the video', r.error || 'unknown error');
   return r;
 }
 
-// ── 3. context menus ────────────────────────────────────────────────────
+// ── 4. messages ─────────────────────────────────────────────────────────
 
-const MENU = { link: 'reidm-link', page: 'reidm-page', media: 'reidm-media', selection: 'reidm-selection' };
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (!msg || typeof msg !== 'object') return false;
+  const tabId = sender.tab ? sender.tab.id : msg.tabId;
+
+  switch (msg.type) {
+    case 'media': {
+      for (const m of msg.items || []) {
+        record(tabId, m.url, m.kind || 'media', { page: m.page, formats: m.formats });
+        // A later report for the same URL may carry the variants the first one lacked.
+        if (m.formats && m.formats.length) {
+          const tab = mediaByTab.get(tabId);
+          const e = tab && tab.get(m.url);
+          if (e) {
+            e.formats = m.formats;
+            persistMedia();
+          }
+        }
+      }
+      reply({ ok: true });
+      return false;
+    }
+    case 'formats-for-tab': {
+      const want = msg.tabId !== undefined ? msg.tabId : tabId;
+      mediaReady.then(() => {
+        const entries = [...(mediaByTab.get(want) || new Map()).values()].filter((i) => i.formats && i.formats.length);
+        reply({ ok: true, entries });
+      });
+      return true;
+    }
+    case 'media-for-tab':
+      mediaReady.then(() => reply({ items: [...(mediaByTab.get(msg.tabId) || new Map()).values()] }));
+      return true;
+    case 'clear-tab':
+      mediaByTab.delete(msg.tabId);
+      persistMedia();
+      chrome.action.setBadgeText({ text: '' }).catch(() => {});
+      reply({ ok: true });
+      return false;
+    case 'capture-link':
+      captureLink(msg, sender).then(reply);
+      return true;
+    case 'bypass':
+      // The content script is about to let the browser have this URL.
+      if (isHttp(msg.url)) bypass.set(msg.url, Date.now() + 15000);
+      prune(bypass, 60000);
+      reply({ ok: true });
+      return false;
+    case 'open-tab': {
+      // A `target=_blank` link reIDM declined: open it as the click would have. The tab is the
+      // worker's to open because the page's user activation may have lapsed by now.
+      if (!isHttp(msg.url)) {
+        reply({ ok: false });
+        return false;
+      }
+      bypass.set(msg.url, Date.now() + 15000);
+      const t = sender.tab;
+      chrome.tabs.create({ url: msg.url, index: t ? t.index + 1 : undefined, openerTabId: t ? t.id : undefined }, () =>
+        reply({ ok: !chrome.runtime.lastError }),
+      );
+      return true;
+    }
+    case 'add': {
+      const d = msg.details || {};
+      (async () => reply(await send({ ...d, cookie: d.cookie || (await cookieHeader(d.url)), user_agent: navigator.userAgent })))();
+      return true;
+    }
+    case 'add-batch':
+      sendBatch(msg.items || [], msg.referer, msg.later).then(reply);
+      return true;
+    case 'download-format':
+      downloadFormat(msg, sender).then(reply);
+      return true;
+    case 'ping':
+      ping().then((info) => reply({ ok: !!info, info }));
+      return true;
+    case 'launch':
+      launchReidm().then((ok) => reply({ ok }));
+      return true;
+    case 'recent-captures':
+      chrome.storage.session
+        .get(CAPTURES_KEY)
+        .then((o) => reply({ items: o[CAPTURES_KEY] || [] }))
+        .catch(() => reply({ items: [] }));
+      return true;
+    case 'open-grabber':
+      openGrabber(msg.tabId).then(() => reply({ ok: true }));
+      return true;
+    default:
+      return false;
+  }
+});
+
+// ── 5. context menus ────────────────────────────────────────────────────
+
+const MENU = {
+  link: 'reidm-link',
+  page: 'reidm-page',
+  media: 'reidm-media',
+  selection: 'reidm-selection',
+  grab: 'reidm-grab',
+};
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({ id: MENU.link, title: 'Download with reIDM', contexts: ['link'] });
     chrome.contextMenus.create({ id: MENU.media, title: 'Download this media with reIDM', contexts: ['video', 'audio', 'image'] });
     chrome.contextMenus.create({ id: MENU.page, title: 'Download all links on this page with reIDM', contexts: ['page'] });
+    chrome.contextMenus.create({ id: MENU.grab, title: 'Grab resources from this page with reIDM…', contexts: ['page', 'frame'] });
     chrome.contextMenus.create({ id: MENU.selection, title: 'Download the selected link with reIDM', contexts: ['selection'] });
   });
+  ping();
 });
+
+async function openGrabber(tabId) {
+  if (tabId === undefined) return;
+  await chrome.tabs.create({ url: chrome.runtime.getURL(`grabber.html?tab=${tabId}`) });
+}
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const referer = tab && tab.url ? tab.url : undefined;
+  const incognito = !!(tab && tab.incognito);
 
   if (info.menuItemId === MENU.link || info.menuItemId === MENU.media) {
     const url = info.linkUrl || info.srcUrl;
     if (!url) return;
-    const r = await send({ url, referer, filename: nameFromUrl(url) || undefined });
+    const r = await send({
+      url,
+      referer,
+      filename: nameFromUrl(url) || undefined,
+      cookie: await cookieHeader(url, incognito ? 'incognito' : undefined),
+      user_agent: navigator.userAgent,
+    });
     flash(r);
     return;
   }
@@ -540,46 +864,51 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === MENU.selection) {
     const url = (info.selectionText || '').trim();
     if (!isHttp(url)) return flash({ ok: false, error: 'the selection is not a link' });
-    flash(await send({ url, referer }));
+    flash(await send({ url, referer, cookie: await cookieHeader(url), user_agent: navigator.userAgent }));
+    return;
+  }
+
+  if (info.menuItemId === MENU.grab) {
+    if (tab) openGrabber(tab.id);
     return;
   }
 
   if (info.menuItemId === MENU.page) {
-    // Collect the page's links in the content script, then queue them all.
     const [res] = await chrome.scripting
       .executeScript({
         target: { tabId: tab.id },
-        func: () =>
-          [...document.querySelectorAll('a[href]')]
-            .map((a) => a.href)
-            .filter((h) => /^https?:/i.test(h))
-            .slice(0, 500),
+        func: () => [...new Set([...document.querySelectorAll('a[href]')].map((a) => a.href).filter((h) => /^https?:/i.test(h)))].slice(0, 2000),
       })
       .catch(() => []);
     const urls = (res && res.result) || [];
     if (!urls.length) return flash({ ok: false, error: 'no links found' });
-    let queued = 0;
-    for (const u of urls) {
-      const r = await send({ url: u, referer });
-      if (r.ok) queued++;
-    }
-    flash({ ok: true, queued });
+    const r = await sendBatch(urls.map((url) => ({ url })), referer);
+    const queued = (r.results || []).filter((x) => x.outcome === 'new').length;
+    flash(r.ok ? { ok: true, queued } : r);
   }
 });
 
 function flash(r) {
-  if (r && r.ok) {
-    badge(r.queued ? String(r.queued) : '✓', '#2ea053', 2500);
-  } else {
-    notify('reIDM could not take it', (r && r.error) || 'unknown error');
-  }
+  if (r && r.ok) badge(r.queued ? String(r.queued) : '✓', '#2ea053', 2500);
+  else notify('reIDM could not take it', (r && r.error) || 'unknown error');
 }
+
+// ── keeping in touch ────────────────────────────────────────────────────
+
+chrome.alarms.create('reidm-ping', { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener((a) => {
+  if (a.name === 'reidm-ping') ping();
+});
 
 chrome.runtime.onStartup.addListener(() => {
   ping().then((info) => badge(info ? '' : '?', info ? '#2ea053' : '#d98a1f', 3000));
   reconcilePending();
 });
 
-// A module service worker can also be woken without `onStartup` (an event wakes it), so
-// reconcile once per worker start as well.
+// A module service worker can also be woken without `onStartup` (an event wakes it), so do
+// these once per worker start as well.
 reconcilePending();
+ping();
+
+// For DevTools and `tools/capture-test.mjs`: a module worker's functions are not globals.
+globalThis.reidm = { ping, launchReidm, status: () => status };

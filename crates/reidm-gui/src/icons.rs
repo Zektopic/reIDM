@@ -130,6 +130,52 @@ pub fn clock(p: &Painter, r: Rect, color: Color32) {
     p.line_segment([c, Pos2::new(c.x + r.width() * 0.16, c.y + r.width() * 0.06)], s);
 }
 
+/// List lines with a play triangle: "start the scheduled queue".
+pub fn queue_start(p: &Painter, r: Rect, color: Color32) {
+    queue_lines(p, r, color);
+    let (cx, cy, d) = (r.left() + r.width() * 0.70, r.center().y, r.width() * 0.17);
+    p.add(Shape::convex_polygon(
+        vec![Pos2::new(cx - d * 0.7, cy - d), Pos2::new(cx + d, cy), Pos2::new(cx - d * 0.7, cy + d)],
+        color,
+        Stroke::NONE,
+    ));
+}
+
+/// List lines with two bars: "stop the scheduled queue".
+pub fn queue_stop(p: &Painter, r: Rect, color: Color32) {
+    queue_lines(p, r, color);
+    let (w, h) = (r.width() * 0.09, r.height() * 0.40);
+    for dx in [0.62, 0.80] {
+        p.rect_filled(Rect::from_center_size(Pos2::new(r.left() + r.width() * dx, r.center().y), Vec2::new(w, h)), 1.0, color);
+    }
+}
+
+fn queue_lines(p: &Painter, r: Rect, color: Color32) {
+    let s = Stroke::new(r.width() * 0.10, color);
+    let (left, right) = (r.left() + r.width() * 0.12, r.left() + r.width() * 0.46);
+    for k in 0..3 {
+        let y = r.top() + r.height() * (0.30 + 0.20 * k as f32);
+        p.line_segment([Pos2::new(left, y), Pos2::new(right, y)], s);
+    }
+}
+
+/// A gauge with its needle low: the speed limiter.
+pub fn gauge(p: &Painter, r: Rect, color: Color32) {
+    let c = Pos2::new(r.center().x, r.top() + r.height() * 0.66);
+    let rad = r.width() * 0.36;
+    let s = Stroke::new(r.width() * 0.10, color);
+    let pts: Vec<Pos2> = (0..=16)
+        .map(|k| {
+            let a = std::f32::consts::PI * (1.0 + k as f32 / 16.0);
+            Pos2::new(c.x + rad * a.cos(), c.y + rad * a.sin())
+        })
+        .collect();
+    p.add(Shape::line(pts, s));
+    let a = std::f32::consts::PI * 1.25;
+    p.line_segment([c, Pos2::new(c.x + rad * 0.8 * a.cos(), c.y + rad * 0.8 * a.sin())], s);
+    p.circle_filled(c, r.width() * 0.07, color);
+}
+
 /// A magnifier over a grid: the site grabber's "find everything on this page" idea.
 pub fn grabber(p: &Painter, r: Rect, color: Color32) {
     let s = Stroke::new(r.width() * 0.10, color);

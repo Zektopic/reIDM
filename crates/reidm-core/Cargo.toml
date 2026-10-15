@@ -16,3 +16,4 @@ directories.workspace = true
 tracing.workspace = true
 url.workspace = true
 percent-encoding.workspace = true
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }

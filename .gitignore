@@ -8,3 +8,5 @@
 # pre-existing local files, not part of the project
 /archive-ygyt97/
 /build/
+__pycache__/
+*.pyc
