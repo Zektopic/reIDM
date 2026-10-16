@@ -21,7 +21,8 @@
 //   6. a "file" link that is really a web page opens in the browser instead of being saved;
 //   7. with reIDM stopped, the extension starts it through the native host and still takes over;
 //   8. with reIDM stopped and no native host, the browser simply downloads the file;
-//   9. the resource grabber lists what the page offers, hides noise, and hands the selection over.
+//   9. the resource grabber lists what the page offers, hides noise, and hands the selection over;
+//  10. a magnet link goes to reIDM as a torrent, and the browser does nothing with it.
 //
 // REIDM_PROMPT=1 turns on the browser's "Ask where to save each file" and runs checks 1–2 only;
 // REIDM_ONLY_GRABBER=1 runs check 9 only; KEEP=1 keeps the temporary profile and logs.
@@ -104,6 +105,7 @@ const PAGE = `<!doctype html><html><head><title>capture test</title>
 <a id="launched" href="/dl/launched?id=9">launched (reIDM stopped, host registered)</a>
 <a id="fallback" href="/dl/fallback?id=10">fallback (reIDM stopped, no host)</a>
 <a id="cancelled" href="/dl/cancelled?id=11">cancelled (Cancel in the dialog)</a>
+<a id="magnet" href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Test%20Torrent.bin">a magnet link</a>
 <form method="post" action="/post/export"><input type="hidden" name="q" value="1">
 <button id="post" type="submit">POST export</button></form>
 </body></html>`;
@@ -536,6 +538,15 @@ async function main() {
   check('page posing as a file: the browser opened it', !!opened);
   check('page posing as a file: reIDM did not save it', !itemFor(await reidmItems(), '/files/fake.zip'));
   await openPage(`http://127.0.0.1:${SITE_PORT}/`);
+
+  // 10. a magnet link: a torrent for reIDM (kept off the network: no DHT)
+  await fetch(`${API}/api/settings`, { method: 'POST', headers: { 'X-Reidm-Token': token(), 'Content-Type': 'application/json' }, body: JSON.stringify({ torrent_dht: false, torrent_port: 0 }) });
+  await click('#magnet');
+  const tor = await waitFor('the torrent in reIDM', async () => (await reidmItems()).find((i) => i.request.url.startsWith('magnet:')));
+  check('magnet link: reIDM has it as a torrent', !!(tor && tor.request.torrent));
+  check('magnet link: named after the link', !!tor && /Test Torrent\.bin$/.test(tor.path), tor && tor.path);
+  check('magnet link: the page stayed where it was', (await evalPage('location.pathname')) === '/');
+  if (tor) await fetch(`${API}/api/downloads/${tor.id}`, { method: 'DELETE', headers: { 'X-Reidm-Token': token() } });
 
   // 7. reIDM stopped; the native host starts it
   const hostDir = WIN ? WORK : path.join(PROFILE, 'NativeMessagingHosts');

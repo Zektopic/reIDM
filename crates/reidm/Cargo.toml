@@ -25,6 +25,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 axum.workspace = true
 reqwest.workspace = true
+base64 = "0.22"
 
 [package.metadata.deb]
 name = "reidm"

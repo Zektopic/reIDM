@@ -359,6 +359,33 @@ each with its codecs (`H264`, `Vp9`, `Av1`) and its largest format's size withou
 To download one, `POST /api/downloads` with `media` (see above): a format selector, and, for sound
 converted to MP3 or Opus, `"audio": "mp3"`.
 
+## Torrents
+
+A magnet link, or the address of a `.torrent` file, given to `POST /api/downloads` (or
+`/ext/add`) is a torrent. To send a `.torrent` file itself, or to choose its files:
+
+```json
+{ "url": "", "later": false, "torrent": { "data": "<the .torrent, base64>", "files": [0, 2] } }
+```
+
+`files` are indices in the torrent (all when missing). A torrent's download carries `torrent` in
+`GET /api/downloads`:
+
+```json
+"torrent": { "info_hash": "7acf8f…", "name": "debian-13.7.0-amd64-netinst.iso", "uploaded": 52428800, "peers": 41, "seeding": true,
+             "files": [ { "path": "debian-13.7.0-amd64-netinst.iso", "size": 792723456, "done": 792723456, "selected": true } ] }
+```
+
+| | |
+|---|---|
+| `POST /api/torrent/inspect` | `{ "url": "magnet:…" }` or `{ "data": "<base64>" }` → `{ "name", "info_hash", "size", "files": [ { "path", "size" } ] }`, without adding it. For a magnet link it waits for a peer to describe the torrent (up to two minutes) |
+| `POST /api/downloads/{id}/seed` | share a finished torrent again |
+| `POST /api/downloads/{id}/stop-seeding` | stop sharing it |
+
+Settings: `seed_ratio` (0: don't seed; above 0: until that ratio; below 0: as long as reIDM runs),
+`upload_limit` (bytes per second, 0: none), `torrent_port` (0: any), `torrent_dht`. The port and
+the DHT take effect when the torrent engine next starts.
+
 ## Site grabber
 
 #### `POST /api/grab`

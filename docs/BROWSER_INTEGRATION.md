@@ -176,6 +176,14 @@ against the SHA-256 the release publishes:
 `reidm add --video URL` does the same from a terminal, for YouTube and the
 [many other sites yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md).
 
+### Torrents
+
+A click on a **magnet link** goes to reIDM as a torrent — through the *Download file info* dialog,
+named after the link — and starts reIDM if it isn't running; **Alt+click** leaves it to whatever
+other program your system opens magnet links with. A **`.torrent` file** the browser downloads is
+taken like any download, and reIDM adds the torrent in it rather than saving the file. See
+[Torrents](USER_GUIDE.md#torrents).
+
 ### Limits
 
 Limits that come from the platforms, not from the extension:

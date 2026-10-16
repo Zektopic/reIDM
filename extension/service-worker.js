@@ -602,6 +602,7 @@ async function maybeAsk(req) {
 async function captureLink(msg, sender) {
   await settingsReady;
   const url = msg.url;
+  if (/^magnet:/i.test(url || '')) return captureMagnet(msg, sender);
   if (!settings.capture || !isHttp(url) || isIgnored(url) || hostSkipped(url)) return { ok: false, error: 'not captured' };
   const incognito = !!(sender.tab && sender.tab.incognito);
   if (incognito && !settings.captureIncognito) return { ok: false, error: 'incognito' };
@@ -628,6 +629,33 @@ async function captureLink(msg, sender) {
     announce(r, filename || nameFromUrl(url));
   } else {
     recordCapture({ url, filename, error: r.error || 'refused' });
+  }
+  return r;
+}
+
+/** A magnet link the user clicked: a torrent for reIDM. Its name is the link's `dn`; its size
+ *  is known only once peers describe it. */
+async function captureMagnet(msg, sender) {
+  if (!settings.capture) return { ok: false, error: 'capture is off' };
+  const incognito = !!(sender.tab && sender.tab.incognito);
+  if (incognito && !settings.captureIncognito) return { ok: false, error: 'incognito' };
+  let dn = null;
+  try {
+    dn = new URLSearchParams(msg.url.slice(msg.url.indexOf('?') + 1)).get('dn');
+  } catch {
+    /* no name, then */
+  }
+  const choice = await maybeAsk({ url: msg.url, filename: dn || 'torrent', sizeNote: 'known once peers describe the torrent', probe: false });
+  if (choice.action === 'cancel') return { ok: true, cancelled: true };
+  // The name is the torrent's own; an edited one is not sent, as reIDM names it from the torrent.
+  const r = await send({ url: msg.url, referer: msg.referer || undefined, later: choice.action === 'later' });
+  choice.report(r);
+  if (r.ok) {
+    recordCapture({ url: msg.url, filename: dn || 'torrent', outcome: r.outcome, id: r.id });
+    badge('✓', '#2ea053', 2500);
+    announce(r, dn || 'the torrent');
+  } else {
+    recordCapture({ url: msg.url, filename: dn || 'torrent', error: r.error || 'refused' });
   }
   return r;
 }

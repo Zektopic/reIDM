@@ -93,6 +93,23 @@ pub struct Item {
     /// What a running download is busy with ("looking up the video"), when progress can't say.
     #[serde(default)]
     pub note: Option<String>,
+    /// A torrent's files, peers, and what it has shared.
+    #[serde(default)]
+    pub torrent: Option<reidm_core::TorrentStatus>,
+}
+
+impl Item {
+    /// Uploaded divided by size: how much of its own size a torrent has shared.
+    pub fn ratio(&self) -> Option<f64> {
+        let t = self.torrent.as_ref()?;
+        let size = self.size.filter(|s| *s > 0)?;
+        Some(t.uploaded as f64 / size as f64)
+    }
+
+    /// A finished torrent that is sharing.
+    pub fn seeding(&self) -> bool {
+        self.status == Status::Done && self.torrent.as_ref().is_some_and(|t| t.seeding)
+    }
 }
 
 impl Item {
@@ -248,6 +265,14 @@ pub struct Settings {
     pub schedule: Schedule,
     #[serde(default)]
     pub folders: Folders,
+    #[serde(default)]
+    pub seed_ratio: f64,
+    #[serde(default)]
+    pub upload_limit: u64,
+    #[serde(default)]
+    pub torrent_port: u16,
+    #[serde(default)]
+    pub torrent_dht: bool,
 }
 
 /// Where each type of file goes, as the service reports it.

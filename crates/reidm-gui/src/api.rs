@@ -21,6 +21,8 @@ pub struct Snapshot {
     pub items: Vec<Item>,
     /// Per-item transfer rate, sampled by the poller (the API has only a byte counter).
     pub rates: std::collections::HashMap<u64, f64>,
+    /// Per-torrent upload rate, sampled the same way from what each has shared.
+    pub up_rates: std::collections::HashMap<u64, f64>,
     pub total_rate: f64,
     pub connected: bool,
     /// Set when a command failed, so the UI can show it.
@@ -151,6 +153,7 @@ impl Api {
             std::thread::spawn(move || {
                 let agent = agent(Duration::from_secs(5));
                 let mut history: std::collections::HashMap<u64, std::collections::VecDeque<(Instant, u64)>> = Default::default();
+                let mut up_history: std::collections::HashMap<u64, std::collections::VecDeque<(Instant, u64)>> = Default::default();
                 let mut service = Service::default();
                 let mut ticks: u64 = 0;
                 loop {
@@ -192,7 +195,26 @@ impl Api {
                                     }
                                 }
                                 history.retain(|id, _| items.iter().any(|i| i.id == *id));
-                                Snapshot { items, rates, total_rate: total, connected: true, last_error: None, service: service.clone() }
+                                let mut up_rates = std::collections::HashMap::new();
+                                for it in &items {
+                                    let Some(up) = it.torrent.as_ref().map(|t| t.uploaded) else { continue };
+                                    let h = up_history.entry(it.id).or_default();
+                                    if h.back().is_some_and(|(_, d)| *d > up) {
+                                        h.clear();
+                                    }
+                                    h.push_back((now, up));
+                                    while h.len() > 2 && h.front().is_some_and(|(t, _)| now.duration_since(*t) > RATE_WINDOW) {
+                                        h.pop_front();
+                                    }
+                                    if let Some((t0, d0)) = h.front() {
+                                        let dt = now.duration_since(*t0).as_secs_f64();
+                                        if dt > 0.25 && up > *d0 {
+                                            up_rates.insert(it.id, (up - d0) as f64 / dt);
+                                        }
+                                    }
+                                }
+                                up_history.retain(|id, _| items.iter().any(|i| i.id == *id));
+                                Snapshot { items, rates, up_rates, total_rate: total, connected: true, last_error: None, service: service.clone() }
                             }
                             Err(e) => {
                                 token = None; // daemon restarted; its token is new
@@ -437,6 +459,21 @@ impl Api {
     /// The videos of a playlist. Slow the first time: the service fetches yt-dlp.
     pub fn playlist_async(&self, url: &str) -> Receiver<Result<reidm_core::media::Playlist, String>> {
         self.post_async("/api/media/playlist", serde_json::json!({ "url": url }), Duration::from_secs(600))
+    }
+
+    /// What a torrent holds. For a magnet link this waits for peers to describe it.
+    pub fn torrent_inspect_async(&self, url: Option<String>, data: Option<String>) -> Receiver<Result<reidm_core::TorrentInfo, String>> {
+        self.post_async("/api/torrent/inspect", serde_json::json!({ "url": url, "data": data }), Duration::from_secs(180))
+    }
+
+    /// Add a torrent: by link, or a `.torrent` file's bytes (base64); `files` picks some.
+    pub fn add_torrent_async(&self, url: &str, data: Option<String>, files: Option<Vec<usize>>, later: bool) -> Receiver<Result<(), String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let inner: Receiver<Result<serde_json::Value, String>> = self.post_async("/api/downloads", serde_json::json!({ "url": url, "later": later, "torrent": { "files": files, "data": data } }), Duration::from_secs(60));
+        std::thread::spawn(move || {
+            let _ = tx.send(inner.recv().unwrap_or_else(|_| Err("no answer".into())).map(|_| ()));
+        });
+        rx
     }
 
     /// The heights and codecs one video comes in.

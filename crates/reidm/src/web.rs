@@ -135,11 +135,41 @@ struct AddBody {
     /// Fetch the video on the page `url` through yt-dlp, in this format.
     #[serde(default)]
     media: Option<Media>,
+    /// A torrent: `url` is a magnet link or a `.torrent` address — or empty, with the
+    /// `.torrent` file itself in `data`.
+    #[serde(default)]
+    torrent: Option<TorrentBody>,
+}
+
+#[derive(Deserialize)]
+struct TorrentBody {
+    /// The files to download, by index; all when missing.
+    #[serde(default)]
+    files: Option<Vec<usize>>,
+    /// A `.torrent` file, base64.
+    #[serde(default)]
+    data: Option<String>,
+}
+
+fn decode_torrent(data: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| format!("the .torrent file is not base64: {e}"))
 }
 
 async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Response {
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
+    }
+    // A .torrent file sent whole.
+    if let Some(data) = b.torrent.as_ref().and_then(|t| t.data.as_deref()) {
+        let bytes = match decode_torrent(data) {
+            Ok(b) => b,
+            Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        };
+        return match app.mgr.add_torrent_file(&bytes, b.torrent.as_ref().and_then(|t| t.files.clone()), b.later) {
+            Ok(o) => Json(serde_json::json!({ "id": o.id, "outcome": o.outcome })).into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+        };
     }
     let req = Request {
         url: b.url.trim().into(),
@@ -149,6 +179,7 @@ async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Re
         user_agent: b.user_agent,
         dir: b.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from),
         media: b.media,
+        torrent: b.torrent.as_ref().map(|t| reidm_core::TorrentRequest { files: t.files.clone(), ..Default::default() }),
     };
     match app.mgr.add_with(req, AddOptions { later: b.later, ..Default::default() }) {
         Ok(o) => Json(serde_json::json!({ "id": o.id, "outcome": o.outcome })).into_response(),
@@ -173,6 +204,11 @@ async fn act(State(app): State<App>, h: HeaderMap, Path((id, what)): Path<(u64, 
         }
         "restart" => {
             if let Err(e) = app.mgr.restart(id).await {
+                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
+            }
+        }
+        "seed" | "stop-seeding" => {
+            if let Err(e) = app.mgr.set_seeding(id, what == "seed").await {
                 return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
             }
         }
@@ -433,6 +469,7 @@ async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) ->
         user_agent: b.user_agent.filter(|u| !u.is_empty()),
         dir: None,
         media: b.media,
+        torrent: None,
     };
 
     // A download waiting for a fresh address takes the next link that is the same file.
@@ -495,6 +532,7 @@ async fn ext_add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtBa
             user_agent: b.user_agent.clone().filter(|u| !u.is_empty()),
             dir: None,
             media: None,
+            torrent: None,
         })
         .collect();
     let results: Vec<serde_json::Value> = app
@@ -562,6 +600,7 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
         user_agent: e.user_agent,
         filename: if single { b.filename.clone() } else { None },
         media: None,
+        torrent: None,
     }));
     let mut results: Vec<serde_json::Value> = app
         .mgr
@@ -600,6 +639,31 @@ async fn media_playlist(State(app): State<App>, h: HeaderMap, Json(b): Json<UrlB
     }
     match app.mgr.playlist(&b.url).await {
         Ok(p) => Json(p).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct InspectBody {
+    #[serde(default)]
+    url: Option<String>,
+    /// A `.torrent` file, base64.
+    #[serde(default)]
+    data: Option<String>,
+}
+
+/// What a torrent holds, to choose its files before adding it. For a magnet link this waits for
+/// a peer to describe it (up to two minutes).
+async fn torrent_inspect(State(app): State<App>, h: HeaderMap, Json(b): Json<InspectBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let bytes = match b.data.as_deref().map(decode_torrent).transpose() {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    match app.mgr.inspect_torrent(b.url.as_deref(), bytes).await {
+        Ok(i) => Json(i).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
 }
@@ -647,6 +711,14 @@ struct SettingsBody {
     /// The temporary folder; empty is the default.
     #[serde(default)]
     temp_dir: Option<String>,
+    #[serde(default)]
+    seed_ratio: Option<f64>,
+    #[serde(default)]
+    upload_limit: Option<u64>,
+    #[serde(default)]
+    torrent_port: Option<u16>,
+    #[serde(default)]
+    torrent_dht: Option<bool>,
 }
 
 /// The folders, as the window's Folders tab and the extension's dialog show them: each
@@ -705,6 +777,10 @@ async fn settings(State(app): State<App>, h: HeaderMap) -> Response {
         "limit_enabled": s.limit_enabled,
         "schedule": s.schedule,
         "folders": folders_json(&app),
+        "seed_ratio": s.seed_ratio,
+        "upload_limit": s.upload_limit,
+        "torrent_port": s.torrent_port,
+        "torrent_dht": s.torrent_dht,
     }))
     .into_response()
 }
@@ -724,6 +800,10 @@ async fn set_settings(State(app): State<App>, h: HeaderMap, Json(b): Json<Settin
         sort_by_category: b.sort_by_category,
         category_dirs: b.category_dirs.map(|m| m.into_iter().filter(|(_, d)| !d.trim().is_empty()).map(|(c, d)| (c, std::path::PathBuf::from(d.trim()))).collect()),
         temp_dir: b.temp_dir.map(|d| std::path::PathBuf::from(d.trim())),
+        seed_ratio: b.seed_ratio,
+        upload_limit: b.upload_limit,
+        torrent_port: b.torrent_port,
+        torrent_dht: b.torrent_dht,
     };
     match app.mgr.update_settings(patch) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -802,6 +882,7 @@ pub async fn serve(mgr: Manager, idm_port: Arc<std::sync::atomic::AtomicBool>) -
         .route("/api/downloads/batch", post(add_batch))
         .route("/api/media/playlist", post(media_playlist))
         .route("/api/media/info", post(media_info))
+        .route("/api/torrent/inspect", post(torrent_inspect))
         .route("/api/grab", post(grab))
         .route("/ext/ping", get(ext_ping).options(ext_preflight))
         .route("/ext/add", post(ext_add).options(ext_preflight))

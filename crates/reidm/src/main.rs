@@ -56,7 +56,7 @@ enum Cmd {
     },
     /// Queue one or more URLs in the running daemon. Re-adding a URL resumes it.
     Add {
-        /// One or more addresses.
+        /// One or more addresses: web links, magnet links, or `.torrent` files on disk.
         #[arg(required = true)]
         urls: Vec<String>,
         /// Referer header to send with every address.
@@ -377,6 +377,11 @@ async fn main() -> Result<()> {
         Cmd::Daemon { connections, dir, no_idm_port } => {
             let mgr = Manager::open(&default_data_dir(), dir.unwrap_or_else(default_download_dir), connections)?;
             mgr.spawn_scheduler();
+            // Finished torrents go on sharing where they left off.
+            {
+                let m = mgr.clone();
+                tokio::spawn(async move { m.resume_seeding().await });
+            }
             // Keep browser integration current: a fresh copy of the extension for "Load unpacked",
             // and the native host the extension uses to start reIDM. Both are idempotent and only
             // write what changed, so doing it at every start is what keeps them right after an
@@ -483,6 +488,22 @@ async fn main() -> Result<()> {
             if output.is_some() && urls.len() > 1 {
                 bail!("--output only makes sense for a single URL");
             }
+            // `.torrent` files on this disk go to the service whole; the rest are addresses.
+            let (files, urls): (Vec<String>, Vec<String>) = urls.into_iter().partition(|u| u.to_ascii_lowercase().ends_with(".torrent") && std::path::Path::new(u).is_file());
+            let mut results = Vec::new();
+            for f in files {
+                use base64::Engine;
+                let data = base64::engine::general_purpose::STANDARD.encode(std::fs::read(&f).with_context(|| format!("cannot read {f}"))?);
+                let body = serde_json::json!({ "url": "", "later": later, "torrent": { "data": data } });
+                results.push(match api_post("/api/downloads", body).await {
+                    Ok(v) => serde_json::json!({ "url": f, "outcome": v["outcome"] }),
+                    Err(e) => serde_json::json!({ "url": f, "error": format!("{e:#}") }),
+                });
+            }
+            if urls.is_empty() {
+                report_batch(&serde_json::json!({ "results": results }));
+                return Ok(());
+            }
             // `referer` applies to the whole batch; `output` (a file name) is only meaningful
             // for one URL.
             let mut body = serde_json::json!({ "urls": urls, "later": later });
@@ -492,7 +513,10 @@ async fn main() -> Result<()> {
             if let Some(o) = output {
                 body["filename"] = serde_json::Value::String(o);
             }
-            let v = api_post("/api/downloads/batch", body).await?;
+            let mut v = api_post("/api/downloads/batch", body).await?;
+            if let Some(r) = v["results"].as_array_mut() {
+                r.extend(results);
+            }
             report_batch(&v);
         }
         Cmd::Batch { pattern, from, to, width, dry_run, later } => {

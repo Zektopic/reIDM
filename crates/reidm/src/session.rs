@@ -107,6 +107,7 @@ impl Session {
             filename: nonempty(K_NAME),
             dir: None,
             media: None,
+            torrent: None,
         })
     }
 

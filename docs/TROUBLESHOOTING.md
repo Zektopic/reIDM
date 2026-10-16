@@ -102,6 +102,14 @@ When YouTube changes something, yt-dlp usually follows within days. reIDM checks
 yt-dlp once a day; to force it, delete the `tools` folder in the
 [data folder](USER_GUIDE.md#where-reidm-keeps-things).
 
+**A torrent stays at *Looking for peers*.** No one is sharing it right now, or none can be
+reached: a magnet link needs the DHT (Options › Torrents), and a firewall may be blocking
+reIDM — allow it when Windows asks. An old torrent may simply have no seeders left.
+
+**A torrent downloads, but uploads little.** Others can't connect to you: allow reIDM through the
+firewall, and check that the listening port (Options › Torrents) is forwarded by your router —
+reIDM asks routers that support it (UPnP).
+
 **Resume capability: No.** The server doesn't serve byte ranges. The download uses one connection,
 and stopping it means starting again. Nothing in reIDM can change that.
 
