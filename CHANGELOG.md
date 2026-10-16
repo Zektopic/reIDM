@@ -19,6 +19,14 @@
   tracker's work — and added as the torrent it describes.
 * `reidm add magnet:…` and `reidm add file.torrent`; `POST /api/torrent/inspect`, `seed` and
   `stop-seeding` actions, and `torrent` on downloads in the API.
+## 0.6.1
+
+### Fixed
+
+* **A video download begun by reIDM 0.5.0 failed when resumed** with "fragment 1 not found,
+  unable to continue": 0.5.0 fetched videos over one connection, and since 0.5.1 yt-dlp resumes
+  in pieces, which can't continue such a file. reIDM now carries it on the way it began, keeping
+  what was already downloaded.
 
 ## 0.6.0
 
