@@ -667,177 +667,190 @@ impl Manager {
             std::fs::create_dir_all(&work)?;
         }
 
-        let mut cmd = tokio::process::Command::new(&ytdlp);
-        // As many connections as a normal download: yt-dlp fetches a format's pieces in
-        // parallel. For YouTube that needs its formats treated as pieces ("dashy"); one
-        // connection is throttled, and a long one is often cut off with a 403.
-        let connections = self.0.settings.lock().unwrap().connections.clamp(1, 16);
-        cmd.args(["--concurrent-fragments", &connections.to_string()]);
-        if page.host_str().is_some_and(|h| h == "youtu.be" || h == "youtube.com" || h.ends_with(".youtube.com")) {
-            cmd.args(["--extractor-args", "youtube:formats=dashy"]);
-        }
-        cmd.args(["--newline", "--no-colors", "--no-playlist", "--continue", "--no-mtime", "--progress", "--encoding", "utf-8"])
-            .args(["--progress-template", "download:REIDM-PROGRESS %(progress.downloaded_bytes)s %(progress.total_bytes)s %(info.filesize,info.filesize_approx)s %(progress.total_bytes_estimate)s %(info.format_id)s"])
-            .args(["--print", "before_dl:REIDM-NAME %(filename)s"])
-            // The whole download's size, video and audio together, known before either starts.
-            .args(["--print", "before_dl:REIDM-SIZE %(filesize,filesize_approx)s"])
-            .args(["--print", "after_move:REIDM-FILE %(filepath)s"])
-            .args(["-f", &media.format])
-            .args(["--merge-output-format", "mp4/webm/mkv"]);
-        if beside {
-            cmd.arg("-o").arg(dir.join(&name));
-        } else {
-            cmd.arg("-P").arg(format!("home:{}", dir.display())).arg("-P").arg(format!("temp:{}", work.display())).arg("-o").arg(&name);
-        }
-        if let Some(f) = &ffmpeg {
-            cmd.arg("--ffmpeg-location").arg(f);
-        }
-        if let Some(js) = &js {
-            cmd.args(["--js-runtimes", js]);
-        }
-        if let Some(a) = media.audio.as_deref().filter(|a| AUDIO_FORMATS.contains(a)) {
-            cmd.args(["-x", "--audio-format", a]);
-        }
-        let global = self.0.settings.lock().unwrap().effective_limit();
-        let rate = match (item.speed_limit.unwrap_or(0), global) {
-            (0, g) => g,
-            (o, 0) => o,
-            (o, g) => o.min(g),
-        };
-        if rate > 0 {
-            cmd.args(["--limit-rate", &rate.to_string()]);
-        }
-        if let Some(ua) = &item.request.user_agent {
-            cmd.args(["--user-agent", ua]);
-        }
-        let cookies = item.request.cookie.as_deref().filter(|c| !c.is_empty()).map(|c| {
-            let p = data_dir.join(format!("cookies-{id}.txt"));
-            let _ = std::fs::write(&p, cookie_file(c, &page));
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-            }
-            p
-        });
-        if let Some(p) = &cookies {
-            cmd.arg("--cookies").arg(p);
-        }
-        // `--` so an address can never be read as an option.
-        cmd.arg("--").arg(page.as_str());
-        cmd.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1");
-        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000);
-        #[cfg(unix)]
-        cmd.process_group(0);
-
-        let mut child = cmd.spawn().with_context(|| format!("cannot run {}", ytdlp.display()))?;
-        let mut out = tokio::io::BufReader::new(child.stdout.take().context("no stdout")?).lines();
-        let err_lines = {
-            let mut err = tokio::io::BufReader::new(child.stderr.take().context("no stderr")?).lines();
-            tokio::spawn(async move {
-                let mut keep: Vec<String> = Vec::new();
-                while let Ok(Some(l)) = err.next_line().await {
-                    tracing::debug!("yt-dlp: {l}");
-                    keep.push(l);
-                    if keep.len() > 40 {
-                        keep.remove(0);
-                    }
+        // In pieces over several connections first; once more over one, if the partial file was
+        // begun that way and yt-dlp can't continue it in pieces.
+        for pieces in [true, false] {
+            let mut cmd = tokio::process::Command::new(&ytdlp);
+            // As many connections as a normal download: yt-dlp fetches a format's pieces in
+            // parallel. For YouTube that needs its formats treated as pieces ("dashy"); one
+            // connection is throttled, and a long one is often cut off with a 403.
+            let connections = self.0.settings.lock().unwrap().connections.clamp(1, 16);
+            if pieces {
+                cmd.args(["--concurrent-fragments", &connections.to_string()]);
+                if page.host_str().is_some_and(|h| h == "youtu.be" || h == "youtube.com" || h.ends_with(".youtube.com")) {
+                    cmd.args(["--extractor-args", "youtube:formats=dashy"]);
                 }
-                keep
-            })
-        };
-
-        let mut parts: HashMap<String, (u64, Option<u64>)> = HashMap::new();
-        let mut whole: Option<u64> = None;
-        let mut final_path: Option<PathBuf> = None;
-        let mut last_save = Instant::now();
-        let mut stopped = false;
-        loop {
-            // Checked on every pass: yt-dlp reports progress several times a second, which
-            // would keep resetting a timer that only looked when the output went quiet.
-            if live.cancel.load(Ordering::SeqCst) {
-                stopped = true;
-                kill_tree(&mut child).await;
-                break;
             }
-            tokio::select! {
-                line = out.next_line() => match line {
-                    Ok(Some(l)) => {
-                        if let Some(p) = parse_progress(&l) {
-                            if parts.is_empty() {
-                                self.set_note(id, None);
-                            }
-                            let complete = p.total.is_some_and(|t| p.done >= t);
-                            parts.insert(p.format, (p.done, p.total));
-                            // The last piece in: what follows is ffmpeg joining the two.
-                            if complete && parts.len() >= 2 && parts.values().all(|(d, t)| t.is_some_and(|t| *d >= t)) {
-                                self.set_note(id, Some("joining video and audio"));
-                            }
-                            let done: u64 = parts.values().map(|v| v.0).sum();
-                            // The size announced up front, unless the parts turn out bigger.
-                            let size = match (whole, parts.values().map(|v| v.1).sum::<Option<u64>>()) {
-                                (Some(w), Some(p)) => Some(w.max(p)),
-                                (w, p) => w.or(p),
-                            };
-                            live.progress.store(done, Ordering::Relaxed);
-                            if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
-                                it.downloaded = done;
-                                if size.is_some() {
-                                    it.size = size;
+            cmd.args(["--newline", "--no-colors", "--no-playlist", "--continue", "--no-mtime", "--progress", "--encoding", "utf-8"])
+                .args(["--progress-template", "download:REIDM-PROGRESS %(progress.downloaded_bytes)s %(progress.total_bytes)s %(info.filesize,info.filesize_approx)s %(progress.total_bytes_estimate)s %(info.format_id)s"])
+                .args(["--print", "before_dl:REIDM-NAME %(filename)s"])
+                // The whole download's size, video and audio together, known before either starts.
+                .args(["--print", "before_dl:REIDM-SIZE %(filesize,filesize_approx)s"])
+                .args(["--print", "after_move:REIDM-FILE %(filepath)s"])
+                .args(["-f", &media.format])
+                .args(["--merge-output-format", "mp4/webm/mkv"]);
+            if beside {
+                cmd.arg("-o").arg(dir.join(&name));
+            } else {
+                cmd.arg("-P").arg(format!("home:{}", dir.display())).arg("-P").arg(format!("temp:{}", work.display())).arg("-o").arg(&name);
+            }
+            if let Some(f) = &ffmpeg {
+                cmd.arg("--ffmpeg-location").arg(f);
+            }
+            if let Some(js) = &js {
+                cmd.args(["--js-runtimes", js]);
+            }
+            if let Some(a) = media.audio.as_deref().filter(|a| AUDIO_FORMATS.contains(a)) {
+                cmd.args(["-x", "--audio-format", a]);
+            }
+            let global = self.0.settings.lock().unwrap().effective_limit();
+            let rate = match (item.speed_limit.unwrap_or(0), global) {
+                (0, g) => g,
+                (o, 0) => o,
+                (o, g) => o.min(g),
+            };
+            if rate > 0 {
+                cmd.args(["--limit-rate", &rate.to_string()]);
+            }
+            if let Some(ua) = &item.request.user_agent {
+                cmd.args(["--user-agent", ua]);
+            }
+            let cookies = item.request.cookie.as_deref().filter(|c| !c.is_empty()).map(|c| {
+                let p = data_dir.join(format!("cookies-{id}.txt"));
+                let _ = std::fs::write(&p, cookie_file(c, &page));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                }
+                p
+            });
+            if let Some(p) = &cookies {
+                cmd.arg("--cookies").arg(p);
+            }
+            // `--` so an address can never be read as an option.
+            cmd.arg("--").arg(page.as_str());
+            cmd.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1");
+            cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+            #[cfg(windows)]
+            cmd.creation_flags(0x0800_0000);
+            #[cfg(unix)]
+            cmd.process_group(0);
+
+            let mut child = cmd.spawn().with_context(|| format!("cannot run {}", ytdlp.display()))?;
+            let mut out = tokio::io::BufReader::new(child.stdout.take().context("no stdout")?).lines();
+            let err_lines = {
+                let mut err = tokio::io::BufReader::new(child.stderr.take().context("no stderr")?).lines();
+                tokio::spawn(async move {
+                    let mut keep: Vec<String> = Vec::new();
+                    while let Ok(Some(l)) = err.next_line().await {
+                        tracing::debug!("yt-dlp: {l}");
+                        keep.push(l);
+                        if keep.len() > 40 {
+                            keep.remove(0);
+                        }
+                    }
+                    keep
+                })
+            };
+
+            let mut parts: HashMap<String, (u64, Option<u64>)> = HashMap::new();
+            let mut whole: Option<u64> = None;
+            let mut final_path: Option<PathBuf> = None;
+            let mut last_save = Instant::now();
+            let mut stopped = false;
+            loop {
+                // Checked on every pass: yt-dlp reports progress several times a second, which
+                // would keep resetting a timer that only looked when the output went quiet.
+                if live.cancel.load(Ordering::SeqCst) {
+                    stopped = true;
+                    kill_tree(&mut child).await;
+                    break;
+                }
+                tokio::select! {
+                    line = out.next_line() => match line {
+                        Ok(Some(l)) => {
+                            if let Some(p) = parse_progress(&l) {
+                                if parts.is_empty() {
+                                    self.set_note(id, None);
                                 }
-                            }
-                            if last_save.elapsed() > Duration::from_secs(3) {
-                                self.save();
-                                last_save = Instant::now();
-                            }
-                        } else if let Some(f) = l.strip_prefix("REIDM-FILE ") {
-                            final_path = Some(PathBuf::from(f.trim()));
-                        } else if let Some(n) = l.strip_prefix("REIDM-SIZE ") {
-                            whole = n.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0).map(|v| v as u64);
-                            if let (Some(w), Some(it)) = (whole, self.0.db.lock().unwrap().items.get_mut(&id)) {
-                                it.size = Some(w);
-                            }
-                        } else if let Some(f) = l.strip_prefix("REIDM-NAME ") {
-                            // Where it is going, known before the first byte: the list shows the
-                            // real name at once, and removing the download finds its pieces.
-                            let p = PathBuf::from(f.trim());
-                            if p.is_absolute() {
+                                let complete = p.total.is_some_and(|t| p.done >= t);
+                                parts.insert(p.format, (p.done, p.total));
+                                // The last piece in: what follows is ffmpeg joining the two.
+                                if complete && parts.len() >= 2 && parts.values().all(|(d, t)| t.is_some_and(|t| *d >= t)) {
+                                    self.set_note(id, Some("joining video and audio"));
+                                }
+                                let done: u64 = parts.values().map(|v| v.0).sum();
+                                // The size announced up front, unless the parts turn out bigger.
+                                let size = match (whole, parts.values().map(|v| v.1).sum::<Option<u64>>()) {
+                                    (Some(w), Some(p)) => Some(w.max(p)),
+                                    (w, p) => w.or(p),
+                                };
+                                live.progress.store(done, Ordering::Relaxed);
                                 if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
-                                    it.path = p;
+                                    it.downloaded = done;
+                                    if size.is_some() {
+                                        it.size = size;
+                                    }
+                                }
+                                if last_save.elapsed() > Duration::from_secs(3) {
+                                    self.save();
+                                    last_save = Instant::now();
+                                }
+                            } else if let Some(f) = l.strip_prefix("REIDM-FILE ") {
+                                final_path = Some(PathBuf::from(f.trim()));
+                            } else if let Some(n) = l.strip_prefix("REIDM-SIZE ") {
+                                whole = n.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0).map(|v| v as u64);
+                                if let (Some(w), Some(it)) = (whole, self.0.db.lock().unwrap().items.get_mut(&id)) {
+                                    it.size = Some(w);
+                                }
+                            } else if let Some(f) = l.strip_prefix("REIDM-NAME ") {
+                                // Where it is going, known before the first byte: the list shows the
+                                // real name at once, and removing the download finds its pieces.
+                                let p = PathBuf::from(f.trim());
+                                if p.is_absolute() {
+                                    if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
+                                        it.path = p;
+                                    }
                                 }
                             }
                         }
-                    }
-                    _ => break,
-                },
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                        _ => break,
+                    },
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
             }
+            let status = child.wait().await;
+            // A process yt-dlp started could still hold its stderr open; don't wait on it forever.
+            let stderr = tokio::time::timeout(Duration::from_secs(3), err_lines).await.ok().and_then(Result::ok).unwrap_or_default();
+            if let Some(p) = &cookies {
+                let _ = std::fs::remove_file(p);
+            }
+            if stopped {
+                return Ok(false);
+            }
+            let status = status?;
+            if !status.success() {
+                // Begun by reIDM 0.5.0 over one connection, its partial file can't be continued in
+                // pieces ("fragment 1 not found, unable to continue"): carry on the way it began.
+                if pieces && stderr.iter().any(|l| l.contains("fragment") && l.contains("not found")) {
+                    tracing::info!("download {id} began over one connection; continuing it that way");
+                    continue;
+                }
+                bail!("{}", explain(&stderr, status.code()));
+            }
+            let path = final_path.filter(|p| p.is_file()).context("yt-dlp finished but did not say where it saved the file")?;
+            let _ = std::fs::remove_dir_all(&work);
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            live.progress.store(len, Ordering::Relaxed);
+            if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
+                it.path = path;
+                it.size = Some(len);
+                it.downloaded = len;
+            }
+            return Ok(true);
         }
-        let status = child.wait().await;
-        // A process yt-dlp started could still hold its stderr open; don't wait on it forever.
-        let stderr = tokio::time::timeout(Duration::from_secs(3), err_lines).await.ok().and_then(Result::ok).unwrap_or_default();
-        if let Some(p) = &cookies {
-            let _ = std::fs::remove_file(p);
-        }
-        if stopped {
-            return Ok(false);
-        }
-        let status = status?;
-        if !status.success() {
-            bail!("{}", explain(&stderr, status.code()));
-        }
-        let path = final_path.filter(|p| p.is_file()).context("yt-dlp finished but did not say where it saved the file")?;
-        let _ = std::fs::remove_dir_all(&work);
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        live.progress.store(len, Ordering::Relaxed);
-        if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
-            it.path = path;
-            it.size = Some(len);
-            it.downloaded = len;
-        }
-        Ok(true)
+        unreachable!("the second attempt returns or fails")
     }
 }
 
