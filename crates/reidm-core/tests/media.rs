@@ -22,6 +22,7 @@ done
 printf '%s' "$temp" > "$here/temp.txt"
 file=$(printf '%s' "$out" | sed 's/%(ext)s/mp4/; s/%(title)\.150B/Clip/; s/%(id)s/abc/; s/%(height&{}p|audio)s/360p/')
 case "$(cat "$here/mode" 2>/dev/null)" in
+  oldpart) case " $* " in *" --concurrent-fragments "*) echo "ERROR: fragment 1 not found, unable to continue" >&2; exit 1 ;; esac ;;
   fail) echo "WARNING: [youtube] something minor" >&2; echo "ERROR: [youtube] abc: Video unavailable" >&2; exit 1 ;;
   slow) echo "REIDM-NAME $file"; echo "REIDM-SIZE 650000.0"
         i=0; while [ $i -lt 600 ]; do echo "REIDM-PROGRESS $((i * 1000)) 600000 NA NA 18"; i=$((i + 1)); sleep 0.05; done ;;
@@ -138,4 +139,16 @@ async fn one_page_in_two_formats_is_two_downloads() {
     assert!(m.add(video(&dl, "18 --exec rm")).is_err(), "only a format selector is accepted");
     m.remove(a.id, true);
     m.remove(b.id, true);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_video_begun_over_one_connection_carries_on_that_way() {
+    // reIDM 0.5.0 fetched videos over one connection; yt-dlp can't continue such a partial file
+    // in pieces, and says "fragment 1 not found". The download must carry on, not fail.
+    let (m, dl, tools) = setup("oldpart", "oldpart");
+    let id = m.add(video(&dl, "18")).unwrap();
+    let it = wait_for(&m, id, |s| matches!(s, Status::Done | Status::Failed(_))).await;
+    assert_eq!(it.status, Status::Done, "{:?}", it.status);
+    let args = std::fs::read_to_string(tools.join("args.txt")).unwrap();
+    assert!(!args.lines().any(|a| a == "--concurrent-fragments"), "the second attempt is over one connection");
 }
