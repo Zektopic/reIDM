@@ -3,10 +3,19 @@ on: [push, pull_request]
 jobs:
   test:
     strategy:
-      matrix: { os: [ubuntu-22.04, windows-2022, macos-14] }
-    runs-on: ${{ matrix.os }}
+      matrix:
+        include:
+          - os: linux
+            runner: [self-hosted, manupa-hnx]
+          - os: windows
+            runner: windows-2022
+          - os: macos
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Configure Git safe directory
+        run: git config --global --add safe.directory '*'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # The desktop app links against the windowing and GL stack, which the runner images
