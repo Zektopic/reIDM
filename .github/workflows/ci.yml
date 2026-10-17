@@ -20,6 +20,8 @@ jobs:
       - name: Configure Git safe directory
         run: git config --global --add safe.directory '*'
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       # The desktop app links against the windowing and GL stack, which the runner images
       # do not install by default.
