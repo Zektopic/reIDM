@@ -9,9 +9,11 @@ permissions:
 
 jobs:
   linux-deb:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, manupa-hnx]
     steps:
       - uses: actions/checkout@v4
+      - name: Configure Git safe directory
+        run: git config --global --add safe.directory '*'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Linux GUI build dependencies
