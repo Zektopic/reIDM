@@ -9,6 +9,34 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-20 — Four reviews, and the plan they set (0.8.0, in progress)
+
+**Context.** Before adding more features, the code was reviewed in four independent passes:
+the download engine, the service and window, the extension, and what IDM, FDM and qBittorrent
+offer that reIDM doesn't. The reports are kept in [reviews/2026-10](reviews/2026-10/) so later
+work can see what was found, not only what was changed.
+**What they found that matters most.**
+- *Data integrity:* the engine counted bytes as downloaded when tokio accepted them, not when
+  they were written, and the file was pre-sized, so the "is the data on disk?" check on resume
+  could never fail — a crash or a full disk could resume past a hole of zeros. `downloads.json`
+  was written without fsync, and a damaged one either blocked start-up or loaded as empty.
+- *Scale:* the window fetched and parsed the whole list every 300 ms and broke beyond about
+  7,000 downloads (a 10 MB response limit); a batch add rewrote the whole list once per link.
+- *Security:* the IDM-protocol WebSocket accepted remove-and-delete-files from any local process;
+  `/ext/*` had no `Host` check (DNS rebinding).
+- *Extension:* the popup's "best quality" YouTube row always failed; a held browser download
+  could be lost if the dialog or the worker went away at the wrong moment.
+- *Gaps:* tray and close-to-tray, "when done" actions, keeping the PC awake, proxy and site
+  logins, speed modes, user categories and queues, clipboard and drag-and-drop.
+**Decision.** Fix the reviews' critical and high findings first (correctness before features),
+in four parallel streams that own separate files: engine core, engine modules
+(torrent/yt-dlp/tools), service and window, extension. Then add the most-used missing features
+and simplify Options: everyday settings in plain tabs, everything else behind an *Advanced
+settings* switch, and one *Performance* choice (Light / Balanced / Maximum) instead of a dozen
+numbers for people who don't want to tune.
+**Alternatives.** Features first (rejected: the integrity bug can corrupt files users already
+have); one agent at a time (slower, no benefit, the files don't overlap).
+
 ## 2026-10-20 — Self-hosted CI, and a browser test that finds its own browser
 
 **Context.** Linux CI and the `.deb` release job moved to the self-hosted runner `manupa-hnx`
