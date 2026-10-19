@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 (unreleased)
+## 0.7.0
 
 ### Torrents
 
@@ -19,6 +19,7 @@
   tracker's work — and added as the torrent it describes.
 * `reidm add magnet:…` and `reidm add file.torrent`; `POST /api/torrent/inspect`, `seed` and
   `stop-seeding` actions, and `torrent` on downloads in the API.
+
 ## 0.6.1
 
 ### Fixed
