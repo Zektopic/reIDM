@@ -1,0 +1,66 @@
+# Working on reIDM — a guide for agents and new contributors
+
+reIDM is a cross-platform download manager in Rust: a background **service** (`reidm daemon`)
+owns every download; a native **window** (`reidm-gui`, egui) and a **CLI** talk to it over a
+local HTTP API; a Chromium **extension** hands it the browser's downloads. It also speaks the
+original IDM extension's protocol. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before
+changing anything structural, and **[docs/DEVLOG.md](docs/DEVLOG.md) for why things are the way
+they are** — add an entry there for every change that involves a decision.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `crates/reidm-core` | the engine: segmented HTTP downloads (`lib.rs`), videos through yt-dlp (`media.rs`), torrents through librqbit (`torrent.rs`), categories (`category.rs`), the limiter, scheduler, lists, site grabber, update check |
+| `crates/reidm` | the `reidm` binary: CLI, daemon, HTTP API (`web.rs`), IDM WebSocket protocol (`ws.rs`, `session.rs`), native-host registration (`install.rs`) |
+| `crates/reidm-host` | the native-messaging host the browser starts |
+| `crates/reidm-gui` | the desktop window (`app.rs`), its API client (`api.rs`), playlist and torrent windows |
+| `crates/reidm-proto` | the IDM protocol's binary messages |
+| `extension/` | reIDM's own MV3 extension |
+| `docs/` | user and developer documentation — keep it true when behaviour changes |
+| `packaging/`, `.github/workflows/` | installers and CI. Linux CI and the `.deb` build run on the self-hosted runner `manupa-hnx`; Windows and macOS on GitHub's |
+| `decomp/`, `samples/` | reverse-engineering material; `samples/` is untrusted vendor data (read-only, `python3 -I`) |
+
+## Before you call something done
+
+```sh
+cargo test --workspace --locked                                   # ~105 tests, all offline
+cargo clippy --workspace --all-targets --locked -- -D warnings    # also with --target x86_64-pc-windows-gnu
+xvfb-run -a node tools/capture-test.mjs                           # the real-browser suite (50 checks)
+REIDM_PROMPT=1 xvfb-run -a node tools/capture-test.mjs            # with "Ask where to save" on
+REIDM_ONLY_GRABBER=1 xvfb-run -a node tools/capture-test.mjs      # the resource grabber
+```
+
+The browser suite needs a Chromium (`npx playwright install chromium`; it finds the newest) and
+ports 61001/61002 free — stop any running reIDM first. For macOS lint without a Mac:
+`CC_aarch64_apple_darwin=true AR_aarch64_apple_darwin=true cargo clippy … --target aarch64-apple-darwin`.
+
+Video and torrent features have offline tests (a stand-in yt-dlp shell script in
+`tests/media.rs`; a local librqbit seeder in `tests/torrent.rs`); real-world checks against
+YouTube and the Debian swarm are done by hand and recorded in the devlog.
+
+## House rules
+
+- **Never lose a user's download.** Resume rather than restart; refuse rather than splice two
+  different files; keep partial data when in doubt. Every engine change needs a test that
+  proves this.
+- **The browser must never end up with nobody downloading the file.** If reIDM can't take a
+  download, the browser keeps it.
+- **Simple by default.** New options go behind *Advanced* unless most users need them; defaults
+  must be right for most people.
+- **Explain, don't just fail.** Error messages say what happened and what to do.
+- Comments explain *why*, in full sentences; match the surrounding style. No dead code.
+- Docs, CHANGELOG and DEVLOG change in the same commit as the behaviour.
+- Commits end with the `Co-Authored-By` trailer the repository uses; stage paths explicitly
+  (an untracked `archive-IQ0Adc/` in some checkouts is not ours).
+
+## Traps already met (see the devlog for each)
+
+- `Path::canonicalize` on Windows returns `\\?\C:\…`, which browsers can't launch — strip it
+  for anything handed to another program.
+- Processes started from an elevated session (SSH on Windows is elevated) can't be stopped by the
+  user's normal-rights installer.
+- YouTube needs yt-dlp **with a JavaScript runtime** (Deno); one connection is throttled and cut
+  off, so yt-dlp runs with `formats=dashy` and parallel fragments.
+- librqbit pauses restored torrents asynchronously; a pause can land during the start-up check.
+- Windows notifications may be switched off globally — never rely on them alone.
