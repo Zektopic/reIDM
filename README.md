@@ -40,6 +40,7 @@ official "IDM Integration Module" extension can hand downloads to it too.
 - Finds video and audio on a page (HLS, DASH, progressive), lists every quality, and grabs every link, image, video and file a page offers.
 - **YouTube**: pick any quality from the list over the video and reIDM downloads it, picture and sound joined into one file. It uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), which it fetches and keeps up to date by itself.
 - **YouTube playlists**: every video listed with the resolutions and codecs it comes in; choose per video or for all.
+- **Torrents**: magnet links and `.torrent` files, from the browser or the window; pick the files, and seed until a share ratio.
 - IDM's **Download file info** dialog before each download: name, folder, size; Start, Later or Cancel.
 
 **Download engine**
@@ -127,7 +128,7 @@ reIDM is young and moving quickly; see the [changelog](CHANGELOG.md). Things it 
 
 - The browser extension runs in **Chromium-based browsers**. Firefox is not supported by it (Firefox users can use Tonec's extension, see [docs/EXTENSION.md](docs/EXTENSION.md)).
 - Video streams on sites other than YouTube are found and listed, but reIDM does not merge their HLS/DASH segments into one file. DRM-protected media cannot be downloaded by any tool.
-- No FTP, no BitTorrent, no HTTP authentication prompts.
+- No FTP, no HTTP authentication prompts.
 - The extension isn't on the Chrome Web Store yet, hence *Load unpacked*.
 
 ## Legal

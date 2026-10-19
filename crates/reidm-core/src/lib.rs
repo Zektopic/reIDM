@@ -11,11 +11,13 @@ mod limiter;
 pub mod lists;
 pub mod media;
 pub mod schedule;
+pub mod torrent;
 pub mod update;
 
 pub use category::Category;
 pub use limiter::Limiter;
 pub use media::{valid_format, Media};
+pub use torrent::{TorrentFile, TorrentInfo, TorrentRequest, TorrentStatus};
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
@@ -57,6 +59,10 @@ pub struct Request {
     /// format. See [`media`](crate::media).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<Media>,
+    /// A torrent: `url` is then a magnet link or the address of a `.torrent` file. See
+    /// [`torrent`](crate::torrent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<TorrentRequest>,
 }
 
 /// How to add a download, beyond what to fetch.
@@ -120,6 +126,12 @@ impl std::error::Error for ChangedOnServer {}
 /// `?b=2&a=1` and `?a=1&b=2` are the same download. Everything else is kept: two URLs that
 /// differ in host, path or query values really are different files.
 pub fn url_key(u: &url::Url) -> String {
+    // A magnet link is its torrent, whatever trackers and name ride along.
+    if u.scheme() == "magnet" {
+        if let Some((_, xt)) = u.query_pairs().find(|(k, _)| k == "xt") {
+            return format!("magnet:{}", xt.to_ascii_lowercase());
+        }
+    }
     let mut q: Vec<(String, String)> = u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
     q.sort();
     let query = if q.is_empty() {
@@ -213,6 +225,9 @@ pub struct Item {
     /// fetching yt-dlp, looking up the video, joining video and audio. Cleared when it stops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// A torrent's name, files, peers and what it has shared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<TorrentStatus>,
 }
 
 impl Item {
@@ -307,6 +322,27 @@ pub struct Settings {
     /// folder in the data folder.
     #[serde(default)]
     pub temp_dir: Option<PathBuf>,
+    /// Seed a finished torrent until it has uploaded this many times its size: 0 not at all,
+    /// below 0 for as long as reIDM runs.
+    #[serde(default = "default_seed_ratio")]
+    pub seed_ratio: f64,
+    /// Torrent uploads' cap in bytes per second; 0 for none.
+    #[serde(default)]
+    pub upload_limit: u64,
+    /// The port torrents listen on for peers; 0 for any free one.
+    #[serde(default = "default_torrent_port")]
+    pub torrent_port: u16,
+    /// Find torrents' peers through the DHT too, not only their trackers.
+    #[serde(default = "yes")]
+    pub torrent_dht: bool,
+}
+
+fn default_seed_ratio() -> f64 {
+    1.0
+}
+
+fn default_torrent_port() -> u16 {
+    6881
 }
 
 fn yes() -> bool {
@@ -366,6 +402,15 @@ pub struct SettingsPatch {
     /// The temporary folder; an empty path goes back to the default.
     #[serde(default)]
     pub temp_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub seed_ratio: Option<f64>,
+    #[serde(default)]
+    pub upload_limit: Option<u64>,
+    /// Takes effect when the torrent session next starts, as does `torrent_dht`.
+    #[serde(default)]
+    pub torrent_port: Option<u16>,
+    #[serde(default)]
+    pub torrent_dht: Option<bool>,
 }
 
 struct Inner {
@@ -379,6 +424,8 @@ struct Inner {
     limiter: Arc<Limiter>,
     /// A download waiting for the browser to supply a fresh address, and until when.
     refresh: Mutex<Option<(u64, Instant)>>,
+    /// The BitTorrent session, started by the first torrent.
+    torrents: tokio::sync::OnceCell<Arc<librqbit::Session>>,
 }
 
 #[derive(Clone)]
@@ -662,6 +709,10 @@ impl Manager {
             sort_by_category: true,
             category_dirs: BTreeMap::new(),
             temp_dir: None,
+            seed_ratio: default_seed_ratio(),
+            upload_limit: 0,
+            torrent_port: default_torrent_port(),
+            torrent_dht: true,
         });
         settings.connections = settings.connections.clamp(1, 32);
         settings.max_concurrent = settings.max_concurrent.clamp(1, 64);
@@ -685,6 +736,7 @@ impl Manager {
             http,
             limiter,
             refresh: Mutex::new(None),
+            torrents: tokio::sync::OnceCell::new(),
         })))
     }
 
@@ -747,9 +799,22 @@ impl Manager {
             if let Some(v) = patch.temp_dir {
                 s.temp_dir = (!v.as_os_str().is_empty()).then_some(v);
             }
+            if let Some(v) = patch.seed_ratio.filter(|v| v.is_finite()) {
+                s.seed_ratio = v;
+            }
+            if let Some(v) = patch.upload_limit {
+                s.upload_limit = v;
+            }
+            if let Some(v) = patch.torrent_port {
+                s.torrent_port = v;
+            }
+            if let Some(v) = patch.torrent_dht {
+                s.torrent_dht = v;
+            }
             s.effective_limit()
         };
         self.0.limiter.set_rate(limit);
+        self.torrent_limits();
         self.save_settings();
         // Raising the limit should let waiting downloads start now, not at the next completion.
         self.pump();
@@ -852,6 +917,21 @@ impl Manager {
     /// What the check learns (size, name, range support) is kept, so the transfer does not ask
     /// the server a second time.
     pub async fn add_checked(&self, req: Request, opts: AddOptions) -> Result<AddOutcome> {
+        // A torrent is checked by the torrent engine when it starts, not with a ranged GET —
+        // except a .torrent file on the web, which is fetched here with the browser's cookies
+        // (a private tracker wants them) and added from what arrives.
+        let named_torrent = req.filename.as_deref().is_some_and(|f| f.to_ascii_lowercase().ends_with(".torrent"));
+        if req.torrent.is_none() && req.media.is_none() && req.url.starts_with("http") && (named_torrent || torrent::is_torrent_url(&req.url)) {
+            let r = self.0.http.get(&req.url).headers(Self::headers(&req)).timeout(Duration::from_secs(30)).send().await?.error_for_status()?;
+            if r.content_length().is_some_and(|n| n > 16 << 20) {
+                bail!("that .torrent is too large to be one");
+            }
+            let bytes = r.bytes().await?;
+            return self.add_torrent_file(&bytes, None, opts.later);
+        }
+        if req.torrent.is_some() || torrent::is_torrent_url(&req.url) {
+            return self.add_inner(req, opts, None);
+        }
         let u = url::Url::parse(&req.url).context("invalid URL")?;
         if !matches!(u.scheme(), "http" | "https") {
             bail!("unsupported scheme {:?} (only http/https)", u.scheme());
@@ -879,10 +959,16 @@ impl Manager {
         self.add_inner(req, opts, Some(p))
     }
 
-    fn add_inner(&self, req: Request, opts: AddOptions, probe: Option<Probe>) -> Result<AddOutcome> {
-        let u = url::Url::parse(&req.url).context("invalid URL")?;
-        if !matches!(u.scheme(), "http" | "https") {
-            bail!("unsupported scheme {:?} (only http/https)", u.scheme());
+    fn add_inner(&self, mut req: Request, opts: AddOptions, probe: Option<Probe>) -> Result<AddOutcome> {
+        let u = url::Url::parse(req.url.trim()).context("invalid URL")?;
+        // A magnet link, or a .torrent file's address, is a torrent to download — not the
+        // .torrent file itself.
+        if req.torrent.is_none() && req.media.is_none() && torrent::is_torrent_url(&req.url) {
+            req.torrent = Some(TorrentRequest::default());
+        }
+        let torrent_ok = req.torrent.is_some() && u.scheme() == "magnet";
+        if !matches!(u.scheme(), "http" | "https") && !torrent_ok {
+            bail!("unsupported scheme {:?} (only http/https, and magnet links)", u.scheme());
         }
         if let Some(m) = &req.media {
             if !valid_format(&m.format) {
@@ -894,10 +980,12 @@ impl Manager {
         }
         let key = url_key(&u);
         // The name it will most likely have, for its category's folder; settled below.
+        let torrent_name = req.torrent.is_some().then(|| torrent::magnet_name(&req.url).unwrap_or_else(|| filename_from_url(&u).trim_end_matches(".torrent").to_string()));
         let likely = req
             .filename
             .as_deref()
             .or(probe.as_ref().and_then(|p| p.filename.as_deref()))
+            .or(torrent_name.as_deref().filter(|n| !n.is_empty()))
             .map(sanitize_filename)
             .unwrap_or_else(|| sanitize_filename(&filename_from_url(&u)));
         let dir = req.dir.clone().unwrap_or_else(|| {
@@ -948,6 +1036,7 @@ impl Manager {
                 .filename
                 .as_deref()
                 .or(probe.as_ref().and_then(|p| p.filename.as_deref()))
+                .or(torrent_name.as_deref().filter(|n| !n.is_empty()))
                 .map(sanitize_filename)
                 .unwrap_or_else(|| match &req.media {
                     // yt-dlp names it after the title once it starts; until then, the video's
@@ -974,6 +1063,7 @@ impl Manager {
                 speed_limit: None,
                 scheduled: opts.later,
                 note: None,
+                torrent: None,
             };
             if let Some(p) = probe {
                 let n = self.0.settings.lock().unwrap().connections as u64;
@@ -1072,6 +1162,10 @@ impl Manager {
             it.last_modified = None;
             it.finished_at = None;
             it.status = Status::Queued;
+            if let Some(t) = it.torrent.take() {
+                // From nothing: the torrent engine forgets it, and its files go.
+                self.forget_torrent(t.info_hash, true);
+            }
             let _ = std::fs::remove_file(self.part_for(id, &it.path));
             if it.request.media.is_some() {
                 // yt-dlp would otherwise find the finished file and its pieces and stop there.
@@ -1135,6 +1229,13 @@ impl Manager {
                     let _ = std::fs::remove_file(f);
                 }
                 let _ = std::fs::remove_dir_all(media::work_dir(&self.temp_dir(), id));
+            }
+            if let Some(t) = &it.torrent {
+                // The torrent engine owns a torrent's files (one, or a folder of them).
+                self.forget_torrent(t.info_hash.clone(), delete_files);
+                self.save();
+                self.pump();
+                return;
             }
             if delete_files {
                 // "remove and delete the file" must also work for finished downloads, which are
@@ -1462,6 +1563,9 @@ impl Manager {
         let mut item = self.get(id).ok_or_else(|| anyhow!("vanished"))?;
         if item.request.media.is_some() {
             return self.run_media(id, live, item).await;
+        }
+        if item.request.torrent.is_some() {
+            return self.run_torrent(id, live, item).await;
         }
         let headers = Self::headers(&item.request);
 

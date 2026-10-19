@@ -10,6 +10,7 @@ mod app;
 mod icons;
 mod model;
 mod playlist;
+mod torrent;
 mod prefs;
 mod theme;
 

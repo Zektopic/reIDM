@@ -9,6 +9,7 @@ Opening the window starts the service if it isn't running.
 - [Adding downloads](#adding-downloads)
 - [While a download runs](#while-a-download-runs)
 - [Expired links: refreshing the address](#expired-links-refreshing-the-address)
+- [Torrents](#torrents)
 - [The queue and the scheduler](#the-queue-and-the-scheduler)
 - [The speed limiter](#the-speed-limiter)
 - [The site grabber](#the-site-grabber)
@@ -144,6 +145,43 @@ file: **right-click › Refresh download address…**
 
 From a terminal: `reidm refresh <id> <new-url>`.
 
+## Torrents
+
+reIDM downloads torrents, and shares them back — *seeding* — the way a torrent client does.
+
+**Adding one.** Any of these:
+
+- click a **magnet link** in the browser (reIDM's extension takes it; Alt+click leaves it to
+  another program), or download a **`.torrent` file** — reIDM fetches it with your cookies, so a
+  private tracker's work too, and adds the torrent it describes;
+- **Tasks › Add torrent…**: paste a magnet link or a `.torrent` address, or *Browse .torrent…*.
+  **Show files** lists what is in it — tick only the files you want — then **Download** or
+  **Download later**. For a magnet link, the list waits until a peer describes the torrent,
+  which can take a minute;
+- `reidm add 'magnet:?xt=…'` or `reidm add file.torrent` in a terminal.
+
+A torrent sits in the list like any download: it takes a turn in *Downloads at the same time*,
+stops and resumes where it was (even across restarts), and is filed by what it holds (a film in
+`Video`, an `.iso` in `Programs`; a torrent of many files is a folder). The status column says
+*Downloading · 25 peers*; *Transfer rate* shows the upload beside the download (*↑ 120 KB/s*).
+Properties shows its info hash, what it has uploaded, its share ratio, its peers and — for a
+torrent of several files — each file's progress.
+
+**Seeding.** When a torrent is complete, it goes on sharing it with others until it has uploaded
+as much as its own size (a *ratio* of 1.0), then stops: *Seeding · ratio 0.45 · 12 peers*.
+Right-click › **Stop seeding** or **Seed again** for one torrent; Options › Torrents for all:
+
+| Option | |
+|---|---|
+| When a torrent is complete | don't seed, seed until a ratio of 0.5, 1, 2 or 5, or for as long as reIDM runs |
+| Upload limit | the cap on what torrents send, in KB/s (0: none). The download limit is the speed limiter's |
+| Listening port | where other peers connect to you (default 6881); reIDM asks your router to forward it. 0 picks any free port. Another torrent program on the same port makes reIDM pick another |
+| Find peers through the DHT | needed for most magnet links |
+
+The first time, **Windows Firewall** asks whether reIDM may accept connections: allow it, or
+others can't reach you and seeding does little. Removing a torrent with *delete the file* removes
+all of its files.
+
 ## The queue and the scheduler
 
 *Download Later* (in Add URL, the batch dialog, the site grabber and the extension's grabber) puts
@@ -243,6 +281,7 @@ In the data folder:
 | `gui.json` | the window's own preferences |
 | `api-token` | the key the window uses to talk to the service (readable only by you) |
 | `browser-extension/` | the extension folder your browser loads |
+| `torrents/` | the torrent engine's records: what each torrent has, so a restart doesn't check every piece again, the peers it knows (`dht.json`), and the `.torrent` files added from disk (`files/`) |
 | `tools/` | yt-dlp and, where needed, Deno and ffmpeg, fetched for video downloads; safe to delete — they are fetched again when needed |
 
 An unfinished download is written to the temporary folder (`parts/` in the data folder, or the

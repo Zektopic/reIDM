@@ -90,8 +90,10 @@ reidm get 'https://example.com/report?id=7' -o report.pdf --cookie 'session=abc'
 reidm add URL... [--referer URL] [-o NAME] [--later] [--video [FORMAT]]
 ```
 
-Queues one or more addresses in the service. `--output` names the file and is only allowed with
-a single address; `--later` puts them in the scheduled queue without starting them.
+Queues one or more addresses in the service — web links, **magnet links**, and **`.torrent`
+files** on disk, which are sent to the service whole. `--output` names the file and is only
+allowed with a single address; `--later` puts them in the scheduled queue without starting
+them.
 
 `--video` says the addresses are pages with a video — YouTube, and the
 [many other sites yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)

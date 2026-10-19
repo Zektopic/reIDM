@@ -69,6 +69,7 @@ impl Default for BatchState {
 enum OptTab {
     General,
     Folders,
+    Torrents,
 }
 
 /// *Refresh download address* for one download.
@@ -133,6 +134,12 @@ pub struct App {
     /// Category name and its folder, as edited; empty is its default.
     opt_folders: Vec<(&'static str, String)>,
     opt_temp: String,
+    /// Seed until this ratio; 0 not at all, below 0 forever.
+    opt_seed: f64,
+    /// Upload limit in KB/s; 0 none.
+    opt_up_kb: u64,
+    opt_port: u16,
+    opt_dht: bool,
     opt_conn: usize,
     opt_max: usize,
     confirm_remove: Vec<u64>,
@@ -160,6 +167,7 @@ pub struct App {
     // site grabber
     show_grabber: bool,
     playlist: crate::playlist::PlaylistWindow,
+    torrent: crate::torrent::TorrentWindow,
     grab: GrabState,
 }
 
@@ -218,6 +226,10 @@ impl App {
             opt_sort: true,
             opt_folders: Vec::new(),
             opt_temp: String::new(),
+            opt_seed: 1.0,
+            opt_up_kb: 0,
+            opt_port: 6881,
+            opt_dht: true,
             opt_conn: 8,
             opt_max: 4,
             confirm_remove: Vec::new(),
@@ -237,6 +249,7 @@ impl App {
             checked_on_start: false,
             show_grabber: false,
             playlist: Default::default(),
+            torrent: Default::default(),
             grab: GrabState::default(),
         }
     }
@@ -751,6 +764,10 @@ impl App {
                 .map(|c| (c.name(), if s.folders.custom.iter().any(|n| n == c.name()) { s.folders.dirs.get(c.name()).cloned().unwrap_or_default() } else { String::new() }))
                 .collect();
             self.opt_temp = if s.folders.temp_custom { s.folders.temp_dir } else { String::new() };
+            self.opt_seed = s.seed_ratio;
+            self.opt_up_kb = s.upload_limit / 1024;
+            self.opt_port = s.torrent_port;
+            self.opt_dht = s.torrent_dht;
         }
         self.opt_tab = OptTab::General;
         self.show_options = true;
@@ -856,6 +873,9 @@ impl eframe::App for App {
         if let Some(msg) = self.playlist.show(&ctx, &self.api, &p) {
             self.toast(msg);
         }
+        if let Some(msg) = self.torrent.show(&ctx, &self.api, &p) {
+            self.toast(msg);
+        }
         self.about_dialog(&ctx);
         self.confirm_dialog(&ctx);
         self.grabber_window(&ctx, &p);
@@ -940,6 +960,11 @@ impl App {
                     ui.menu_button("Tasks", |ui| {
                         if ui.button("Add URL…").clicked() {
                             self.open_add();
+                            ui.close();
+                        }
+                        if ui.button("Add torrent…").clicked() {
+                            let clip = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()).map(|t| t.trim().to_string()).filter(|t| t.starts_with("magnet:"));
+                            self.torrent.open_with(clip);
                             ui.close();
                         }
                         if ui.button("Add YouTube playlist…").clicked() {
@@ -1531,6 +1556,14 @@ impl App {
                                         let mut c = note.chars();
                                         c.next().map(|f| format!("{}{}…", f.to_uppercase(), c.as_str())).unwrap_or_default()
                                     }
+                                    _ if it.seeding() => {
+                                        let t = it.torrent.as_ref().unwrap();
+                                        format!("Seeding · ratio {:.2} · {} peer{}", it.ratio().unwrap_or(0.0), t.peers, if t.peers == 1 { "" } else { "s" })
+                                    }
+                                    _ if it.status == Status::Running && it.torrent.is_some() => {
+                                        let p = it.torrent.as_ref().map_or(0, |t| t.peers);
+                                        format!("Downloading · {p} peer{}", if p == 1 { "" } else { "s" })
+                                    }
                                     _ if it.status == Status::Running && n > 1 => format!("{} ({n})", it.status.label()),
                                     _ => it.status.label().to_string(),
                                 };
@@ -1546,8 +1579,14 @@ impl App {
                             });
 
                             row.col(|ui| {
-                                let txt = if it.status == Status::Running { rate.map(rate_human).unwrap_or_default() } else { String::new() };
-                                ui.label(RichText::new(txt).size(12.0).color(if it.status == Status::Running { p.accent } else { p.text_dim }));
+                                let up = self.snap.up_rates.get(&it.id).copied().filter(|r| *r > 1.0);
+                                let mut txt = if it.status == Status::Running { rate.map(rate_human).unwrap_or_default() } else { String::new() };
+                                if let Some(u) = up {
+                                    // A torrent's upload, beside its download (or alone, when seeding).
+                                    txt = if txt.is_empty() { format!("↑ {}", rate_human(u)) } else { format!("{txt}  ↑ {}", rate_human(u)) };
+                                }
+                                let active = it.status == Status::Running || up.is_some();
+                                ui.label(RichText::new(txt).size(12.0).color(if active { p.accent } else { p.text_dim }));
                             });
 
                             // Last Try, as IDM shows it.
@@ -1642,8 +1681,15 @@ impl App {
                                     if it.status.is_stopped() {
                                         pick(ui, "Resume", CtxCmd::Start);
                                     }
+                                    if it.status == Status::Done && it.torrent.is_some() {
+                                        if it.seeding() {
+                                            pick(ui, "Stop seeding", CtxCmd::Seed(false));
+                                        } else {
+                                            pick(ui, "Seed again", CtxCmd::Seed(true));
+                                        }
+                                    }
                                     pick(ui, "Restart from the beginning", CtxCmd::Restart);
-                                    if it.status != Status::Done {
+                                    if it.status != Status::Done && it.torrent.is_none() && it.request.media.is_none() {
                                         pick(ui, "Refresh download address…", CtxCmd::Refresh);
                                     }
                                     ui.separator();
@@ -1677,6 +1723,12 @@ impl App {
                     Some(CtxCmd::Refresh) => {
                         if let Some(id) = self.selected.last().copied() {
                             self.open_refresh(id);
+                        }
+                    }
+                    Some(CtxCmd::Seed(on)) => {
+                        let ids: Vec<u64> = self.selected.iter().copied().filter(|id| self.item(*id).is_some_and(|i| i.status == Status::Done && i.torrent.is_some())).collect();
+                        for id in ids {
+                            self.api.action(id, if on { "seed" } else { "stop-seeding" });
                         }
                     }
                     Some(CtxCmd::Queue) => self.set_queued(true),
@@ -1717,6 +1769,8 @@ enum CtxCmd {
     CopyUrl(String),
     Remove,
     RemoveFile,
+    /// Start (`true`) or stop sharing finished torrents.
+    Seed(bool),
 }
 
 // ── dialogs ──────────────────────────────────────────────────────────────
@@ -1932,10 +1986,13 @@ impl App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.opt_tab, OptTab::General, "General");
                 ui.selectable_value(&mut self.opt_tab, OptTab::Folders, "Folders");
+                ui.selectable_value(&mut self.opt_tab, OptTab::Torrents, "Torrents");
             });
             ui.separator();
             if self.opt_tab == OptTab::Folders {
                 self.folders_tab(ui, p);
+            } else if self.opt_tab == OptTab::Torrents {
+                self.torrents_tab(ui, p);
             } else {
             ui.label(RichText::new("Downloads").strong());
             ui.add_space(6.0);
@@ -2011,6 +2068,10 @@ impl App {
                 "sort_by_category": self.opt_sort,
                 "category_dirs": dirs,
                 "temp_dir": self.opt_temp.trim(),
+                "seed_ratio": self.opt_seed,
+                "upload_limit": self.opt_up_kb * 1024,
+                "torrent_port": self.opt_port,
+                "torrent_dht": self.opt_dht,
             }));
             self.prefs.save();
             match r {
@@ -2030,6 +2091,34 @@ impl App {
         if !open {
             self.show_options = false;
         }
+    }
+
+    /// Options › Torrents: how long to share, how fast, and how peers find reIDM.
+    fn torrents_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.label(RichText::new("When a torrent is complete").strong());
+        let seed_label = |r: f64| if r == 0.0 { "Stop: don't seed".to_string() } else if r < 0.0 { "Seed for as long as reIDM runs".into() } else { format!("Seed until it has shared {r}× its size") };
+        egui::ComboBox::from_id_salt("seed").width(330.0).selected_text(seed_label(self.opt_seed)).show_ui(ui, |ui| {
+            for r in [0.0, 0.5, 1.0, 2.0, 5.0, -1.0] {
+                ui.selectable_value(&mut self.opt_seed, r, seed_label(r));
+            }
+        });
+        label(ui, p, "Seeding is sharing what you downloaded with others, which is how torrents work. Stop or restart it for one torrent from its right-click menu.");
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Upload limit");
+            ui.add(egui::DragValue::new(&mut self.opt_up_kb).range(0..=10_000_000).suffix(" KB/s"));
+            label(ui, p, if self.opt_up_kb == 0 { "(none)" } else { "" });
+        });
+        label(ui, p, "The download limit is the speed limiter's, shared with every other download.");
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label("Listening port");
+            ui.add(egui::DragValue::new(&mut self.opt_port).range(0..=65535));
+        });
+        label(ui, p, "Where other peers connect to you; reIDM asks your router to forward it. 0 picks any free port. Takes effect when reIDM restarts.");
+        ui.add_space(6.0);
+        ui.checkbox(&mut self.opt_dht, "Find peers through the DHT, not only through trackers");
+        label(ui, p, "Needed for most magnet links. Takes effect when reIDM restarts.");
     }
 
     /// Options › Folders: where each type of file goes, and where unfinished downloads wait.
@@ -2370,7 +2459,12 @@ impl App {
                     if let Some(t) = it.finished_at {
                         row(ui, "Completed", since_human(t, now_secs()));
                     }
-                    if it.request.media.is_some() {
+                    if let Some(t) = &it.torrent {
+                        row(ui, "Torrent", format!("{} · info hash {}", t.name, t.info_hash));
+                        row(ui, "Shared", format!("{} uploaded · ratio {:.2}{}", size_human(t.uploaded), it.ratio().unwrap_or(0.0), if it.seeding() { " · seeding" } else { "" }));
+                        row(ui, "Peers", format!("{} connected", t.peers));
+                        row(ui, "Resume capability", "Yes — a torrent carries on where it stopped".into());
+                    } else if it.request.media.is_some() {
                         row(ui, "Resume capability", "Yes — yt-dlp carries on where it stopped".into());
                     } else {
                         row(ui, "Resume capability", if it.resumable { "Yes".into() } else if it.size.is_some() { "No — a stop means starting over".into() } else { "Unknown".into() });
@@ -2379,6 +2473,22 @@ impl App {
                 });
                 ui.add_space(8.0);
                 segment_map(ui, p, &it);
+                // A torrent's files, each with its own progress.
+                if let Some(t) = it.torrent.as_ref().filter(|t| t.files.len() > 1 || t.files.iter().any(|f| !f.selected)) {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Files").strong());
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                        egui::Grid::new("torrent-files").num_columns(3).spacing(Vec2::new(10.0, 3.0)).show(ui, |ui| {
+                            for f in &t.files {
+                                ui.label(RichText::new(&f.path).size(12.0).color(if f.selected { p.text } else { p.text_dim }));
+                                ui.label(RichText::new(size_human(f.size)).size(12.0).color(p.text_dim));
+                                let txt = if !f.selected { "skipped".to_string() } else if f.size == 0 { "100%".into() } else { format!("{:.0}%", f.done as f64 * 100.0 / f.size as f64) };
+                                ui.label(RichText::new(txt).size(12.0));
+                                ui.end_row();
+                            }
+                        });
+                    });
+                }
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut limit_on, "Limit this download to");

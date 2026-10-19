@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0 (unreleased)
+
+### Torrents
+
+* **reIDM downloads and seeds torrents**, with [librqbit](https://github.com/ikatson/rqbit):
+  magnet links and `.torrent` files, trackers, the DHT and uTP. A torrent is a download like any
+  other in the list — queued, stopped, resumed across restarts, filed by what it holds, removed
+  with its files — showing its peers and its upload beside its download.
+* **Choose the files** in **Tasks › Add torrent…**, from a magnet link, a `.torrent` address or a
+  file on disk.
+* **Seeding**: a finished torrent shares until it has uploaded as much as its size, then stops;
+  **Options › Torrents** sets that ratio (or none, or forever), an upload limit, the listening
+  port (forwarded by UPnP) and the DHT. Right-click › *Stop seeding* / *Seed again*. Seeding
+  carries on after a restart.
+* **The browser**: a clicked magnet link goes to reIDM (Alt+click leaves it to another program);
+  a `.torrent` the browser downloads is fetched by reIDM with the site's cookies — so a private
+  tracker's work — and added as the torrent it describes.
+* `reidm add magnet:…` and `reidm add file.torrent`; `POST /api/torrent/inspect`, `seed` and
+  `stop-seeding` actions, and `torrent` on downloads in the API.
 ## 0.6.1
 
 ### Fixed

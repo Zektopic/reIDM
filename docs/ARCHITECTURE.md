@@ -234,6 +234,7 @@ What this does and doesn't protect against:
 | `crates/reidm-core/src/limiter.rs` | the token-bucket speed limiter |
 | `crates/reidm-core/src/schedule.rs` | the scheduler's time windows |
 | `crates/reidm-core/src/lists.rs` | `.ef2` import/export, batch patterns |
+| `crates/reidm-core/src/torrent.rs` | torrents through [librqbit](https://github.com/ikatson/rqbit): one session for all, matched to the list by info hash; downloading, seeding to the share ratio, and the session's records in `torrents/` |
 | `crates/reidm-core/src/media.rs` | video downloads through yt-dlp: fetching and checking yt-dlp, Deno and ffmpeg, running yt-dlp, its progress, stopping it |
 | `crates/reidm-core/src/grabber.rs` | the site grabber, URL-list parsing |
 | `crates/reidm-core/src/update.rs` | the release check |

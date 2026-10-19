@@ -124,6 +124,19 @@
       const a = linkOf(ev);
       if (!a) return;
       const href = a.href;
+      // A magnet link is a torrent for reIDM — the browser has nothing to do with one but hand
+      // it to some other program. Alt+click still leaves it to that program.
+      if (/^magnet:/i.test(href)) {
+        if (ev.altKey || ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.shiftKey || !cap.capture) return;
+        ev.preventDefault();
+        chrome.runtime
+          .sendMessage({ type: 'capture-link', url: href, referer: location.href })
+          .then((r) => {
+            if (!r || !r.ok) handBack(a, href);
+          })
+          .catch(() => handBack(a, href));
+        return;
+      }
       if (!isHttp(href)) return;
       // IDM's convention: Alt+click means "let the browser have this one".
       if (ev.altKey) {
