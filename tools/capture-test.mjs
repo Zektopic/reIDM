@@ -52,7 +52,23 @@ const args = Object.fromEntries(
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const WIN = process.platform === 'win32';
 const EXE = WIN ? '.exe' : '';
-const CHROME = args.chrome || process.env.CHROME_PATH || path.join(os.homedir(), '.cache/ms-playwright/chromium-1243/chrome-linux64/chrome');
+/** The newest Chromium that Playwright has installed (`npx playwright install chromium`). */
+function playwrightChromium() {
+  const root = path.join(os.homedir(), '.cache/ms-playwright');
+  const builds = (fs.existsSync(root) ? fs.readdirSync(root) : [])
+    .filter((d) => /^chromium-\d+$/.test(d))
+    .sort((a, b) => Number(b.split('-')[1]) - Number(a.split('-')[1]));
+  for (const b of builds) {
+    const exe = path.join(root, b, 'chrome-linux64', 'chrome');
+    if (fs.existsSync(exe)) return exe;
+  }
+  return null;
+}
+const CHROME = args.chrome || process.env.CHROME_PATH || playwrightChromium();
+if (!CHROME) {
+  console.error('No browser: pass --chrome PATH, set CHROME_PATH, or run `npx playwright install chromium`.');
+  process.exit(2);
+}
 const BIN = path.resolve(args.bin || path.join(ROOT, 'target/debug'));
 const EXT = path.resolve(args.extension || path.join(ROOT, 'extension'));
 const EXT_ID = 'pgeonmdaagbiccimgojpafdjcipcfnlc';
@@ -292,8 +308,12 @@ async function launchChrome() {
     ],
     { env, stdio: 'ignore' },
   );
+  // A browser that can't start is an error like any other, so the cleanup below still runs.
+  let failed = null;
+  chrome.once('error', (e) => (failed = e));
   let version;
   for (let i = 0; i < 100 && !version; i++) {
+    if (failed) throw failed;
     try {
       version = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`)).json();
     } catch {
