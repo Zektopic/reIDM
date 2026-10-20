@@ -87,13 +87,7 @@ pub struct App {
     // dialogs
     add: AddState,
     batch: BatchState,
-    show_options: bool,
-    opt_tab: OptTab,
-    /// The service's settings as edited in Options.
-    opt: OptionsForm,
-    /// The settings Options was opened with, to send only what changed; `None` until they have
-    /// loaded, and Save is not offered until then.
-    opt_base: Option<OptionsForm>,
+    options: options_dialog::OptionsDialog,
     confirm: Option<Confirm>,
     about: bool,
     refresh: Option<RefreshState>,
@@ -164,10 +158,7 @@ impl App {
             toast: None,
             add: AddState::default(),
             batch: BatchState::default(),
-            show_options: false,
-            opt_tab: OptTab::General,
-            opt: OptionsForm::from_settings(&Default::default()),
-            opt_base: None,
+            options: Default::default(),
             confirm: None,
             about: false,
             refresh: None,

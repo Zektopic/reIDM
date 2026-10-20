@@ -351,6 +351,89 @@ pub struct Settings {
     pub torrent_port: u16,
     #[serde(default)]
     pub torrent_dht: bool,
+    // What 0.8's service adds. An older one leaves them out, and the window then hides the
+    // options they hold instead of showing values it can't save.
+    #[serde(default)]
+    pub performance: Option<Performance>,
+    #[serde(default)]
+    pub write_buffer_kib: Option<u32>,
+    #[serde(default)]
+    pub retries: Option<u32>,
+    #[serde(default)]
+    pub retry_wait_secs: Option<u32>,
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u32>,
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u32>,
+    #[serde(default)]
+    pub proxy: Option<Proxy>,
+    #[serde(default)]
+    pub keep_awake: Option<bool>,
+    #[serde(default)]
+    pub keep_awake_seeding: Option<bool>,
+    #[serde(default)]
+    pub min_free_space_mib: Option<u64>,
+}
+
+/// How hard reIDM works: a preset for connections, downloads at once and write buffers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Performance {
+    Light,
+    #[default]
+    Balanced,
+    Maximum,
+    /// The knobs differ from every preset. Anything this window doesn't know reads as this too,
+    /// rather than failing to load the settings at all.
+    #[serde(other)]
+    Custom,
+}
+
+/// The proxy, as the service reports it. The password is never sent back, only whether one is
+/// set.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct Proxy {
+    #[serde(default)]
+    pub mode: ProxyMode,
+    #[serde(default)]
+    pub kind: Option<ProxyKind>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password_set: bool,
+    #[serde(default)]
+    pub bypass: Vec<String>,
+    #[serde(default)]
+    pub remote_dns: Option<bool>,
+    #[serde(default)]
+    pub torrents: Option<bool>,
+    #[serde(default)]
+    pub videos: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    None,
+    Manual,
+    /// Last, so that a mode this window doesn't know reads as the default.
+    #[default]
+    #[serde(other)]
+    System,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyKind {
+    Https,
+    Socks5,
+    #[default]
+    #[serde(other)]
+    Http,
 }
 
 /// Where each type of file goes, as the service reports it.

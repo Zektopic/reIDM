@@ -58,7 +58,7 @@ impl App {
             self.prefs.notify_complete = false;
             self.prefs.save();
             self.completed.clear();
-            self.toast("Turn it back on in Options › Window");
+            self.toast("Turn it back on in Options › General");
         } else if close {
             self.completed.retain(|x| *x != id);
         }

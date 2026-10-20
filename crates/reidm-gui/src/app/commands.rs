@@ -551,29 +551,6 @@ impl App {
         });
     }
 
-    /// Options opens on the settings last polled, and fetches them again: Save sends only what
-    /// changed against those, and is offered only once they are known.
-    pub(super) fn open_options(&mut self) {
-        self.opt_base = self.known_settings().map(|s| OptionsForm::from_settings(&s));
-        if let Some(b) = &self.opt_base {
-            self.opt = b.clone();
-        }
-        self.cmd.run(|c| {
-            let s = c.settings();
-            reply(move |app: &mut App| {
-                let Ok(s) = s else { return };
-                let fresh = OptionsForm::from_settings(&s);
-                // Unless the user has started editing, show the very latest.
-                if app.opt_base.as_ref().is_none_or(|b| *b == app.opt) {
-                    app.opt = fresh.clone();
-                    app.opt_base = Some(fresh);
-                }
-            })
-        });
-        self.opt_tab = OptTab::General;
-        self.show_options = true;
-    }
-
     /// *Add YouTube playlist*, with a playlist link from the clipboard already filled in.
     pub(super) fn open_playlist(&mut self) {
         let s = self.known_settings().unwrap_or_default();
@@ -581,11 +558,5 @@ impl App {
         let (video, music) = if s.folders.sort { (dir("Video"), dir("Music")) } else { (s.default_dir.clone(), s.default_dir.clone()) };
         let clip = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()).map(|t| t.trim().to_string()).filter(|t| t.starts_with("http") && (t.contains("list=") || t.contains("/@") || t.contains("/channel/")));
         self.playlist.open_with(clip, video, music);
-    }
-
-    /// Where a category goes when the user hasn't chosen: under the download folder.
-    pub(super) fn default_folder(&self, name: &str) -> String {
-        let base = std::path::Path::new(&self.opt.dir);
-        if name == reidm_core::Category::General.name() { base.to_string_lossy().into_owned() } else { base.join(name).to_string_lossy().into_owned() }
     }
 }

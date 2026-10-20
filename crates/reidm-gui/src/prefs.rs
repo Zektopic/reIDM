@@ -7,7 +7,7 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Prefs {
     #[serde(default)]
     pub dark: bool,
@@ -21,11 +21,14 @@ pub struct Prefs {
     /// background.
     #[serde(default)]
     pub close_explained: bool,
+    /// Options shows its *Advanced* tab.
+    #[serde(default)]
+    pub advanced_settings: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { dark: false, notify_complete: true, clipboard: true, close_explained: false }
+        Self { dark: false, notify_complete: true, clipboard: true, close_explained: false, advanced_settings: false }
     }
 }
 

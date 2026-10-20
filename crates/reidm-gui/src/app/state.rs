@@ -106,13 +106,6 @@ pub(super) fn expand_batch(pattern: &str, from: &str, to: &str, width: usize) ->
     expand_pattern(pattern, &seq).map_err(|e| e.to_string())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum OptTab {
-    General,
-    Folders,
-    Torrents,
-}
-
 /// *Refresh download address* for one download.
 pub(super) struct RefreshState {
     pub(super) id: u64,

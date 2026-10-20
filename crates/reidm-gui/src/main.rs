@@ -7,6 +7,7 @@
 
 mod api;
 mod app;
+mod autostart;
 mod icons;
 mod model;
 mod options;

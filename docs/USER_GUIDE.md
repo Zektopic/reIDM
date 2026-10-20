@@ -128,7 +128,7 @@ splicing two versions together. Use **Restart** to fetch the new version.
 A server that stops sending entirely for 60 seconds counts as a dropped connection.
 
 **Download complete.** When a download finishes, a small window offers *Open*, *Open folder* or
-*Close*. *Don't show again* turns it off; it's back in Options › Window.
+*Close*. *Don't show again* turns it off; it's back in Options › General.
 
 ## Expired links: refreshing the address
 
@@ -173,14 +173,15 @@ torrent of several files — each file's progress.
 
 **Seeding.** When a torrent is complete, it goes on sharing it with others until it has uploaded
 as much as its own size (a *ratio* of 1.0), then stops: *Seeding · ratio 0.45 · 12 peers*.
-Right-click › **Stop seeding** or **Seed again** for one torrent; Options › Torrents for all:
+Right-click › **Stop seeding** or **Seed again** for one torrent; Options › Torrents for all (the
+port and the DHT are under *Advanced settings*):
 
 | Option | |
 |---|---|
-| When a torrent is complete | don't seed, seed until a ratio of 0.5, 1, 2 or 5, or for as long as reIDM runs |
+| When a torrent is complete | don't share it, share it until it has sent 0.5, 1, 2 or 5 times its size, or for as long as reIDM runs |
 | Upload limit | the cap on what torrents send, in KB/s (0: none). The download limit is the speed limiter's |
-| Listening port | where other peers connect to you (default 6881); reIDM asks your router to forward it. 0 picks any free port. Another torrent program on the same port makes reIDM pick another |
-| Find peers through the DHT | needed for most magnet links |
+| Torrent listening port (Advanced) | where other peers connect to you (default 6881); reIDM asks your router to forward it. 0 picks any free port. Another torrent program on the same port makes reIDM pick another |
+| Use the DHT to find peers (Advanced) | needed for most magnet links |
 
 The first time, **Windows Firewall** asks whether reIDM may accept connections: allow it, or
 others can't reach you and seeding does little. Removing a torrent with *delete the file* removes
@@ -247,22 +248,52 @@ itself can import. Exports never include cookies.
 
 ## Options
 
+Options has five tabs, each option with a line under it saying what it does. Save sends only what
+you changed; Cancel puts everything back. Some options appear only with a service of version 0.8
+or later.
+
 | Option | |
 |---|---|
 | **General** tab: | |
-| Default download folder | where new downloads go unless Add URL says otherwise |
-| Connections per download | 1–32 (default 8) |
-| Downloads at the same time | 1–16 here (default 4); the rest wait in line |
-| Speed limiter…, Scheduler… | shortcuts to those dialogs |
+| Start reIDM when you sign in | starts the service in the background at sign-in, so browser downloads are caught before you open the window (the Windows installer turns it on) |
+| Keep the computer awake while downloading | on by default; sleep waits until downloads finish |
 | Dark theme | |
 | Show a window when a download completes | |
 | Fill Add URL with links from the clipboard | |
 | Browser | whether the extension is connected, and *Set up…* |
 | Updates | *Check now*. reIDM also checks once shortly after it starts |
 | **Folders** tab: | |
+| Download folder | where new downloads go unless Add URL says otherwise |
 | Save each download in the folder for its type | IDM's categories, on by default: videos in `Video`, archives in `Compressed`, installers in `Programs`, and `Documents`, `Images`, `Music`; anything else in the download folder itself |
 | One folder per type | each defaults to the folder of that name under the download folder (shown greyed), and follows it if the download folder moves; *Browse…* puts it anywhere, *Default* puts it back |
-| Temporary folder | where unfinished downloads wait (default: `parts` in the [data folder](#where-reidm-keeps-things)); each moves to its folder when complete, so the download folder only ever holds finished files. On another drive, that move is a copy |
+| **Downloads** tab: | |
+| Performance | **Light** (4 connections per download, 2 downloads at once), **Balanced** (8 and 4, the default) or **Maximum** (16 and 8). *Custom* shows when Advanced settings were changed by hand |
+| Downloads at the same time | 1–64; the rest wait their turn |
+| Limit the total download speed | the [speed limiter](#the-speed-limiter), here as one switch and a rate |
+| Scheduler… | opens the [scheduler](#the-queue-and-the-scheduler) |
+| **Network** tab: | |
+| Proxy | *Use the computer's proxy settings* (the default), *No proxy*, or *Use this proxy*: HTTP, HTTPS or SOCKS5, address and port, a user name and password if it asks for them, and the servers to reach directly (`*.lan`, `10.0.0.0/8`, one per line). The password is kept by the service and never shown again; leave the field empty to keep it |
+| **Torrents** tab: | |
+| When a torrent is complete, Upload limit | see [Torrents](#torrents) |
+
+**Advanced settings** (bottom left; reIDM remembers the choice) adds a sixth tab, a grid of
+everything else, each with its unit and a **Default** button. Hover over a name for what it does.
+Those marked *requires restart* apply the next time reIDM starts.
+
+| Advanced | Default | |
+|---|---|---|
+| Connections per download | 8 | 1–32; part of the performance preset |
+| Memory per connection before writing to disk | 256 KiB | 64–4096; part of the preset |
+| Retries per connection without progress | 5 | 0 means for ever |
+| First wait between retries | 3 s | doubles each time, up to a minute |
+| Retry a connection that sends nothing for | 60 s | |
+| Give up on a server that doesn't answer after | 30 s | |
+| Pause downloads when the disk has less free than | 200 MiB | the download waits, and resumes by itself when there is room |
+| Keep the computer awake while sharing too | off | |
+| Torrent listening port | 6881 | where peers connect to you; 0 picks any free port |
+| Use the DHT to find peers | on | needed for most magnet links |
+| Look up names through the SOCKS5 proxy · Torrents use the proxy · Videos use the proxy | on · off · on | with a manual proxy; torrents can only use a SOCKS5 one |
+| Temporary folder | `parts` in the [data folder](#where-reidm-keeps-things) | where unfinished downloads wait; each moves to its folder when complete, so the download folder only ever holds finished files. On another drive, that move is a copy |
 
 ## Keyboard shortcuts
 
@@ -297,7 +328,7 @@ In the data folder:
 | `tools/` | yt-dlp and, where needed, Deno and ffmpeg, fetched for video downloads; safe to delete — they are fetched again when needed |
 
 An unfinished download is written to the temporary folder (`parts/` in the data folder, or the
-one set in Options › Folders) as `<id>-<name>.reidm`, and moved to its folder when it completes;
+one set in Options › Advanced) as `<id>-<name>.reidm`, and moved to its folder when it completes;
 a video's pieces wait in `parts/video-<id>/`. A download begun before reIDM 0.6 carries on beside
 its file, where it started.
 
