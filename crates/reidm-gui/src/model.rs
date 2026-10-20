@@ -1,37 +1,19 @@
-//! Mirrors the daemon's `downloads.json` / `/api/downloads` JSON.
+//! Mirrors the daemon's JSON: the list's rows (`/api/downloads/rows`), settings and status.
 
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Request {
     pub url: String,
-    #[serde(default)]
     pub referer: Option<String>,
-    #[serde(default)]
-    pub user_agent: Option<String>,
     /// A video fetched through yt-dlp: `url` is then the page, and this the format asked for.
-    #[serde(default)]
     pub media: Option<Media>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 pub struct Media {
     pub format: String,
-}
-
-/// One byte range of a download and how far it has got.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct Segment {
-    pub start: u64,
-    /// Inclusive; `u64::MAX` when the length is unknown.
-    pub end: u64,
-    pub done: u64,
-    #[serde(default)]
-    pub finished: bool,
-    /// A connection is working on it right now.
-    #[serde(default)]
-    pub active: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -62,40 +44,135 @@ impl Status {
     pub fn is_stopped(&self) -> bool {
         matches!(self, Status::Paused | Status::Failed(_))
     }
+
+    /// Sorting order for the Status column: what needs attention first.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Status::Running => 0,
+            Status::Queued => 1,
+            Status::Paused => 2,
+            Status::Failed(_) => 3,
+            Status::Done => 4,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// A torrent's summary, as a list row carries it (the file list is only in the full item).
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+pub struct TorrentRow {
+    #[serde(default)]
+    pub info_hash: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub uploaded: u64,
+    #[serde(default)]
+    pub peers: u32,
+    #[serde(default)]
+    pub seeding: bool,
+    #[serde(default)]
+    pub files: usize,
+    #[serde(default)]
+    pub skipped: usize,
+}
+
+/// One row of the download list.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(from = "RowWire")]
 pub struct Item {
     pub id: u64,
     pub request: Request,
     pub path: PathBuf,
-    #[serde(default)]
     pub size: Option<u64>,
-    #[serde(default)]
     pub downloaded: u64,
     pub status: Status,
-    #[serde(default)]
     pub added: u64,
-    #[serde(default)]
     pub last_try: Option<u64>,
-    #[serde(default)]
     pub finished_at: Option<u64>,
-    #[serde(default)]
-    pub segments: Vec<Segment>,
-    #[serde(default)]
     pub resumable: bool,
     /// This download's own speed cap, bytes per second.
-    #[serde(default)]
     pub speed_limit: Option<u64>,
     /// In the scheduled queue (*Download Later*).
-    #[serde(default)]
     pub scheduled: bool,
     /// What a running download is busy with ("looking up the video"), when progress can't say.
-    #[serde(default)]
     pub note: Option<String>,
-    /// A torrent's files, peers, and what it has shared.
+    /// Connections transferring right now.
+    pub connections: usize,
+    /// How many byte ranges it is split into.
+    pub parts: usize,
+    pub torrent: Option<TorrentRow>,
+    // Worked out once when the row arrives, not on every frame: the list is filtered, sorted and
+    // counted by these, and with tens of thousands of rows the allocations add up.
+    name: String,
+    name_lower: String,
+    url_lower: String,
+    category: Category,
+}
+
+/// The row as the service sends it.
+#[derive(Deserialize)]
+struct RowWire {
+    id: u64,
+    url: String,
     #[serde(default)]
-    pub torrent: Option<reidm_core::TorrentStatus>,
+    referer: Option<String>,
+    #[serde(default)]
+    media: Option<Media>,
+    path: PathBuf,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    downloaded: u64,
+    status: Status,
+    #[serde(default)]
+    added: u64,
+    #[serde(default)]
+    last_try: Option<u64>,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    #[serde(default)]
+    resumable: bool,
+    #[serde(default)]
+    speed_limit: Option<u64>,
+    #[serde(default)]
+    scheduled: bool,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    connections: usize,
+    #[serde(default)]
+    parts: usize,
+    #[serde(default)]
+    torrent: Option<TorrentRow>,
+}
+
+impl From<RowWire> for Item {
+    fn from(w: RowWire) -> Item {
+        let name = w.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| w.path.to_string_lossy().into_owned());
+        let ext = w.path.extension().map(|e| e.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
+        Item {
+            id: w.id,
+            name_lower: name.to_lowercase(),
+            url_lower: w.url.to_lowercase(),
+            category: Category::of(&ext),
+            name,
+            request: Request { url: w.url, referer: w.referer, media: w.media },
+            path: w.path,
+            size: w.size,
+            downloaded: w.downloaded,
+            status: w.status,
+            added: w.added,
+            last_try: w.last_try,
+            finished_at: w.finished_at,
+            resumable: w.resumable,
+            speed_limit: w.speed_limit,
+            scheduled: w.scheduled,
+            note: w.note,
+            connections: w.connections,
+            parts: w.parts,
+            torrent: w.torrent,
+        }
+    }
 }
 
 impl Item {
@@ -110,24 +187,23 @@ impl Item {
     pub fn seeding(&self) -> bool {
         self.status == Status::Done && self.torrent.as_ref().is_some_and(|t| t.seeding)
     }
-}
 
-impl Item {
-    /// Connections transferring right now.
-    pub fn connections(&self) -> usize {
-        self.segments.iter().filter(|s| s.active).count()
+    pub fn file_name(&self) -> &str {
+        &self.name
     }
 
-    pub fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.to_string_lossy().into_owned())
+    /// The file name in lower case, for searching and sorting.
+    pub fn name_lower(&self) -> &str {
+        &self.name_lower
+    }
+
+    pub fn url_lower(&self) -> &str {
+        &self.url_lower
     }
 
     /// 0.0..=1.0, or `None` when the server never told us a size.
     pub fn fraction(&self) -> Option<f32> {
-        match (self.size, self.status.clone()) {
+        match (self.size, &self.status) {
             (Some(_), Status::Done) => Some(1.0),
             (Some(sz), _) if sz > 0 => Some((self.downloaded as f32 / sz as f32).clamp(0.0, 1.0)),
             _ => None,
@@ -136,14 +212,13 @@ impl Item {
 
     /// The category this file belongs to, from its extension.
     pub fn category(&self) -> Category {
-        let ext = self
-            .path
-            .extension()
-            .map(|e| e.to_string_lossy().to_ascii_uppercase())
-            .unwrap_or_default();
-        Category::of(&ext)
+        self.category
     }
 }
+
+/// A download with every field, for the Properties window: its segment map and a torrent's
+/// files, which list rows leave out.
+pub type Detail = reidm_core::Item;
 
 /// IDM groups downloads into a fixed set of categories; reIDM uses the same idea and the same
 /// extension vocabulary the browser extension sends in its type-4 settings message.
@@ -249,7 +324,7 @@ pub struct Schedule {
 }
 
 /// The daemon's settings, mirrored.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct Settings {
     #[serde(default)]
     pub default_dir: String,
@@ -276,7 +351,7 @@ pub struct Settings {
 }
 
 /// Where each type of file goes, as the service reports it.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct Folders {
     #[serde(default)]
     pub sort: bool,
@@ -293,7 +368,7 @@ pub struct Folders {
 }
 
 /// When reIDM's own browser extension last checked in.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct ExtensionSeen {
     #[serde(default)]
     pub seconds_ago: u64,

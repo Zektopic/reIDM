@@ -1,7 +1,7 @@
 //! *Tasks › Add torrent…*: a magnet link, a `.torrent` address or a `.torrent` file, and the
 //! files in it to download.
 
-use crate::api::Api;
+use crate::api::Client;
 use crate::model::size_human;
 use crate::theme::Palette;
 use egui::{RichText, Vec2};
@@ -23,12 +23,19 @@ pub struct TorrentWindow {
 }
 
 impl TorrentWindow {
+    /// Waiting on the service, so the window must keep drawing to notice the answer.
+    pub fn busy(&self) -> bool {
+        self.inspecting.is_some() || self.sending.is_some()
+    }
+}
+
+impl TorrentWindow {
     pub fn open_with(&mut self, url: Option<String>) {
         *self = TorrentWindow { open: true, url: url.unwrap_or_default(), ..Default::default() };
     }
 
     /// Draw the window. Returns a message for the status bar once the torrent is added.
-    pub fn show(&mut self, ctx: &egui::Context, api: &Api, p: &Palette) -> Option<String> {
+    pub fn show(&mut self, ctx: &egui::Context, api: &Client, p: &Palette) -> Option<String> {
         if !self.open {
             return None;
         }
@@ -133,9 +140,10 @@ impl TorrentWindow {
                 }
             });
             ui.separator();
-            egui::ScrollArea::vertical().max_height((ui.available_height() - 50.0).max(120.0)).auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("torrent-pick").num_columns(2).striped(true).spacing(Vec2::new(10.0, 4.0)).show(ui, |ui| {
-                    for (f, on) in info.files.iter().zip(self.picked.iter_mut()) {
+            // Only the files in view are laid out: a torrent can hold tens of thousands.
+            egui::ScrollArea::vertical().max_height((ui.available_height() - 50.0).max(120.0)).auto_shrink([false, false]).show_rows(ui, 22.0, info.files.len(), |ui, range| {
+                egui::Grid::new("torrent-pick").num_columns(2).striped(true).spacing(Vec2::new(10.0, 4.0)).min_row_height(18.0).show(ui, |ui| {
+                    for (f, on) in info.files[range.clone()].iter().zip(self.picked[range].iter_mut()) {
                         ui.checkbox(on, &f.path);
                         ui.label(RichText::new(size_human(f.size)).color(p.text_dim).size(12.0));
                         ui.end_row();
@@ -168,7 +176,7 @@ impl TorrentWindow {
         done
     }
 
-    fn start_inspect(&mut self, api: &Api) {
+    fn start_inspect(&mut self, api: &Client) {
         self.error = None;
         let data = self.file.as_ref().map(|(_, d)| d.clone());
         let url = (!self.url.trim().is_empty() && data.is_none()).then(|| self.url.trim().to_string());

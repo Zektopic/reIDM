@@ -9,10 +9,13 @@ mod api;
 mod app;
 mod icons;
 mod model;
+mod options;
 mod playlist;
 mod torrent;
 mod prefs;
 mod theme;
+mod view;
+mod worker;
 
 /// The window/taskbar icon, decoded from the PNG shipped in the repository.
 fn window_icon() -> Option<egui::IconData> {
@@ -42,15 +45,14 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let background = args.iter().any(|a| a == "--background");
 
-    // A daemon may already be running (started at login, or by `reidm daemon`); reuse it.
-    let started = api::ensure_daemon();
-    if !started {
-        eprintln!("reIDM: could not start the background download service. Is reidm installed next to this program?");
-    }
-
     // `--background` is what the login autostart runs: make sure the service is up, then exit
-    // without showing a window.
+    // without showing a window. With a window, the poller starts the service instead, so the
+    // window shows at once and says what it is waiting for.
     if background {
+        if !api::ensure_daemon() {
+            eprintln!("reIDM: could not start the background download service. Is reidm installed next to this program?");
+            std::process::exit(1);
+        }
         return Ok(());
     }
 

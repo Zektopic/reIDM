@@ -5,24 +5,35 @@
 //! bar. Every IDM feature the window shows is implemented; anything reIDM does not have is left
 //! out rather than shown as a dead button.
 
-use crate::api::{open_external, Api, BatchResult, Snapshot};
+use crate::api::{open_external, BatchResult, Client, Pace, Poller, Snapshot};
 use crate::icons;
-use crate::model::{eta_human, now_secs, rate_human, since_human, size_human, Category, Found, GrabOptions, Item, Schedule, Status, View, CATEGORIES};
+use crate::model::{eta_human, now_secs, rate_human, since_human, size_human, Category, Detail, Found, GrabOptions, Item, Schedule, Status, View, CATEGORIES};
+use crate::options::OptionsForm;
 use crate::prefs::Prefs;
 use crate::theme::{self, Palette};
+use crate::view::{SortKey, ViewModel};
+use crate::worker::{Reply, Worker};
 use egui::{Align, Layout, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-#[derive(PartialEq, Clone, Copy)]
-enum SortKey {
-    Name,
-    Size,
-    Status,
-    Rate,
-    LastTry,
+/// A reply from the command thread: what to do in the window with a command's result.
+fn reply(f: impl FnOnce(&mut App) + Send + 'static) -> Option<Reply<App>> {
+    Some(Box::new(f))
+}
+
+/// A confirmation the window is waiting for before doing something that can't be undone.
+enum Confirm {
+    /// Remove these from the list, and maybe delete their files.
+    Remove(Vec<u64>),
+    /// Start these again from the first byte.
+    Restart(Vec<u64>),
+    /// Remove every finished download from the list.
+    ClearCompleted(Vec<u64>),
+    /// The window is closing for the first time: say that downloads carry on.
+    Close,
 }
 
 struct Toast {
@@ -48,7 +59,28 @@ struct AddState {
     urls: String,
     name: String,
     dir: String,
+    /// The text `count` was worked out for: parsing ten thousand pasted lines on every frame
+    /// would make typing crawl.
+    parsed: String,
+    count: usize,
 }
+
+impl AddState {
+    /// How many addresses the text holds.
+    fn count(&mut self) -> usize {
+        if self.parsed != self.urls {
+            self.count = reidm_core::grabber::parse_url_list(&self.urls).len();
+            self.parsed = self.urls.clone();
+        }
+        self.count
+    }
+}
+
+/// The most addresses one batch pattern may make, as the service caps a batch.
+const MAX_BATCH: u64 = 10_000;
+
+/// What a batch preview depends on: the pattern, from, to and padding.
+type BatchKey = (String, String, String, usize);
 
 /// IDM's *Add batch download*: an address with one `*` and a range.
 struct BatchState {
@@ -57,12 +89,58 @@ struct BatchState {
     from: String,
     to: String,
     width: usize,
+    /// The addresses for `(pattern, from, to, width)`, worked out when one of them changes.
+    preview: Option<(BatchKey, Result<Vec<String>, String>)>,
 }
 
 impl Default for BatchState {
     fn default() -> Self {
-        Self { open: false, pattern: String::new(), from: "1".into(), to: "10".into(), width: 0 }
+        Self { open: false, pattern: String::new(), from: "1".into(), to: "10".into(), width: 0, preview: None }
     }
+}
+
+impl BatchState {
+    /// The addresses the pattern makes, or why it makes none.
+    fn expand(&mut self) -> Result<Vec<String>, String> {
+        let key = (self.pattern.clone(), self.from.clone(), self.to.clone(), self.width);
+        if let Some((k, r)) = &self.preview {
+            if *k == key {
+                return r.clone();
+            }
+        }
+        let r = expand_batch(&self.pattern, &self.from, &self.to, self.width);
+        self.preview = Some((key, r.clone()));
+        r
+    }
+}
+
+/// Expand an *Add batch download* pattern. The range is checked before anything is built, so a
+/// typo like `0` to `99999999999` is an error at once instead of a window that stops responding.
+fn expand_batch(pattern: &str, from: &str, to: &str, width: usize) -> Result<Vec<String>, String> {
+    use reidm_core::lists::{expand_pattern, Sequence};
+    let seq = match (from.trim().parse::<u64>(), to.trim().parse::<u64>()) {
+        (Ok(from), Ok(to)) => {
+            let n = to.checked_sub(from).and_then(|d| d.checked_add(1)).ok_or("To must not be less than From")?;
+            if n > MAX_BATCH {
+                return Err(format!("That is {n} addresses; one batch can hold at most {MAX_BATCH}"));
+            }
+            Sequence::Numbers { from, to, width: width.min(20) }
+        }
+        _ => {
+            let one = |s: &str| {
+                let mut c = s.trim().chars();
+                match (c.next(), c.next()) {
+                    (Some(ch), None) if ch.is_ascii_alphabetic() => Some(ch),
+                    _ => None,
+                }
+            };
+            match (one(from), one(to)) {
+                (Some(from), Some(to)) => Sequence::Letters { from, to },
+                _ => return Err("From and To must both be numbers, or both be single letters".to_string()),
+            }
+        }
+    };
+    expand_pattern(pattern, &seq).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -108,13 +186,26 @@ struct PropsState {
     id: u64,
     limit_on: bool,
     limit_kb: u32,
+    /// Every field of the download (its segments, a torrent's files), which list rows leave
+    /// out; refreshed about once a second while the window is open.
+    detail: Option<Detail>,
+    fetched: Option<Instant>,
+    fetching: bool,
 }
 
 pub struct App {
-    api: Api,
+    poller: Poller,
+    /// Quick commands, one at a time, off the window's thread.
+    cmd: Worker<App>,
+    /// For calls that take long enough to need a thread of their own.
+    client: Client,
     snap: Snapshot,
+    /// The visible rows and the counts, rebuilt only when the list or the view changes.
+    vm: ViewModel,
     view: View,
-    selected: Vec<u64>,
+    selected: HashSet<u64>,
+    /// The row last clicked: what Properties, Open and Enter act on.
+    focus: Option<u64>,
     anchor: Option<u64>,
     search: String,
     sort: SortKey,
@@ -122,27 +213,18 @@ pub struct App {
     prefs: Prefs,
     applied_theme: Option<bool>,
     toast: Option<Toast>,
-    last_error_shown: Option<String>,
 
     // dialogs
     add: AddState,
     batch: BatchState,
     show_options: bool,
-    opt_dir: String,
     opt_tab: OptTab,
-    opt_sort: bool,
-    /// Category name and its folder, as edited; empty is its default.
-    opt_folders: Vec<(&'static str, String)>,
-    opt_temp: String,
-    /// Seed until this ratio; 0 not at all, below 0 forever.
-    opt_seed: f64,
-    /// Upload limit in KB/s; 0 none.
-    opt_up_kb: u64,
-    opt_port: u16,
-    opt_dht: bool,
-    opt_conn: usize,
-    opt_max: usize,
-    confirm_remove: Vec<u64>,
+    /// The service's settings as edited in Options.
+    opt: OptionsForm,
+    /// The settings Options was opened with, to send only what changed; `None` until they have
+    /// loaded, and Save is not offered until then.
+    opt_base: Option<OptionsForm>,
+    confirm: Option<Confirm>,
     about: bool,
     refresh: Option<RefreshState>,
     sched: SchedEdit,
@@ -154,6 +236,8 @@ pub struct App {
     completed: Vec<u64>,
     last_status: HashMap<u64, Status>,
     primed: bool,
+    /// The snapshot `note_completions` last looked at.
+    noted_rev: u64,
 
     // updates
     update: Option<UpdateOffer>,
@@ -205,11 +289,24 @@ impl App {
             prefs.dark = true;
         }
         theme::apply(&cc.egui_ctx, prefs.dark);
+        let poller = Poller::start(Some(cc.egui_ctx.clone()));
+        let cmd = {
+            let (ctx, poke) = (cc.egui_ctx.clone(), poller.poke.clone());
+            Worker::start(poller.client.clone(), move || {
+                // Show the command's effect now rather than at the next poll.
+                let _ = poke.send(());
+                ctx.request_repaint();
+            })
+        };
         Self {
-            api: Api::start(),
+            client: poller.client.clone(),
+            poller,
+            cmd,
             snap: Snapshot::default(),
+            vm: ViewModel::default(),
             view: View::Category(Category::All),
-            selected: Vec::new(),
+            selected: HashSet::new(),
+            focus: None,
             anchor: None,
             search: String::new(),
             sort: SortKey::Name,
@@ -217,22 +314,13 @@ impl App {
             prefs,
             applied_theme: None,
             toast: None,
-            last_error_shown: None,
             add: AddState::default(),
             batch: BatchState::default(),
             show_options: false,
-            opt_dir: String::new(),
             opt_tab: OptTab::General,
-            opt_sort: true,
-            opt_folders: Vec::new(),
-            opt_temp: String::new(),
-            opt_seed: 1.0,
-            opt_up_kb: 0,
-            opt_port: 6881,
-            opt_dht: true,
-            opt_conn: 8,
-            opt_max: 4,
-            confirm_remove: Vec::new(),
+            opt: OptionsForm::from_settings(&Default::default()),
+            opt_base: None,
+            confirm: None,
             about: false,
             refresh: None,
             sched: SchedEdit::default(),
@@ -242,6 +330,7 @@ impl App {
             completed: Vec::new(),
             last_status: HashMap::new(),
             primed: false,
+            noted_rev: 0,
             update: None,
             update_rx: None,
             cats_open: true,
@@ -256,6 +345,16 @@ impl App {
 
     fn toast(&mut self, text: impl Into<String>) {
         self.toast = Some(Toast { text: text.into(), until: Instant::now() + Duration::from_secs(5) });
+    }
+
+    /// Waiting for an answer that arrives on a channel the window has to look at.
+    fn waiting(&self) -> bool {
+        self.update_rx.is_some()
+            || self.grab.rx.is_some()
+            || self.refresh.as_ref().is_some_and(|r| r.busy.is_some() || r.capturing)
+            || self.props.is_some()
+            || self.playlist.busy()
+            || self.torrent.busy()
     }
 
     // ── update checking ──────────────────────────────────────────────────
@@ -321,133 +420,144 @@ impl App {
     /// Notice downloads that have just finished, for IDM's "Download complete" window. The first
     /// snapshot only records state: downloads that finished before the window opened are old news.
     fn note_completions(&mut self) {
-        if !self.snap.connected {
+        if !self.snap.connected || self.snap.rev == self.noted_rev {
             return;
         }
-        for it in &self.snap.items {
+        self.noted_rev = self.snap.rev;
+        let mut ids = HashSet::with_capacity(self.snap.items.len());
+        for it in self.snap.items.iter() {
+            ids.insert(it.id);
             let before = self.last_status.insert(it.id, it.status.clone());
             let finished_now = it.status == Status::Done && before.is_some_and(|b| b != Status::Done);
             if self.primed && finished_now && self.prefs.notify_complete && !self.completed.contains(&it.id) {
                 self.completed.push(it.id);
             }
         }
-        let ids: Vec<u64> = self.snap.items.iter().map(|i| i.id).collect();
         self.last_status.retain(|id, _| ids.contains(id));
         self.completed.retain(|id| ids.contains(id));
+        self.selected.retain(|id| ids.contains(id));
         self.primed = true;
     }
 
-    fn visible(&self) -> Vec<&Item> {
-        let q = self.search.trim().to_ascii_lowercase();
-        let mut v: Vec<&Item> = self
-            .snap
-            .items
-            .iter()
-            .filter(|i| self.view.matches(i))
-            .filter(|i| q.is_empty() || i.file_name().to_ascii_lowercase().contains(&q) || i.request.url.to_ascii_lowercase().contains(&q))
-            .collect();
-        let rate = |i: &Item| self.snap.rates.get(&i.id).copied().unwrap_or(0.0);
-        v.sort_by(|a, b| {
-            let o = match self.sort {
-                SortKey::Name => a.file_name().to_ascii_lowercase().cmp(&b.file_name().to_ascii_lowercase()),
-                SortKey::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
-                SortKey::Status => a.status.label().cmp(b.status.label()),
-                SortKey::Rate => rate(a).partial_cmp(&rate(b)).unwrap_or(std::cmp::Ordering::Equal),
-                SortKey::LastTry => a.last_try.unwrap_or(0).cmp(&b.last_try.unwrap_or(0)),
-            };
-            if self.desc {
-                o.reverse()
-            } else {
-                o
-            }
-        });
-        v
-    }
-
-    fn count(&self, v: View) -> usize {
-        self.snap.items.iter().filter(|i| v.matches(i)).count()
-    }
-
     fn item(&self, id: u64) -> Option<&Item> {
-        self.snap.items.iter().find(|i| i.id == id)
+        self.snap.item(id)
     }
 
     // ── selection ────────────────────────────────────────────────────────
 
     fn select_only(&mut self, id: u64) {
-        self.selected = vec![id];
+        self.selected.clear();
+        self.selected.insert(id);
         self.anchor = Some(id);
+        self.focus = Some(id);
     }
 
     fn toggle_select(&mut self, id: u64) {
-        if let Some(p) = self.selected.iter().position(|x| *x == id) {
-            self.selected.remove(p);
-        } else {
-            self.selected.push(id);
+        if !self.selected.remove(&id) {
+            self.selected.insert(id);
             self.anchor = Some(id);
+            self.focus = Some(id);
         }
     }
 
-    fn select_range(&mut self, id: u64, ordered: &[u64]) {
+    fn select_range(&mut self, id: u64) {
         let Some(a) = self.anchor else { return self.select_only(id) };
+        let ordered: Vec<u64> = self.vm.ids(&self.snap).collect();
         let (Some(i), Some(j)) = (ordered.iter().position(|x| *x == a), ordered.iter().position(|x| *x == id)) else {
             return self.select_only(id);
         };
         let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
-        self.selected = ordered[lo..=hi].to_vec();
+        self.selected = ordered[lo..=hi].iter().copied().collect();
+        self.focus = Some(id);
     }
 
+    /// The selected downloads, in list order.
     fn selected_items(&self) -> Vec<&Item> {
-        self.snap.items.iter().filter(|i| self.selected.contains(&i.id)).collect()
+        let mut v: Vec<&Item> = self.selected.iter().filter_map(|id| self.item(*id)).collect();
+        v.sort_by_key(|i| i.id);
+        v
+    }
+
+    fn selected_ids(&self) -> Vec<u64> {
+        self.selected_items().iter().map(|i| i.id).collect()
     }
 
     // ── commands ─────────────────────────────────────────────────────────
+    //
+    // Each runs on the command thread; its result comes back as a toast.
+
+    /// One action on many downloads, in one request.
+    fn bulk(&mut self, ids: Vec<u64>, action: &'static str, done: impl FnOnce(usize) -> String + Send + 'static) {
+        if ids.is_empty() {
+            return;
+        }
+        self.cmd.run(move |c| {
+            let r = c.bulk(&ids, action);
+            reply(move |app: &mut App| match r {
+                Ok((n, None)) => app.toast(done(n)),
+                Ok((0, Some(e))) => app.toast(format!("Could not {}: {e}", action.replace('-', " "))),
+                Ok((n, Some(e))) => app.toast(format!("{} — {e}", done(n))),
+                Err(e) => app.toast(format!("Could not {}: {e}", action.replace('-', " "))),
+            })
+        });
+    }
+
+    /// A single action whose failure is worth saying (open, seed…).
+    fn action(&self, id: u64, what: &'static str) {
+        self.cmd.run(move |c| {
+            let r = c.post(&format!("/api/downloads/{id}/{what}"), serde_json::json!({}));
+            r.err().and_then(|e| reply(move |app: &mut App| app.toast(format!("Could not {}: {e}", what.replace('-', " ")))))
+        });
+    }
 
     fn start_selected(&mut self) {
         let ids: Vec<u64> = self.selected_items().iter().filter(|i| i.status.is_stopped()).map(|i| i.id).collect();
         if ids.is_empty() {
-            return self.toast("Select a paused or failed download to start");
+            return self.toast("Select a paused or failed download to resume");
         }
-        for id in ids {
-            self.api.action(id, "resume");
-        }
+        self.bulk(ids, "resume", |n| format!("Resumed {n} download(s)"));
     }
 
     fn stop_selected(&mut self) {
         let ids: Vec<u64> = self.selected_items().iter().filter(|i| i.status.is_active()).map(|i| i.id).collect();
         if ids.is_empty() {
-            return self.toast("Select a running download to stop");
+            return self.toast("Select a running download to pause");
         }
-        for id in ids {
-            self.api.action(id, "pause");
-        }
+        self.bulk(ids, "pause", |n| format!("Paused {n} download(s)"));
     }
 
     fn stop_all(&mut self) {
-        self.api.stop_all();
+        let ids: Vec<u64> = self.snap.items.iter().filter(|i| i.status.is_active()).map(|i| i.id).collect();
+        if ids.is_empty() {
+            return self.toast("Nothing is downloading");
+        }
+        self.bulk(ids, "pause", |n| format!("Paused {n} download(s)"));
     }
 
+    fn start_all(&mut self) {
+        let ids: Vec<u64> = self.snap.items.iter().filter(|i| i.status.is_stopped()).map(|i| i.id).collect();
+        if ids.is_empty() {
+            return self.toast("Nothing is paused");
+        }
+        self.bulk(ids, "resume", |n| format!("Resumed {n} download(s)"));
+    }
+
+    /// Ask first: restarting throws away what has arrived, and for a finished download replaces
+    /// the file.
     fn restart_selected(&mut self) {
-        let ids: Vec<u64> = self.selected.clone();
+        let ids = self.selected_ids();
         if ids.is_empty() {
             return self.toast("Select a download to restart");
         }
-        for id in ids {
-            if let Err(e) = self.api.try_action(id, "restart") {
-                return self.toast(format!("could not restart: {e}"));
-            }
-        }
-        self.toast("Restarted from the beginning");
+        self.confirm = Some(Confirm::Restart(ids));
     }
 
     fn set_queued(&mut self, queued: bool) {
-        let ids = self.selected.clone();
+        let ids = self.selected_ids();
         if ids.is_empty() {
             return self.toast("Select a download first");
         }
-        // The service refuses to queue a finished download, so count what it accepted.
-        let n = ids.iter().filter(|id| self.api.try_action(**id, if queued { "schedule" } else { "unschedule" }).is_ok()).count();
-        self.toast(match (queued, n) {
+        self.bulk(ids, if queued { "schedule" } else { "unschedule" }, move |n| match (queued, n) {
             (true, 0) => "Finished downloads can't be added to the scheduled queue".to_string(),
             (true, n) => format!("{n} added to the scheduled queue"),
             (false, n) => format!("{n} removed from the scheduled queue"),
@@ -455,37 +565,67 @@ impl App {
     }
 
     fn queue_now(&mut self, start: bool) {
-        match self.api.queue(start) {
-            Ok(0) if start => self.toast("Nothing in the scheduled queue is waiting to start"),
-            Ok(0) => self.toast("Nothing in the scheduled queue is running"),
-            Ok(n) => self.toast(if start { format!("Started the queue: {n} download(s)") } else { format!("Stopped the queue: {n} download(s)") }),
-            Err(e) => self.toast(format!("could not {} the queue: {e}", if start { "start" } else { "stop" })),
-        }
+        self.cmd.run(move |c| {
+            let r = c.post(&format!("/api/queue/{}", if start { "start" } else { "stop" }), serde_json::json!({}));
+            let r = r.map(|t| serde_json::from_str::<serde_json::Value>(&t).ok().and_then(|v| v["count"].as_u64()).unwrap_or(0));
+            reply(move |app: &mut App| match r {
+                Ok(0) if start => app.toast("Nothing in the scheduled queue is waiting to start"),
+                Ok(0) => app.toast("Nothing in the scheduled queue is running"),
+                Ok(n) => app.toast(if start { format!("Started the queue: {n} download(s)") } else { format!("Stopped the queue: {n} download(s)") }),
+                Err(e) => app.toast(format!("Could not {} the queue: {e}", if start { "start" } else { "stop" })),
+            })
+        });
     }
 
+    /// Ask first, with the count: this empties the history, with no undo.
     fn delete_completed(&mut self) {
         let done: Vec<u64> = self.snap.items.iter().filter(|i| i.status == Status::Done).map(|i| i.id).collect();
         if done.is_empty() {
             return self.toast("There are no completed downloads");
         }
-        for id in done.iter() {
-            self.api.remove(*id, false);
+        self.confirm = Some(Confirm::ClearCompleted(done));
+    }
+
+    fn ask_remove(&mut self) {
+        let ids = self.selected_ids();
+        if ids.is_empty() {
+            return self.toast("Select the downloads to remove");
         }
-        self.selected.clear();
-        self.toast(format!("Removed {} completed download(s)", done.len()));
+        self.confirm = Some(Confirm::Remove(ids));
+    }
+
+    /// Stop the background service too, and close the window. Downloads carry on from where
+    /// they stopped the next time reIDM starts.
+    fn quit_completely(&mut self, ctx: &egui::Context) {
+        self.prefs.close_explained = true;
+        self.prefs.save();
+        let ctx = ctx.clone();
+        self.cmd.run(move |c| {
+            let r = c.post("/api/shutdown", serde_json::json!({}));
+            reply(move |app: &mut App| match r {
+                Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(e) => app.toast(format!("Could not stop the background service: {e}")),
+            })
+        });
     }
 
     fn remove_ids(&mut self, ids: &[u64], purge: bool) {
         for id in ids {
-            self.api.remove(*id, purge);
+            self.selected.remove(id);
         }
-        self.selected.retain(|x| !ids.contains(x));
-        let n = ids.len();
-        self.toast(match (purge, n) {
+        self.bulk(ids.to_vec(), if purge { "purge" } else { "remove" }, move |n| match (purge, n) {
             (true, 1) => "Download and file removed".to_string(),
             (true, n) => format!("{n} downloads and their files removed"),
             (false, 1) => "Download removed from the list".to_string(),
             (false, n) => format!("{n} downloads removed from the list"),
+        });
+    }
+
+    /// Set the service's settings, then say how it went.
+    fn save_settings(&self, patch: serde_json::Value, done: impl FnOnce(&mut App, Result<(), String>) + Send + 'static) {
+        self.cmd.run(move |c| {
+            let r = c.post("/api/settings", patch).map(|_| ());
+            reply(move |app: &mut App| done(app, r))
         });
     }
 
@@ -524,8 +664,16 @@ impl App {
         if urls.is_empty() {
             return self.toast("No URLs to add");
         }
-        let r = self.api.add_batch(&urls, later);
-        self.report_batch(r, later);
+        self.queue_batch(serde_json::json!({ "urls": urls, "later": later }), later);
+    }
+
+    fn queue_batch(&mut self, body: serde_json::Value, later: bool) {
+        self.toast("Adding…");
+        self.cmd.run(move |c| {
+            // A big batch can keep the service busy for a while.
+            let r = c.with_timeout(Duration::from_secs(600)).batch(body);
+            reply(move |app: &mut App| app.report_batch(r, later))
+        });
     }
 
     /// Open the Add URL dialog, with whatever links are on the clipboard.
@@ -563,8 +711,7 @@ impl App {
                     if entries.is_empty() {
                         return self.toast("That IDM export holds no downloads");
                     }
-                    let r = self.api.add_entries(&entries, false);
-                    self.report_batch(r, false);
+                    self.queue_batch(serde_json::json!({ "items": entries, "later": false }), false);
                 } else {
                     self.queue_urls(reidm_core::grabber::parse_url_list(&text), false);
                 }
@@ -587,10 +734,14 @@ impl App {
         else {
             return;
         };
-        match self.api.export(format).map_err(|e| e.to_string()).and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string())) {
-            Ok(()) => self.toast(format!("Exported {} download(s) to {}", self.snap.items.len(), path.display())),
-            Err(e) => self.toast(format!("could not export: {e}")),
-        }
+        let n = self.snap.items.len();
+        self.cmd.run(move |c| {
+            let r = c.with_timeout(Duration::from_secs(120)).get(&format!("/api/export?format={format}")).and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+            reply(move |app: &mut App| match r {
+                Ok(()) => app.toast(format!("Exported {n} download(s) to {}", path.display())),
+                Err(e) => app.toast(format!("Could not export: {e}")),
+            })
+        });
     }
 
     /// Export just the grabber's results as a URL list.
@@ -620,7 +771,7 @@ impl App {
             exclude: self.grab.exclude.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect(),
             sizes: self.grab.sizes,
         };
-        self.grab.rx = Some(self.api.grab_async(&url, &opts));
+        self.grab.rx = Some(self.client.grab_async(&url, &opts));
         self.grab.scanning = true;
         self.grab.error = None;
     }
@@ -696,7 +847,7 @@ impl App {
     }
 
     fn open_selected(&mut self, reveal: bool) {
-        let Some(id) = self.selected.last().copied() else {
+        let Some(id) = self.focus.filter(|id| self.selected.contains(id)) else {
             return self.toast("Select a download first");
         };
         self.open_id(id, reveal);
@@ -707,12 +858,35 @@ impl App {
         if !matches!(it.status, Status::Done) && !reveal {
             return self.toast("That download has not finished yet");
         }
-        self.api.action(id, if reveal { "folder" } else { "open" });
+        self.action(id, if reveal { "folder" } else { "open" });
     }
 
     fn open_props(&mut self, id: u64) {
         let limit = self.item(id).and_then(|i| i.speed_limit);
-        self.props = Some(PropsState { id, limit_on: limit.is_some(), limit_kb: limit.map(|l| (l / 1024) as u32).unwrap_or(512).max(1) });
+        self.props = Some(PropsState { id, limit_on: limit.is_some(), limit_kb: limit.map(|l| (l / 1024) as u32).unwrap_or(512).max(1), detail: None, fetched: None, fetching: false });
+    }
+
+    /// Keep Properties' full copy of its download fresh: about once a second, and never more
+    /// than one request at a time.
+    fn refresh_props(&mut self) {
+        let Some(st) = &mut self.props else { return };
+        if st.fetching || st.fetched.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        st.fetching = true;
+        let id = st.id;
+        self.cmd.run(move |c| {
+            let d = c.detail(id).ok();
+            reply(move |app: &mut App| {
+                if let Some(st) = app.props.as_mut().filter(|st| st.id == id) {
+                    st.fetching = false;
+                    st.fetched = Some(Instant::now());
+                    if d.is_some() {
+                        st.detail = d;
+                    }
+                }
+            })
+        });
     }
 
     fn open_refresh(&mut self, id: u64) {
@@ -724,8 +898,15 @@ impl App {
         self.refresh = Some(RefreshState { id, url: String::new(), busy: None, error: None, capturing: false, old_url });
     }
 
+    /// The service's settings as last polled (at most a few seconds old), or why there are none.
+    fn known_settings(&self) -> Option<crate::model::Settings> {
+        self.snap.service.settings.clone()
+    }
+
     fn open_scheduler(&mut self) {
-        let s = self.api.fetch_settings().map(|s| s.schedule).unwrap_or_default();
+        let Some(s) = self.known_settings().map(|s| s.schedule) else {
+            return self.toast("The scheduler's settings haven't loaded yet: is the download service running?");
+        };
         let mut days = [false; 7];
         for d in &s.days {
             if let Some(slot) = days.get_mut(*d as usize) {
@@ -747,35 +928,52 @@ impl App {
     }
 
     fn open_limiter(&mut self) {
-        let s = self.api.fetch_settings().unwrap_or_default();
+        let Some(s) = self.known_settings() else {
+            return self.toast("The speed limiter's settings haven't loaded yet: is the download service running?");
+        };
         self.limiter = LimiterEdit { open: true, on: s.limit_enabled, kb: if s.speed_limit > 0 { (s.speed_limit / 1024) as u32 } else { 1024 } };
     }
 
-    fn open_options(&mut self) {
-        if let Some(s) = self.api.fetch_settings() {
-            self.opt_dir = s.default_dir;
-            self.opt_conn = s.connections.max(1);
-            self.opt_max = s.max_concurrent.max(1);
-            self.opt_sort = s.folders.sort;
-            // Only the folders the user chose are shown filled in; the rest follow the
-            // download folder, and show it greyed as their hint.
-            self.opt_folders = reidm_core::category::ALL
-                .iter()
-                .map(|c| (c.name(), if s.folders.custom.iter().any(|n| n == c.name()) { s.folders.dirs.get(c.name()).cloned().unwrap_or_default() } else { String::new() }))
-                .collect();
-            self.opt_temp = if s.folders.temp_custom { s.folders.temp_dir } else { String::new() };
-            self.opt_seed = s.seed_ratio;
-            self.opt_up_kb = s.upload_limit / 1024;
-            self.opt_port = s.torrent_port;
-            self.opt_dht = s.torrent_dht;
+    /// Turn the limiter on or off from the menu. With no rate chosen yet, "on" would limit
+    /// nothing, so that opens the limiter's settings instead.
+    fn toggle_limiter(&mut self) {
+        let Some(s) = self.known_settings() else { return self.open_limiter() };
+        if !s.limit_enabled && s.speed_limit == 0 {
+            return self.open_limiter();
         }
+        let on = !s.limit_enabled;
+        self.save_settings(serde_json::json!({ "limit_enabled": on }), move |app, r| match r {
+            Ok(()) => app.toast(if on { "Speed limiter on" } else { "Speed limiter off" }),
+            Err(e) => app.toast(format!("Could not change the speed limiter: {e}")),
+        });
+    }
+
+    /// Options opens on the settings last polled, and fetches them again: Save sends only what
+    /// changed against those, and is offered only once they are known.
+    fn open_options(&mut self) {
+        self.opt_base = self.known_settings().map(|s| OptionsForm::from_settings(&s));
+        if let Some(b) = &self.opt_base {
+            self.opt = b.clone();
+        }
+        self.cmd.run(|c| {
+            let s = c.settings();
+            reply(move |app: &mut App| {
+                let Ok(s) = s else { return };
+                let fresh = OptionsForm::from_settings(&s);
+                // Unless the user has started editing, show the very latest.
+                if app.opt_base.as_ref().is_none_or(|b| *b == app.opt) {
+                    app.opt = fresh.clone();
+                    app.opt_base = Some(fresh);
+                }
+            })
+        });
         self.opt_tab = OptTab::General;
         self.show_options = true;
     }
 
     /// *Add YouTube playlist*, with a playlist link from the clipboard already filled in.
     fn open_playlist(&mut self) {
-        let s = self.api.fetch_settings().unwrap_or_default();
+        let s = self.known_settings().unwrap_or_default();
         let dir = |n: &str| s.folders.dirs.get(n).cloned().unwrap_or_else(|| s.default_dir.clone());
         let (video, music) = if s.folders.sort { (dir("Video"), dir("Music")) } else { (s.default_dir.clone(), s.default_dir.clone()) };
         let clip = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()).map(|t| t.trim().to_string()).filter(|t| t.starts_with("http") && (t.contains("list=") || t.contains("/@") || t.contains("/channel/")));
@@ -784,7 +982,7 @@ impl App {
 
     /// Where a category goes when the user hasn't chosen: under the download folder.
     fn default_folder(&self, name: &str) -> String {
-        let base = std::path::Path::new(&self.opt_dir);
+        let base = std::path::Path::new(&self.opt.dir);
         if name == reidm_core::Category::General.name() { base.to_string_lossy().into_owned() } else { base.join(name).to_string_lossy().into_owned() }
     }
 
@@ -804,13 +1002,13 @@ impl App {
             )
         });
         if del && !self.selected.is_empty() {
-            self.confirm_remove = self.selected.clone();
+            self.confirm = Some(Confirm::Remove(self.selected_ids()));
         }
         if all {
-            self.selected = self.visible().iter().map(|i| i.id).collect();
+            self.selected = self.vm.ids(&self.snap).collect();
         }
         if enter {
-            if let Some(id) = self.selected.last().copied() {
+            if let Some(id) = self.focus.filter(|id| self.selected.contains(id)) {
                 if self.item(id).is_some_and(|i| i.status == Status::Done) {
                     self.open_id(id, false);
                 } else {
@@ -826,27 +1024,35 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if let Some(s) = self.api.try_recv() {
+        let ctx = ui.ctx().clone();
+        if let Some(s) = self.poller.rx.try_iter().last() {
             self.snap = s;
             self.note_completions();
-            if self.snap.last_error != self.last_error_shown {
-                self.last_error_shown = self.snap.last_error.clone();
-                if let Some(e) = self.snap.last_error.clone().filter(|_| self.snap.connected) {
-                    self.toast(e);
-                }
-            }
         }
+        for r in self.cmd.replies() {
+            r(self);
+        }
+        self.vm.update(&self.snap, self.view, &self.search, self.sort, self.desc);
         self.poll_update();
         self.poll_grab();
         self.poll_refresh();
+        self.refresh_props();
         // One check shortly after launch, so a new release is noticed without the user going
         // looking. It is a single GET to api.github.com and reports nothing back to us.
         if !self.checked_on_start && self.snap.connected {
             self.checked_on_start = true;
             self.check_for_updates();
         }
+        // The first time the window is closed, say that downloads carry on without it.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.prefs.close_explained && self.snap.connected {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Some(Confirm::Close);
+        }
+        // Poll as often as what is on screen deserves.
+        let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
+        let busy = self.vm.counts.running > 0 || self.snap.total_rate > 0.0;
+        self.poller.pace.set(Pace::for_window(busy, focused, minimized));
 
-        let ctx = ui.ctx().clone();
         if self.applied_theme != Some(self.prefs.dark) {
             theme::apply(&ctx, self.prefs.dark);
             if self.applied_theme.is_some() {
@@ -870,14 +1076,14 @@ impl eframe::App for App {
         self.add_dialog(&ctx, &p);
         self.batch_dialog(&ctx, &p);
         self.options_dialog(&ctx, &p);
-        if let Some(msg) = self.playlist.show(&ctx, &self.api, &p) {
+        if let Some(msg) = self.playlist.show(&ctx, &self.client, &p) {
             self.toast(msg);
         }
-        if let Some(msg) = self.torrent.show(&ctx, &self.api, &p) {
+        if let Some(msg) = self.torrent.show(&ctx, &self.client, &p) {
             self.toast(msg);
         }
         self.about_dialog(&ctx);
-        self.confirm_dialog(&ctx);
+        self.confirm_dialog(&ctx, &p);
         self.grabber_window(&ctx, &p);
         self.props_window(&ctx, &p);
         self.refresh_window(&ctx, &p);
@@ -886,8 +1092,14 @@ impl eframe::App for App {
         self.integration_window(&ctx, &p);
         self.complete_window(&ctx, &p);
 
+        // Draw again only when something will have changed. A new snapshot and a command's
+        // answer each ask for a frame themselves; what is left is time passing.
+        let mut next = Duration::from_secs(30); // "Last Try" says "2 min ago"
         if let Some(t) = &self.toast {
-            if Instant::now() < t.until {
+            let left = t.until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                self.toast = None;
+            } else {
                 egui::Area::new(egui::Id::new("toast"))
                     .anchor(egui::Align2::CENTER_BOTTOM, Vec2::new(0.0, -48.0))
                     .order(egui::Order::Tooltip)
@@ -897,12 +1109,14 @@ impl eframe::App for App {
                             ui.label(RichText::new(&t.text).color(p.text));
                         });
                     });
-            } else {
-                self.toast = None;
+                next = next.min(left);
             }
         }
-
-        ctx.request_repaint_after(Duration::from_millis(200));
+        if self.waiting() {
+            // An answer arriving on a channel of our own doesn't wake the window.
+            next = next.min(Duration::from_millis(250));
+        }
+        ctx.request_repaint_after(next);
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -947,7 +1161,7 @@ impl App {
         }
         if open {
             self.about = false;
-            self.api.open_url(&url);
+            open_external(&url);
         }
     }
 
@@ -1010,49 +1224,50 @@ impl App {
                             ui.close();
                         }
                         if ui.button("Properties…").clicked() {
-                            if let Some(id) = self.selected.last().copied() {
+                            if let Some(id) = self.focus.filter(|id| self.selected.contains(id)) {
                                 self.open_props(id);
                             }
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Delete").clicked() {
-                            self.confirm_remove = self.selected.clone();
+                        if ui.button("Remove…").clicked() {
+                            self.ask_remove();
                             ui.close();
                         }
-                        if ui.button("Delete completed").clicked() {
+                        if ui.button("Remove completed…").clicked() {
                             self.delete_completed();
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui.button("Quit reIDM completely (stops downloads)").clicked() {
+                            self.quit_completely(ui.ctx());
                             ui.close();
                         }
                     });
                     ui.menu_button("Downloads", |ui| {
-                        if ui.button("Start").clicked() {
+                        if ui.button("Resume").clicked() {
                             self.start_selected();
                             ui.close();
                         }
-                        if ui.button("Stop").clicked() {
+                        if ui.button("Pause").clicked() {
                             self.stop_selected();
                             ui.close();
                         }
-                        if ui.button("Start all").clicked() {
-                            for i in self.snap.items.clone() {
-                                if i.status.is_stopped() {
-                                    self.api.action(i.id, "resume");
-                                }
-                            }
+                        if ui.button("Resume all").clicked() {
+                            self.start_all();
                             ui.close();
                         }
-                        if ui.button("Stop all").clicked() {
+                        if ui.button("Pause all").clicked() {
                             self.stop_all();
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Restart").clicked() {
+                        if ui.button("Restart from the beginning…").clicked() {
                             self.restart_selected();
                             ui.close();
                         }
                         if ui.button("Refresh download address…").clicked() {
-                            match self.selected.last().copied() {
+                            match self.focus.filter(|id| self.selected.contains(id)) {
                                 Some(id) => self.open_refresh(id),
                                 None => self.toast("Select the download whose address expired"),
                             }
@@ -1074,7 +1289,7 @@ impl App {
                         ui.separator();
                         let on = self.snap.service.settings.as_ref().is_some_and(|s| s.limit_enabled);
                         if ui.button(if on { "Speed limiter: turn off" } else { "Speed limiter: turn on" }).clicked() {
-                            let _ = self.api.update_settings(serde_json::json!({ "limit_enabled": !on }));
+                            self.toggle_limiter();
                             ui.close();
                         }
                         if ui.button("Speed limiter settings…").clicked() {
@@ -1119,7 +1334,7 @@ impl App {
                     });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let (txt, col) = if self.snap.connected { ("Service running", p.ok) } else { ("Service unavailable", p.err) };
+                        let (txt, col) = if self.snap.connected { ("Ready", p.ok) } else { ("Background service not running", p.err) };
                         ui.label(RichText::new(txt).color(col).size(12.0));
                         // Painted: the bundled font has no reliable bullet glyph.
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
@@ -1148,20 +1363,17 @@ impl App {
                     if tool(ui, p, "Resume", Icon::Play, false).clicked() {
                         self.start_selected();
                     }
-                    if tool(ui, p, "Stop", Icon::Pause, false).clicked() {
+                    if tool(ui, p, "Pause", Icon::Pause, false).clicked() {
                         self.stop_selected();
                     }
-                    if tool(ui, p, "Stop All", Icon::PauseAll, false).clicked() {
+                    if tool(ui, p, "Pause All", Icon::PauseAll, false).clicked() {
                         self.stop_all();
                     }
                     sep(ui);
-                    if tool(ui, p, "Delete", Icon::Cross, false).clicked() {
-                        self.confirm_remove = self.selected.clone();
-                        if self.confirm_remove.is_empty() {
-                            self.toast("Select the downloads to delete");
-                        }
+                    if tool(ui, p, "Remove", Icon::Cross, false).clicked() {
+                        self.ask_remove();
                     }
-                    if tool(ui, p, "Delete\nCompleted", Icon::CrossAll, false).clicked() {
+                    if tool(ui, p, "Remove\nCompleted", Icon::CrossAll, false).clicked() {
                         self.delete_completed();
                     }
                     sep(ui);
@@ -1221,7 +1433,7 @@ impl App {
                     let all = View::Category(Category::All);
                     let on_all = self.view == all;
                     ui.painter().text(r.min + Vec2::new(50.0, 11.0), egui::Align2::LEFT_CENTER, "All Downloads", egui::FontId::proportional(12.5), if on_all { p.accent } else { p.text });
-                    ui.painter().text(r.right_center() - Vec2::new(8.0, 0.0), egui::Align2::RIGHT_CENTER, self.snap.items.len().to_string(), egui::FontId::proportional(11.5), p.text_dim);
+                    ui.painter().text(r.right_center() - Vec2::new(8.0, 0.0), egui::Align2::RIGHT_CENTER, self.vm.counts.total.to_string(), egui::FontId::proportional(11.5), p.text_dim);
                     if resp.clicked() {
                         // The chevron toggles; the label selects.
                         if ui.input(|i| i.pointer.interact_pos()).is_some_and(|pos| pos.x < r.min.x + 30.0) {
@@ -1235,14 +1447,14 @@ impl App {
                         for c in CATEGORIES.into_iter().filter(|c| *c != Category::All) {
                             let v = View::Category(c);
                             let dark = self.prefs.dark;
-                            if tree_row(ui, p, 34.0, c.label(), Some(self.count(v)), self.view == v, |pt, r| icons::file_card(pt, r, c, dark)) {
+                            if tree_row(ui, p, 34.0, c.label(), Some(self.vm.counts.of(v)), self.view == v, |pt, r| icons::file_card(pt, r, c, dark)) {
                                 self.view = v;
                             }
                         }
                     }
                     for (v, done) in [(View::Unfinished, false), (View::Finished, true)] {
                         let col = if done { p.ok } else { p.accent };
-                        if tree_row(ui, p, 16.0, v.label(), Some(self.count(v)), self.view == v, |pt, r| {
+                        if tree_row(ui, p, 16.0, v.label(), Some(self.vm.counts.of(v)), self.view == v, |pt, r| {
                             if done {
                                 icons::dot(pt, r, col)
                             } else {
@@ -1258,7 +1470,7 @@ impl App {
                 ui.label(RichText::new("QUEUES").size(10.0).color(p.text_dim).strong());
                 let q = View::Queue;
                 let qcol = p.text_dim;
-                if tree_row(ui, p, 4.0, q.label(), Some(self.count(q)), self.view == q, |pt, r| icons::clock(pt, r, qcol)) {
+                if tree_row(ui, p, 4.0, q.label(), Some(self.vm.counts.of(q)), self.view == q, |pt, r| icons::clock(pt, r, qcol)) {
                     self.view = q;
                 }
                 ui.add_space(8.0);
@@ -1275,12 +1487,10 @@ impl App {
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(10, 5)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let active = self.snap.items.iter().filter(|i| i.status == Status::Running).count();
-                    let done = self.snap.items.iter().filter(|i| i.status == Status::Done).count();
-                    let failed = self.snap.items.iter().filter(|i| matches!(i.status, Status::Failed(_))).count();
-                    let queued = self.snap.items.iter().filter(|i| i.scheduled && i.status != Status::Done).count();
+                    let c = &self.vm.counts;
+                    let (active, done, failed, queued) = (c.running, c.done, c.failed, c.queued);
 
-                    let mut parts = vec![format!("{} total", self.snap.items.len())];
+                    let mut parts = vec![format!("{} total", c.total)];
                     if active > 0 {
                         parts.push(format!("{active} downloading"));
                     }
@@ -1374,8 +1584,9 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(p.panel_alt).inner_margin(egui::Margin::ZERO))
             .show(ui, |ui| {
-                let rows = self.visible();
-                let ordered: Vec<u64> = rows.iter().map(|i| i.id).collect();
+                // Shared, not copied: the snapshot's rows and the view's order.
+                let snap = self.snap.clone();
+                let rows = std::mem::take(&mut self.vm.rows);
                 let mut click: Option<(u64, bool, bool)> = None; // id, ctrl, shift
                 let mut check_click: Option<u64> = None;
                 let mut open_req: Option<u64> = None;
@@ -1386,8 +1597,15 @@ impl App {
                 let now = now_secs();
 
                 if rows.is_empty() {
+                    let waiting = (!self.snap.connected).then(|| self.snap.problem.clone()).flatten();
                     ui.vertical_centered(|ui| {
                         ui.add_space(60.0);
+                        if let Some(why) = &waiting {
+                            ui.label(RichText::new(why).color(p.warn));
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("The list appears here as soon as reIDM's background service answers.").color(p.text_dim));
+                            return;
+                        }
                         ui.label(
                             RichText::new(if self.snap.items.is_empty() {
                                 "No downloads yet — use Add URL, or start a download in your browser."
@@ -1399,15 +1617,15 @@ impl App {
                             .color(p.text_dim),
                         );
                     });
+                    self.vm.rows = rows;
                     return;
                 }
 
                 // Header checkbox state: all / none / some of the visible rows.
-                let visible_ids: Vec<u64> = ordered.clone();
-                let selected_visible = visible_ids.iter().filter(|id| self.selected.contains(id)).count();
+                let selected_visible = if self.selected.is_empty() { 0 } else { rows.iter().filter(|&&i| self.selected.contains(&snap.items[i].id)).count() };
                 let header_check = if selected_visible == 0 {
                     Some(false)
-                } else if selected_visible == visible_ids.len() {
+                } else if selected_visible == rows.len() {
                     Some(true)
                 } else {
                     None
@@ -1470,15 +1688,15 @@ impl App {
                         h(&mut header, "File Name", SortKey::Name);
                         h(&mut header, "Size", SortKey::Size);
                         h(&mut header, "Status", SortKey::Status);
-                        h(&mut header, "Time Left", SortKey::Rate);
+                        h(&mut header, "Time Left", SortKey::TimeLeft);
                         h(&mut header, "Transfer Rate", SortKey::Rate);
                         h(&mut header, "Last Try", SortKey::LastTry);
-                        h(&mut header, "Description", SortKey::Name);
+                        h(&mut header, "Address", SortKey::Address);
                     })
                     .body(|body| {
                         body.rows(42.0, rows.len(), |mut row| {
                             let idx = row.index();
-                            let it = rows[idx];
+                            let it: &Item = &snap.items[rows[idx]];
                             let id = it.id;
                             let is_sel = self.selected.contains(&id);
                             let rate = self.snap.rates.get(&id).copied();
@@ -1550,7 +1768,7 @@ impl App {
                                 let c = p.status_color(&it.status);
                                 let (dr, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
                                 icons::dot(ui.painter(), dr, c);
-                                let n = it.connections();
+                                let n = it.connections;
                                 let label = match &it.note {
                                     Some(note) if it.status == Status::Running => {
                                         let mut c = note.chars();
@@ -1623,22 +1841,20 @@ impl App {
                     }
                 }
                 if toggle_all {
+                    let visible: HashSet<u64> = rows.iter().map(|&i| snap.items[i].id).collect();
                     if header_check == Some(true) {
-                        self.selected.retain(|id| !visible_ids.contains(id));
+                        self.selected.retain(|id| !visible.contains(id));
                     } else {
-                        for id in &visible_ids {
-                            if !self.selected.contains(id) {
-                                self.selected.push(*id);
-                            }
-                        }
+                        self.selected.extend(visible);
                     }
                 }
+                self.vm.rows = rows;
                 if let Some(id) = check_click {
                     self.toggle_select(id);
                 }
                 if let Some((id, ctrl, shift)) = click {
                     if shift {
-                        self.select_range(id, &ordered);
+                        self.select_range(id);
                     } else if ctrl {
                         self.toggle_select(id);
                     } else {
@@ -1676,7 +1892,7 @@ impl App {
                                     pick(ui, "Open containing folder", CtxCmd::Folder);
                                     ui.separator();
                                     if it.status.is_active() {
-                                        pick(ui, "Stop", CtxCmd::Stop);
+                                        pick(ui, "Pause", CtxCmd::Stop);
                                     }
                                     if it.status.is_stopped() {
                                         pick(ui, "Resume", CtxCmd::Start);
@@ -1688,7 +1904,7 @@ impl App {
                                             pick(ui, "Seed again", CtxCmd::Seed(true));
                                         }
                                     }
-                                    pick(ui, "Restart from the beginning", CtxCmd::Restart);
+                                    pick(ui, "Restart from the beginning…", CtxCmd::Restart);
                                     if it.status != Status::Done && it.torrent.is_none() && it.request.media.is_none() {
                                         pick(ui, "Refresh download address…", CtxCmd::Refresh);
                                     }
@@ -1702,7 +1918,7 @@ impl App {
                                     pick(ui, "Properties…", CtxCmd::Props);
                                     ui.separator();
                                     pick(ui, "Remove from list", CtxCmd::Remove);
-                                    pick(ui, "Remove and delete the file", CtxCmd::RemoveFile);
+                                    pick(ui, "Remove and delete the file…", CtxCmd::RemoveFile);
                                 });
                             });
                             // Close on any click elsewhere, or once a command was picked.
@@ -1721,20 +1937,18 @@ impl App {
                     Some(CtxCmd::Start) => self.start_selected(),
                     Some(CtxCmd::Restart) => self.restart_selected(),
                     Some(CtxCmd::Refresh) => {
-                        if let Some(id) = self.selected.last().copied() {
+                        if let Some(id) = self.focus {
                             self.open_refresh(id);
                         }
                     }
                     Some(CtxCmd::Seed(on)) => {
-                        let ids: Vec<u64> = self.selected.iter().copied().filter(|id| self.item(*id).is_some_and(|i| i.status == Status::Done && i.torrent.is_some())).collect();
-                        for id in ids {
-                            self.api.action(id, if on { "seed" } else { "stop-seeding" });
-                        }
+                        let ids: Vec<u64> = self.selected_items().iter().filter(|i| i.status == Status::Done && i.torrent.is_some()).map(|i| i.id).collect();
+                        self.bulk(ids, if on { "seed" } else { "stop-seeding" }, move |n| if on { format!("Sharing {n} torrent(s) again") } else { format!("Stopped sharing {n} torrent(s)") });
                     }
                     Some(CtxCmd::Queue) => self.set_queued(true),
                     Some(CtxCmd::Unqueue) => self.set_queued(false),
                     Some(CtxCmd::Props) => {
-                        if let Some(id) = self.selected.last().copied() {
+                        if let Some(id) = self.focus {
                             self.open_props(id);
                         }
                     }
@@ -1743,13 +1957,11 @@ impl App {
                         self.toast("Address copied");
                     }
                     Some(CtxCmd::Remove) => {
-                        let ids = self.selected.clone();
+                        let ids = self.selected_ids();
                         self.remove_ids(&ids, false);
                     }
-                    Some(CtxCmd::RemoveFile) => {
-                        let ids = self.selected.clone();
-                        self.remove_ids(&ids, true);
-                    }
+                    // Deleting files is asked about first, in the same dialog as Remove.
+                    Some(CtxCmd::RemoveFile) => self.ask_remove(),
                     None => {}
                 }
             });
@@ -1785,7 +1997,7 @@ fn label(ui: &mut egui::Ui, p: &Palette, text: &str) {
 
 /// A segment map: the whole file as a bar, each range's downloaded part filled, the ranges a
 /// connection is working on marked at their write position.
-fn segment_map(ui: &mut egui::Ui, p: &Palette, it: &Item) {
+fn segment_map(ui: &mut egui::Ui, p: &Palette, it: &Item, segments: &[reidm_core::Segment]) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 3.0, p.border.gamma_multiply(0.5));
@@ -1794,14 +2006,14 @@ fn segment_map(ui: &mut egui::Ui, p: &Palette, it: &Item) {
         painter.rect_filled(rect, 3.0, p.ok);
         return;
     }
-    if total == 0 || it.segments.is_empty() {
+    if total == 0 || segments.is_empty() {
         if let Some(f) = it.fraction() {
             painter.rect_filled(egui::Rect::from_min_size(rect.min, Vec2::new(rect.width() * f, rect.height())), 3.0, p.accent);
         }
         return;
     }
     let x = |b: u64| rect.left() + rect.width() * (b.min(total) as f32 / total as f32);
-    for s in &it.segments {
+    for s in segments {
         let end = if s.end == u64::MAX { total } else { s.end + 1 };
         let filled = if s.finished { end } else { (s.start + s.done).min(end) };
         if filled > s.start {
@@ -1830,7 +2042,7 @@ impl App {
                 Vec2::new(520.0, 96.0),
                 egui::TextEdit::multiline(&mut self.add.urls).hint_text("https://example.com/file.zip\nhttps://example.com/another.iso").desired_rows(4),
             );
-            let count = reidm_core::grabber::parse_url_list(&self.add.urls).len();
+            let count = self.add.count();
             if count > 1 {
                 ui.label(RichText::new(format!("{count} URLs")).color(p.accent).size(11.0));
             }
@@ -1877,13 +2089,15 @@ impl App {
                 self.toast("Enter an http or https address first");
             } else if urls.len() == 1 {
                 let name = Some(self.add.name.trim().to_string()).filter(|n| !n.is_empty());
-                match self.api.add(&urls[0], name, dir, later) {
-                    Ok(()) => {
-                        self.toast(if later { "Added to the scheduled queue" } else { "Download started" });
-                        self.add = AddState::default();
-                    }
-                    Err(e) => self.toast(format!("could not add it: {e}")),
-                }
+                let body = serde_json::json!({ "url": urls[0], "filename": name, "dir": dir, "later": later });
+                self.add = AddState::default();
+                self.cmd.run(move |c| {
+                    let r = c.post("/api/downloads", body);
+                    reply(move |app: &mut App| match r {
+                        Ok(_) => app.toast(if later { "Added to the scheduled queue" } else { "Download started" }),
+                        Err(e) => app.toast(format!("Could not add it: {e}")),
+                    })
+                });
             } else {
                 self.queue_urls(urls, later);
                 self.add = AddState::default();
@@ -1898,24 +2112,7 @@ impl App {
         if !self.batch.open {
             return;
         }
-        use reidm_core::lists::{expand_pattern, Sequence};
-        let seq = match (self.batch.from.trim().parse::<u64>(), self.batch.to.trim().parse::<u64>()) {
-            (Ok(from), Ok(to)) => Ok(Sequence::Numbers { from, to, width: self.batch.width }),
-            _ => {
-                let one = |s: &str| {
-                    let mut c = s.trim().chars();
-                    match (c.next(), c.next()) {
-                        (Some(ch), None) if ch.is_ascii_alphabetic() => Some(ch),
-                        _ => None,
-                    }
-                };
-                match (one(&self.batch.from), one(&self.batch.to)) {
-                    (Some(from), Some(to)) => Ok(Sequence::Letters { from, to }),
-                    _ => Err("From and To must both be numbers, or both be single letters".to_string()),
-                }
-            }
-        };
-        let preview = seq.and_then(|s| expand_pattern(&self.batch.pattern, &s).map_err(|e| e.to_string()));
+        let preview = self.batch.expand();
         let mut open = true;
         let mut submit: Option<bool> = None;
         window("Add batch download").open(&mut open).show(ctx, |ui| {
@@ -1928,10 +2125,11 @@ impl App {
                 ui.add_sized(Vec2::new(70.0, 24.0), egui::TextEdit::singleline(&mut self.batch.from));
                 label(ui, p, "to");
                 ui.add_sized(Vec2::new(70.0, 24.0), egui::TextEdit::singleline(&mut self.batch.to));
-                label(ui, p, "wildcard size");
+                label(ui, p, "zero-pad to");
                 ui.add(egui::DragValue::new(&mut self.batch.width).range(0..=8));
+                label(ui, p, "digits");
             });
-            label(ui, p, "Numbers (1 to 50) or letters (a to z). Wildcard size pads numbers with zeros: 3 gives 001, 002 …");
+            label(ui, p, "Numbers (1 to 50) or letters (a to z). Zero-padding to 3 digits gives 001, 002 …");
             ui.add_space(8.0);
             match &preview {
                 Ok(urls) if !urls.is_empty() => {
@@ -1998,20 +2196,20 @@ impl App {
             ui.add_space(6.0);
             label(ui, p, "Default download folder");
             ui.horizontal(|ui| {
-                ui.add_sized(Vec2::new(380.0, 26.0), egui::TextEdit::singleline(&mut self.opt_dir));
+                ui.add_sized(Vec2::new(380.0, 26.0), egui::TextEdit::singleline(&mut self.opt.dir));
                 if ui.button("Browse…").clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.opt_dir).pick_folder() {
-                        self.opt_dir = d.to_string_lossy().into_owned();
+                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.opt.dir).pick_folder() {
+                        self.opt.dir = d.to_string_lossy().into_owned();
                     }
                 }
             });
             ui.add_space(8.0);
             label(ui, p, "Connections per download");
-            ui.add(egui::Slider::new(&mut self.opt_conn, 1..=32));
+            ui.add(egui::Slider::new(&mut self.opt.conn, crate::options::CONNECTIONS));
             label(ui, p, "When a connection finishes early it takes over half of the slowest one's remaining part, so more connections rarely hurt. 8 is a good default.");
             ui.add_space(8.0);
             label(ui, p, "Downloads at the same time");
-            ui.add(egui::Slider::new(&mut self.opt_max, 1..=16));
+            ui.add(egui::Slider::new(&mut self.opt.max, crate::options::AT_ONCE));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Speed limiter…").clicked() {
@@ -2050,8 +2248,17 @@ impl App {
             });
             }
             ui.add_space(14.0);
+            let loaded = self.opt_base.is_some();
+            if !loaded {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading the service's settings… they can be saved once they have loaded.").color(p.warn));
+                });
+            }
             ui.horizontal(|ui| {
-                if ui.add_sized(Vec2::new(90.0, 28.0), egui::Button::new("Save")).clicked() {
+                // Without the settings as they are, Save would have nothing to compare with and
+                // could only write the defaults shown over the user's own.
+                if ui.add_enabled(loaded, egui::Button::new("Save").min_size(Vec2::new(90.0, 28.0))).clicked() {
                     save = true;
                 }
                 if ui.add_sized(Vec2::new(90.0, 28.0), egui::Button::new("Cancel")).clicked() {
@@ -2060,26 +2267,21 @@ impl App {
             });
         });
         if save {
-            let dirs: serde_json::Map<String, serde_json::Value> = self.opt_folders.iter().filter(|(_, d)| !d.trim().is_empty()).map(|(n, d)| (n.to_string(), d.trim().into())).collect();
-            let r = self.api.update_settings(serde_json::json!({
-                "default_dir": self.opt_dir,
-                "connections": self.opt_conn,
-                "max_concurrent": self.opt_max,
-                "sort_by_category": self.opt_sort,
-                "category_dirs": dirs,
-                "temp_dir": self.opt_temp.trim(),
-                "seed_ratio": self.opt_seed,
-                "upload_limit": self.opt_up_kb * 1024,
-                "torrent_port": self.opt_port,
-                "torrent_dht": self.opt_dht,
-            }));
+            // The window's own preferences save at once; the service's, only what changed.
             self.prefs.save();
-            match r {
-                Ok(()) => {
-                    self.show_options = false;
-                    self.toast("Options saved");
-                }
-                Err(e) => self.toast(format!("could not save: {e}")),
+            let patch = self.opt_base.as_ref().map(|b| self.opt.changes(b)).unwrap_or_default();
+            self.show_options = false;
+            if patch.is_empty() {
+                self.toast("Options saved");
+            } else {
+                self.save_settings(serde_json::Value::Object(patch), |app, r| match r {
+                    Ok(()) => app.toast("Options saved"),
+                    Err(e) => {
+                        // Back to the dialog, as edited, to put it right.
+                        app.show_options = true;
+                        app.toast(format!("Could not save: {e}"));
+                    }
+                });
             }
         }
         if limiter {
@@ -2097,40 +2299,40 @@ impl App {
     fn torrents_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
         ui.label(RichText::new("When a torrent is complete").strong());
         let seed_label = |r: f64| if r == 0.0 { "Stop: don't seed".to_string() } else if r < 0.0 { "Seed for as long as reIDM runs".into() } else { format!("Seed until it has shared {r}× its size") };
-        egui::ComboBox::from_id_salt("seed").width(330.0).selected_text(seed_label(self.opt_seed)).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("seed").width(330.0).selected_text(seed_label(self.opt.seed)).show_ui(ui, |ui| {
             for r in [0.0, 0.5, 1.0, 2.0, 5.0, -1.0] {
-                ui.selectable_value(&mut self.opt_seed, r, seed_label(r));
+                ui.selectable_value(&mut self.opt.seed, r, seed_label(r));
             }
         });
         label(ui, p, "Seeding is sharing what you downloaded with others, which is how torrents work. Stop or restart it for one torrent from its right-click menu.");
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label("Upload limit");
-            ui.add(egui::DragValue::new(&mut self.opt_up_kb).range(0..=10_000_000).suffix(" KB/s"));
-            label(ui, p, if self.opt_up_kb == 0 { "(none)" } else { "" });
+            ui.add(egui::DragValue::new(&mut self.opt.up_kb).range(0..=10_000_000).suffix(" KB/s"));
+            label(ui, p, if self.opt.up_kb == 0 { "(none)" } else { "" });
         });
         label(ui, p, "The download limit is the speed limiter's, shared with every other download.");
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             ui.label("Listening port");
-            ui.add(egui::DragValue::new(&mut self.opt_port).range(0..=65535));
+            ui.add(egui::DragValue::new(&mut self.opt.port).range(0..=65535));
         });
         label(ui, p, "Where other peers connect to you; reIDM asks your router to forward it. 0 picks any free port. Takes effect when reIDM restarts.");
         ui.add_space(6.0);
-        ui.checkbox(&mut self.opt_dht, "Find peers through the DHT, not only through trackers");
+        ui.checkbox(&mut self.opt.dht, "Find peers through the DHT, not only through trackers");
         label(ui, p, "Needed for most magnet links. Takes effect when reIDM restarts.");
     }
 
     /// Options › Folders: where each type of file goes, and where unfinished downloads wait.
     fn folders_tab(&mut self, ui: &mut egui::Ui, p: &Palette) {
-        ui.checkbox(&mut self.opt_sort, "Save each download in the folder for its type");
+        ui.checkbox(&mut self.opt.sort, "Save each download in the folder for its type");
         label(ui, p, "As IDM does: videos in Video, archives in Compressed, installers in Programs… A folder left empty is the one under the download folder shown in grey; anything else goes to the download folder itself.");
         ui.add_space(8.0);
-        let defaults: Vec<String> = self.opt_folders.iter().map(|(n, _)| self.default_folder(n)).collect();
+        let defaults: Vec<String> = self.opt.folders.iter().map(|(n, _)| self.default_folder(n)).collect();
         egui::Grid::new("folders").num_columns(4).spacing(Vec2::new(8.0, 6.0)).show(ui, |ui| {
-            for ((name, dir), default) in self.opt_folders.iter_mut().zip(&defaults) {
+            for ((name, dir), default) in self.opt.folders.iter_mut().zip(&defaults) {
                 let name: &'static str = name;
-                let on = self.opt_sort || name == "General";
+                let on = self.opt.sort || name == "General";
                 ui.add_enabled_ui(on, |ui| ui.label(if name == "General" { "Everything else" } else { name }));
                 ui.add_enabled_ui(on, |ui| ui.add_sized(Vec2::new(330.0, 22.0), egui::TextEdit::singleline(dir).hint_text(default.as_str())));
                 if ui.add_enabled(on, egui::Button::new("Browse…")).clicked() {
@@ -2150,15 +2352,15 @@ impl App {
         label(ui, p, "Unfinished downloads wait here, and move to their folder when complete — so the download folder only ever holds finished files. On another drive than the download folder, the move is a copy.");
         let temp_default = reidm_core::default_data_dir().join("parts").to_string_lossy().into_owned();
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.opt_temp).hint_text(temp_default.as_str()).desired_width(330.0));
+            ui.add(egui::TextEdit::singleline(&mut self.opt.temp).hint_text(temp_default.as_str()).desired_width(330.0));
             if ui.button("Browse…").clicked() {
-                let start = if self.opt_temp.is_empty() { temp_default.clone() } else { self.opt_temp.clone() };
+                let start = if self.opt.temp.is_empty() { temp_default.clone() } else { self.opt.temp.clone() };
                 if let Some(d) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
-                    self.opt_temp = d.to_string_lossy().into_owned();
+                    self.opt.temp = d.to_string_lossy().into_owned();
                 }
             }
-            if ui.add_enabled(!self.opt_temp.is_empty(), egui::Button::new("Default")).clicked() {
-                self.opt_temp.clear();
+            if ui.add_enabled(!self.opt.temp.is_empty(), egui::Button::new("Default")).clicked() {
+                self.opt.temp.clear();
             }
         });
     }
@@ -2293,8 +2495,9 @@ impl App {
                         });
                     });
                     ui.add_space(4.0);
-                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                        for (i, f) in found.iter().enumerate() {
+                    // Only the rows in view are laid out: a deep scan can find thousands.
+                    egui::ScrollArea::vertical().max_height(280.0).show_rows(ui, 22.0, found.len(), |ui, range| {
+                        for (i, f) in found.iter().enumerate().skip(range.start).take(range.len()) {
                             ui.horizontal(|ui| {
                                 if i < selected.len() {
                                     ui.checkbox(&mut selected[i], "");
@@ -2320,12 +2523,14 @@ impl App {
                 ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    let chosen: Vec<String> = found.iter().zip(selected.iter()).filter(|(_, s)| **s).map(|(f, _)| f.url.clone()).collect();
-                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new(format!("Download {} selected", chosen.len()))).clicked() {
-                        queue = Some((chosen.clone(), false));
+                    // Counted each frame, collected only when used.
+                    let n = selected.iter().filter(|s| **s).count();
+                    let chosen = || found.iter().zip(selected.iter()).filter(|(_, s)| **s).map(|(f, _)| f.url.clone()).collect::<Vec<String>>();
+                    if ui.add_enabled(n > 0, egui::Button::new(format!("Download {n} selected"))).clicked() {
+                        queue = Some((chosen(), false));
                     }
-                    if ui.add_enabled(!chosen.is_empty(), egui::Button::new("Download later")).clicked() {
-                        queue = Some((chosen, true));
+                    if ui.add_enabled(n > 0, egui::Button::new("Download later")).clicked() {
+                        queue = Some((chosen(), true));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button("Close").clicked() {
@@ -2335,7 +2540,10 @@ impl App {
                 });
             });
 
-        let all_urls: Vec<String> = found.iter().map(|f| f.url.clone()).collect();
+        if export {
+            let all_urls: Vec<String> = found.iter().map(|f| f.url.clone()).collect();
+            self.export_found(&all_urls);
+        }
         self.grab.found = found;
         self.grab.selected = selected;
         if scan {
@@ -2343,9 +2551,6 @@ impl App {
         }
         if let Some((urls, later)) = queue {
             self.queue_urls(urls, later);
-        }
-        if export {
-            self.export_found(&all_urls);
         }
         if import {
             self.import_from_file();
@@ -2355,36 +2560,103 @@ impl App {
         }
     }
 
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        if self.confirm_remove.is_empty() {
-            return;
-        }
-        let ids = self.confirm_remove.clone();
-        let what = match ids.as_slice() {
-            [one] => format!("“{}”", self.item(*one).map(|i| i.file_name()).unwrap_or_default()),
+    /// Ask before what can't be undone. Esc or closing the dialog cancels; Enter takes the
+    /// harmless choice, never the one that deletes.
+    fn confirm_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(c) = &self.confirm else { return };
+        let name = |ids: &[u64]| match ids {
+            [one] => format!("“{}”", self.item(*one).map(|i| i.file_name().to_string()).unwrap_or_default()),
             many => format!("{} downloads", many.len()),
         };
+        let (title, text, detail) = match c {
+            Confirm::Remove(ids) => ("Remove", format!("Remove {} from the list?", name(ids)), "Removing from the list keeps the files. Deleting the files can't be undone.".to_string()),
+            Confirm::Restart(ids) => {
+                let done = ids.iter().filter(|id| self.item(**id).is_some_and(|i| i.status == Status::Done)).count();
+                let got: u64 = ids.iter().filter_map(|id| self.item(*id)).filter(|i| i.status != Status::Done).map(|i| i.downloaded).sum();
+                let mut d = String::new();
+                if got > 0 {
+                    d.push_str(&format!("The {} already downloaded will be thrown away. ", size_human(got)));
+                }
+                if done > 0 {
+                    d.push_str("A finished download is fetched again and replaces its file on disk.");
+                }
+                ("Restart", format!("Start {} again from the beginning?", name(ids)), d)
+            }
+            Confirm::ClearCompleted(ids) => ("Remove completed", format!("Remove all {} completed downloads from the list?", ids.len()), "The files stay where they are; only the list entries go. This can't be undone.".to_string()),
+            Confirm::Close => (
+                "reIDM keeps downloading",
+                "Downloads carry on in the background when this window is closed.".to_string(),
+                "The browser keeps handing downloads to reIDM, and opening reIDM again shows them. To stop everything, choose Quit reIDM completely (also in the File menu).".to_string(),
+            ),
+        };
+        let (esc, enter) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter)));
         let mut open = true;
-        window("Delete").open(&mut open).show(ctx, |ui| {
-            ui.set_min_width(390.0);
-            ui.label(format!("Remove {what} from the list?"));
+        let mut choice: Option<&'static str> = None;
+        window(title).open(&mut open).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.label(RichText::new(&text).strong());
+            if !detail.is_empty() {
+                ui.add_space(4.0);
+                label(ui, p, &detail);
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.button("Remove from list only").clicked() {
-                    self.remove_ids(&ids, false);
-                    self.confirm_remove.clear();
+                let danger = |t: &str| egui::Button::new(RichText::new(t).color(egui::Color32::WHITE)).fill(p.err);
+                match c {
+                    Confirm::Remove(_) => {
+                        if ui.button(RichText::new("Remove from list").strong()).clicked() || enter {
+                            choice = Some("remove");
+                        }
+                        if ui.add(danger("Remove and delete the files")).clicked() {
+                            choice = Some("purge");
+                        }
+                    }
+                    Confirm::Restart(_) => {
+                        if ui.add(danger("Restart")).clicked() {
+                            choice = Some("restart");
+                        }
+                    }
+                    Confirm::ClearCompleted(_) => {
+                        if ui.add(danger("Remove them")).clicked() {
+                            choice = Some("clear");
+                        }
+                    }
+                    Confirm::Close => {
+                        if ui.button(RichText::new("Keep downloading in the background").strong()).clicked() || enter {
+                            choice = Some("close");
+                        }
+                        if ui.add(danger("Quit reIDM completely")).clicked() {
+                            choice = Some("quit");
+                        }
+                    }
                 }
-                if ui.button("Remove and delete the files").clicked() {
-                    self.remove_ids(&ids, true);
-                    self.confirm_remove.clear();
-                }
-                if ui.button("Cancel").clicked() {
-                    self.confirm_remove.clear();
+                if ui.button("Cancel").clicked() || esc {
+                    choice = Some("cancel");
                 }
             });
         });
         if !open {
-            self.confirm_remove.clear();
+            choice = Some("cancel");
+        }
+        let Some(choice) = choice else { return };
+        let Some(c) = self.confirm.take() else { return };
+        match (c, choice) {
+            (Confirm::Remove(ids), "remove") => self.remove_ids(&ids, false),
+            (Confirm::Remove(ids), "purge") => self.remove_ids(&ids, true),
+            (Confirm::Restart(ids), "restart") => self.bulk(ids, "restart", |n| format!("Restarted {n} download(s) from the beginning")),
+            (Confirm::ClearCompleted(ids), "clear") => {
+                for id in &ids {
+                    self.selected.remove(id);
+                }
+                self.bulk(ids, "remove", |n| format!("Removed {n} completed download(s) from the list"));
+            }
+            (Confirm::Close, "close") => {
+                self.prefs.close_explained = true;
+                self.prefs.save();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            (Confirm::Close, "quit") => self.quit_completely(ctx),
+            _ => {}
         }
     }
 
@@ -2397,6 +2669,8 @@ impl App {
             self.props = None;
             return;
         };
+        // The list row is live; the full copy (segments, files) is at most a second old.
+        let detail = st.detail.clone();
         let rate = self.snap.rates.get(&id).copied();
         let mut open = true;
         let mut apply_limit: Option<Option<u64>> = None;
@@ -2429,8 +2703,8 @@ impl App {
                     if let Some(r) = &it.request.referer {
                         row(ui, "Referer", r.clone());
                     }
-                    if let Some(ua) = &it.request.user_agent {
-                        row(ui, "Sent as", ua.clone());
+                    if let Some(ua) = detail.as_ref().and_then(|d| d.request.user_agent.clone()) {
+                        row(ui, "Sent as", ua);
                     }
                     if let Some(m) = &it.request.media {
                         row(ui, "Fetched with", format!("yt-dlp, format {}", m.format));
@@ -2468,18 +2742,19 @@ impl App {
                         row(ui, "Resume capability", "Yes — yt-dlp carries on where it stopped".into());
                     } else {
                         row(ui, "Resume capability", if it.resumable { "Yes".into() } else if it.size.is_some() { "No — a stop means starting over".into() } else { "Unknown".into() });
-                        row(ui, "Connections", format!("{} working on {} part(s)", it.connections(), it.segments.len().max(1)));
+                        row(ui, "Connections", format!("{} working on {} part(s)", it.connections, it.parts.max(1)));
                     }
                 });
                 ui.add_space(8.0);
-                segment_map(ui, p, &it);
+                segment_map(ui, p, &it, detail.as_ref().map(|d| d.segments()).unwrap_or_default());
                 // A torrent's files, each with its own progress.
-                if let Some(t) = it.torrent.as_ref().filter(|t| t.files.len() > 1 || t.files.iter().any(|f| !f.selected)) {
+                if let Some(t) = detail.as_ref().and_then(|d| d.torrent.as_ref()).filter(|t| t.files.len() > 1 || t.files.iter().any(|f| !f.selected)) {
                     ui.add_space(8.0);
                     ui.label(RichText::new("Files").strong());
-                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                        egui::Grid::new("torrent-files").num_columns(3).spacing(Vec2::new(10.0, 3.0)).show(ui, |ui| {
-                            for f in &t.files {
+                    // Only the files in view are laid out: a torrent can hold tens of thousands.
+                    egui::ScrollArea::vertical().max_height(160.0).show_rows(ui, 18.0, t.files.len(), |ui, range| {
+                        egui::Grid::new("torrent-files").num_columns(3).spacing(Vec2::new(10.0, 3.0)).min_row_height(15.0).show(ui, |ui| {
+                            for f in &t.files[range] {
                                 ui.label(RichText::new(&f.path).size(12.0).color(if f.selected { p.text } else { p.text_dim }));
                                 ui.label(RichText::new(size_human(f.size)).size(12.0).color(p.text_dim));
                                 let txt = if !f.selected { "skipped".to_string() } else if f.size == 0 { "100%".into() } else { format!("{:.0}%", f.done as f64 * 100.0 / f.size as f64) };
@@ -2514,7 +2789,7 @@ impl App {
                     if it.status != Status::Done && ui.button("Refresh address…").clicked() {
                         refresh = true;
                     }
-                    if ui.button("Restart").clicked() {
+                    if ui.button("Restart…").clicked() {
                         cmd = Some("restart");
                     }
                 });
@@ -2528,21 +2803,22 @@ impl App {
             self.toast("Address copied");
         }
         if let Some(l) = apply_limit {
-            match self.api.set_limit(id, l) {
-                Ok(()) => self.toast(match l {
-                    Some(b) => format!("This download is limited to {}", rate_human(b as f64)),
-                    None => "This download's own limit is off".into(),
-                }),
-                Err(e) => self.toast(format!("could not set the limit: {e}")),
-            }
+            self.cmd.run(move |c| {
+                let r = c.post(&format!("/api/downloads/{id}/limit"), serde_json::json!({ "limit": l }));
+                reply(move |app: &mut App| match r {
+                    Ok(_) => app.toast(match l {
+                        Some(b) => format!("This download is limited to {}", rate_human(b as f64)),
+                        None => "This download's own limit is off".into(),
+                    }),
+                    Err(e) => app.toast(format!("Could not set the limit: {e}")),
+                })
+            });
         }
         if let Some(c) = cmd {
             if c == "restart" {
-                if let Err(e) = self.api.try_action(id, c) {
-                    self.toast(format!("could not restart: {e}"));
-                }
+                self.confirm = Some(Confirm::Restart(vec![id]));
             } else {
-                self.api.action(id, c);
+                self.action(id, c);
             }
         }
         if refresh {
@@ -2556,7 +2832,7 @@ impl App {
     fn refresh_window(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(r) = &mut self.refresh else { return };
         let id = r.id;
-        let name = self.snap.items.iter().find(|i| i.id == id).map(|i| i.file_name()).unwrap_or_default();
+        let name = self.snap.item(id).map(|i| i.file_name().to_string()).unwrap_or_default();
         let mut open = true;
         let mut submit = false;
         let mut capture = false;
@@ -2601,23 +2877,36 @@ impl App {
         });
         if submit {
             r.error = None;
-            r.busy = Some(self.api.refresh_async(id, r.url.trim()));
+            r.busy = Some(self.client.refresh_async(id, r.url.trim()));
         }
         if capture {
             r.error = None;
-            match self.api.try_action(id, "refresh-capture") {
-                Ok(()) => r.capturing = true,
-                Err(e) => r.error = Some(e),
+            r.capturing = true;
+            self.cmd.run(move |c| {
+                let res = c.post(&format!("/api/downloads/{id}/refresh-capture"), serde_json::json!({}));
+                res.err().and_then(|e| {
+                    reply(move |app: &mut App| {
+                        if let Some(r) = app.refresh.as_mut().filter(|r| r.id == id) {
+                            r.capturing = false;
+                            r.error = Some(e);
+                        }
+                    })
+                })
+            });
+        }
+        let cancel = cancel_capture || (!open && self.refresh.as_ref().is_some_and(|r| r.capturing));
+        if cancel_capture {
+            if let Some(r) = &mut self.refresh {
+                r.capturing = false;
             }
         }
-        if cancel_capture {
-            r.capturing = false;
-            self.api.cancel_refresh();
+        if cancel {
+            self.cmd.run(|c| {
+                let r = c.post("/api/refresh-capture/cancel", serde_json::json!({}));
+                r.err().and_then(|e| reply(move |app: &mut App| app.toast(format!("Could not stop waiting for the browser: {e}"))))
+            });
         }
         if !open {
-            if self.refresh.as_ref().is_some_and(|r| r.capturing) {
-                self.api.cancel_refresh();
-            }
             self.refresh = None;
         }
     }
@@ -2629,7 +2918,7 @@ impl App {
         let mut open = true;
         let mut save = false;
         let mut queue: Option<bool> = None;
-        let in_queue = self.snap.items.iter().filter(|i| i.scheduled && i.status != Status::Done).count();
+        let in_queue = self.vm.counts.queued;
         let s = &mut self.sched;
         window("Scheduler").open(&mut open).show(ctx, |ui| {
             ui.set_min_width(470.0);
@@ -2690,13 +2979,16 @@ impl App {
             if s.enabled && s.days.iter().all(|d| !*d) {
                 s.error = Some("Pick at least one day".into());
             } else {
-                match self.api.update_settings(serde_json::json!({ "schedule": sched })) {
-                    Ok(()) => {
-                        self.sched.open = false;
-                        self.toast(if sched.enabled { "Schedule saved" } else { "Schedule turned off" });
+                let enabled = sched.enabled;
+                self.sched.open = false;
+                self.save_settings(serde_json::json!({ "schedule": sched }), move |app, r| match r {
+                    Ok(()) => app.toast(if enabled { "Schedule saved" } else { "Schedule turned off" }),
+                    Err(e) => {
+                        // Back to the dialog, as edited, to put it right.
+                        app.sched.open = true;
+                        app.sched.error = Some(e);
                     }
-                    Err(e) => self.sched.error = Some(e),
-                }
+                });
             }
         }
         if let Some(start) = queue {
@@ -2742,14 +3034,15 @@ impl App {
             });
         });
         if save {
-            let r = self.api.update_settings(serde_json::json!({ "limit_enabled": self.limiter.on, "speed_limit": self.limiter.kb as u64 * 1024 }));
-            match r {
-                Ok(()) => {
-                    self.limiter.open = false;
-                    self.toast(if self.limiter.on { format!("Total speed limited to {} KB/s", self.limiter.kb) } else { "Speed limiter off".into() });
+            let (on, kb) = (self.limiter.on, self.limiter.kb);
+            self.limiter.open = false;
+            self.save_settings(serde_json::json!({ "limit_enabled": on, "speed_limit": kb as u64 * 1024 }), move |app, r| match r {
+                Ok(()) => app.toast(if on { format!("Total speed limited to {kb} KB/s") } else { "Speed limiter off".into() }),
+                Err(e) => {
+                    app.limiter.open = true;
+                    app.toast(format!("Could not save: {e}"));
                 }
-                Err(e) => self.toast(format!("could not save: {e}")),
-            }
+            });
         }
         if !open {
             self.limiter.open = false;
@@ -2880,7 +3173,7 @@ impl App {
                 });
             });
         if let Some(a) = action {
-            self.api.action(id, a);
+            self.action(id, a);
             close = true;
         }
         if never {
