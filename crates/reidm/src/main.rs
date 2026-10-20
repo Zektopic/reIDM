@@ -1,5 +1,7 @@
 mod install;
 mod launch;
+// TEMP: replaced by Manager::revision() when the engine branch lands
+mod revision;
 mod web;
 mod session;
 mod ws;

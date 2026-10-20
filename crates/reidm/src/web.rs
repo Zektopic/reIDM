@@ -894,3 +894,8 @@ pub async fn serve(mgr: Manager, idm_port: Arc<std::sync::atomic::AtomicBool>) -
     r?;
     Ok(())
 }
+
+// TEMP: replaced by Manager::revision() when the engine branch lands. Brings the stand-in
+// `revision()` into scope; the engine's inherent method wins once it exists.
+#[allow(unused_imports)]
+use crate::revision::Revision as _;
