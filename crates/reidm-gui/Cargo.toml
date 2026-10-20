@@ -18,7 +18,7 @@ directories.workspace = true
 
 egui = "0.36"
 egui_extras = "0.36"
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "accesskit"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # Window icon only; the packaged formats carry their own copies.
 png = "0.18"
@@ -26,6 +26,23 @@ png = "0.18"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 base64 = "0.22"
 arboard = { version = "3.6.1", default-features = false }
+# The notification-area icon. On Linux it speaks StatusNotifierItem over D-Bus (`ksni`) rather
+# than through GTK's libappindicator, so building needs no GTK.
+tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
+# Desktop notifications when a download finishes; over D-Bus (zbus) on Linux.
+notify-rust = { version = "4.18", default-features = false, features = ["z"] }
+# Waits for a file picker on a thread of its own, so the window keeps drawing.
+pollster = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already in the tree through `ksni`, `notify-rust` and AccessKit; used directly only to ask
+# whether anything shows tray icons at all.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[target.'cfg(windows)'.dependencies]
+# Already in the tree through `notify-rust`; used to see whether Windows will show a
+# notification at all (they can be switched off for everything).
+windows = { version = "0.62", features = ["UI_Notifications"] }
 
 [build-dependencies]
 # Only used on Windows; the build script no-ops elsewhere.
