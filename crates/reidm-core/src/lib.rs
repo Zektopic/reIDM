@@ -291,11 +291,16 @@ struct Cancel {
     wake: tokio::sync::Notify,
 }
 
-impl Cancel {
-    fn load(&self, o: Ordering) -> bool {
-        self.flag.load(o)
+/// The flag itself, for code that only looks at it now and then (`cancel.load(…)`). Stopping a
+/// download goes through [`Cancel::set`], which also wakes whatever is waiting.
+impl std::ops::Deref for Cancel {
+    type Target = AtomicBool;
+    fn deref(&self) -> &AtomicBool {
+        &self.flag
     }
+}
 
+impl Cancel {
     fn set(&self) {
         self.flag.store(true, Ordering::SeqCst);
         self.wake.notify_waiters();
@@ -790,6 +795,18 @@ async fn nap(d: Duration, cancel: &Cancel) {
     tokio::select! {
         _ = tokio::time::sleep(d) => {}
         _ = cancel.cancelled() => {}
+    }
+}
+
+/// Where the scheduler's next check starts from. When the clocks go back an hour, local time
+/// repeats that hour: moving the mark back with it would make a start or stop in that hour fire
+/// twice, so a step back of under two hours keeps the mark where it was until the clock has
+/// caught up. A bigger step back is someone setting the clock, and is followed.
+fn scheduler_mark(prev: chrono::NaiveDateTime, now: chrono::NaiveDateTime) -> chrono::NaiveDateTime {
+    if now < prev && prev - now < chrono::Duration::hours(2) {
+        prev
+    } else {
+        now
     }
 }
 
@@ -1658,7 +1675,7 @@ impl Manager {
                     }
                     None => {}
                 }
-                prev = now;
+                prev = scheduler_mark(prev, now);
             }
         });
     }
@@ -2702,6 +2719,20 @@ mod tests {
         assert!(!unknown.complete());
         let finished = Segment { done: 5, finished: true, ..Segment::new(0, u64::MAX) };
         assert!(finished.complete());
+    }
+
+    #[test]
+    fn the_scheduler_does_not_repeat_the_hour_the_clocks_go_back() {
+        let t = |h: u32, m: u32| chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap().and_hms_opt(h, m, 0).unwrap();
+        // 02:59 summer time, then 02:00 winter time: the mark stays at 02:59...
+        assert_eq!(scheduler_mark(t(2, 59), t(2, 0)), t(2, 59));
+        // ...so a start at 02:30 is not due a second time in the repeated hour.
+        let sched = schedule::Schedule { enabled: true, start: Some("02:30".into()), ..Default::default() };
+        assert_eq!(sched.due(t(2, 0), t(2, 31)), Some(schedule::Action::Start), "following the clock back starts it twice");
+        assert_eq!(sched.due(scheduler_mark(t(2, 59), t(2, 0)), t(2, 31)), None);
+        // Forward time moves on as ever, and a big step back (the clock being set) is followed.
+        assert_eq!(scheduler_mark(t(2, 0), t(2, 1)), t(2, 1));
+        assert_eq!(scheduler_mark(t(9, 0), t(1, 0)), t(1, 0));
     }
 
     #[test]
