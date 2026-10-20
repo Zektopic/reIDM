@@ -152,11 +152,12 @@ pub fn extract_links(html: &str) -> (Vec<String>, bool) {
     let bytes: Vec<char> = clean.chars().collect();
     let lb: Vec<char> = clean.to_ascii_lowercase().chars().collect();
 
+    // Made once, not at every character of the page.
+    let attrs: Vec<Vec<char>> = ATTRS.iter().map(|a| a.chars().collect()).collect();
     let mut i = 0usize;
     while i < lb.len() {
         let mut matched = None;
-        for a in ATTRS {
-            let ac: Vec<char> = a.chars().collect();
+        for ac in &attrs {
             if i + ac.len() <= lb.len() && lb[i..i + ac.len()] == ac[..] {
                 matched = Some(ac.len());
                 break;
@@ -220,27 +221,30 @@ fn blank_non_markup(html: &str) -> String {
     // `to_ascii_lowercase` only rewrites ASCII bytes, so offsets stay aligned with `html`.
     let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len());
+    const REGIONS: [(&str, &str); 3] = [("<script", "</script>"), ("<style", "</style>"), ("<!--", "-->")];
+    // Where each opener next occurs (absolute offsets), searched again only once passed: a
+    // fresh search of the rest of the page for every region made long pages quadratic.
+    let find = |from: usize, open: &str| lower[from..].find(open).map(|p| from + p);
+    let mut next: [Option<usize>; 3] = REGIONS.map(|(open, _)| find(0, open));
     let mut i = 0usize;
     while i < html.len() {
-        let rest = &lower[i..];
-        let mut best: Option<(usize, usize, &str)> = None;
-        for (open, close) in [("<script", "</script>"), ("<style", "</style>"), ("<!--", "-->")] {
-            if let Some(p) = rest.find(open) {
-                if best.is_none_or(|(bp, _, _)| p < bp) {
-                    best = Some((p, open.len(), close));
-                }
+        for (k, (open, _)) in REGIONS.iter().enumerate() {
+            if next[k].is_some_and(|p| p < i) {
+                next[k] = find(i, open);
             }
         }
+        let best = (0..REGIONS.len()).filter_map(|k| next[k].map(|p| (p, k))).min();
         match best {
             None => {
                 out.push_str(&html[i..]);
                 break;
             }
-            Some((p, open_len, closer)) => {
-                out.push_str(&html[i..i + p]);
-                let body = i + p + open_len;
+            Some((p, k)) => {
+                let (open, closer) = REGIONS[k];
+                out.push_str(&html[i..p]);
+                let body = p + open.len();
                 let end = lower[body..].find(closer).map(|c| body + c + closer.len()).unwrap_or(html.len());
-                out.push_str(&" ".repeat(end - (i + p)));
+                out.push_str(&" ".repeat(end - p));
                 i = end;
             }
         }
@@ -281,7 +285,9 @@ fn keep(u: &Url, opts: &Options, start_host: &str) -> bool {
         return false;
     }
     let s = u.as_str();
-    if opts.include.iter().any(|p| !p.is_empty() && !s.contains(p.as_str())) {
+    // "Containing one of these": any one pattern is enough.
+    let include: Vec<&String> = opts.include.iter().filter(|p| !p.is_empty()).collect();
+    if !include.is_empty() && !include.iter().any(|p| s.contains(p.as_str())) {
         return false;
     }
     if opts.exclude.iter().any(|p| !p.is_empty() && s.contains(p.as_str())) {
@@ -387,6 +393,9 @@ fn strip_fragment(mut u: Url) -> Url {
     u
 }
 
+/// The largest page the grabber reads.
+const MAX_PAGE: usize = 8 << 20;
+
 struct Fetched {
     body: String,
     final_url: Url,
@@ -404,11 +413,10 @@ async fn fetch(client: &reqwest::Client, u: &Url) -> Result<Fetched> {
     if !status.is_success() {
         anyhow::bail!("HTTP {status}");
     }
-    // Refuse anything enormous; we only want the markup.
-    if resp.content_length().unwrap_or(0) > 8 * 1024 * 1024 {
-        anyhow::bail!("page is too large to scan");
-    }
-    let body = resp.text().await?;
+    // Refuse anything enormous; we only want the markup. Counted while reading too: a chunked
+    // page says nothing of its size up front, and one that never ends must not fill the memory.
+    let bytes = crate::torrent::read_capped(resp, MAX_PAGE, Duration::from_secs(20), "the page").await?;
+    let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok(Fetched { body, final_url })
 }
 
@@ -536,6 +544,47 @@ mod tests {
         let inc = Options { include: vec!["/pub/".into()], ..Default::default() };
         assert!(keep(&Url::parse("https://a.example/pub/x.zip").unwrap(), &inc, "a.example"));
         assert!(!keep(&Url::parse("https://a.example/priv/x.zip").unwrap(), &inc, "a.example"));
+        // One of them is enough, as the option says.
+        let either = Options { include: vec!["/pub/".into(), "/mirror/".into()], ..Default::default() };
+        assert!(keep(&Url::parse("https://a.example/pub/x.zip").unwrap(), &either, "a.example"));
+        assert!(keep(&Url::parse("https://a.example/mirror/x.zip").unwrap(), &either, "a.example"));
+        assert!(!keep(&Url::parse("https://a.example/priv/x.zip").unwrap(), &either, "a.example"));
+    }
+
+    #[test]
+    fn scripts_styles_and_comments_are_blanked_wherever_they_are() {
+        let html = "<a href=a.zip><script>x='<a href=s.zip>'</script><!-- <a href=c.zip> --><style>.x{}</style><a href=b.zip><script>y</script>";
+        let clean = blank_non_markup(html);
+        assert_eq!(clean.len(), html.len(), "offsets are kept");
+        let (links, _) = extract_links(html);
+        assert_eq!(links, ["a.zip", "b.zip"]);
+        // Long pages stay linear: many regions, each searched for once.
+        let big = "<p><script>1</script><a href=f.zip>".repeat(20_000);
+        let t = std::time::Instant::now();
+        assert_eq!(extract_links(&big).0.len(), 20_000);
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "took {:?}", t.elapsed());
+    }
+
+    #[tokio::test]
+    async fn an_endless_page_is_not_read_into_memory() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut req = [0u8; 2048];
+            let _ = s.read(&mut req).await;
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n").await;
+            let chunk = format!("{:x}\r\n{}\r\n", 65536, "a".repeat(65536));
+            // 64 MiB and more, until the reader hangs up.
+            for _ in 0..1024 {
+                if s.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let e = fetch(&reqwest::Client::new(), &Url::parse(&format!("http://{addr}/")).unwrap()).await.err().expect("refused");
+        assert!(format!("{e:#}").contains("larger than 8 MiB"), "{e:#}");
     }
 
     #[test]

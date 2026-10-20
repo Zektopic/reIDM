@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.8.0 (unreleased)
+
+### Fixed
+
+* **Torrents of several files were put straight into the download folder** — every file loose in
+  *Compressed*, *Video*… — instead of a folder named after the torrent, and a file already there
+  with the same name was overwritten. A torrent now gets a folder of its own, and a new torrent never
+  writes over a file that is already there: if the name is taken it goes into `Name (1)/`, or a
+  single file into a folder beside it. Torrents begun by 0.7.0 carry on where their files are.
+* **A video could be reported finished with a hole in it** when yt-dlp couldn't fetch one piece. It
+  now stops instead, and carries on by itself when YouTube's addresses expire partway (after about
+  six hours) or the connection drops.
+* The same torrent can't be added twice, whether its magnet link gives the hash in hex or base32 or
+  it comes as a `.torrent` from another site. *Start again* on a torrent waits for its old files to
+  be removed first.
+* A video whose title isn't UTF-8 could hang; `reidm update-check` crashed.
+* A partially unpacked ffmpeg was taken for installed.
+* The site grabber's *include* filter keeps links containing any one of the patterns, as documented
+  (it required all of them).
+
+### Improved
+
+* Videos and torrents keep to the global speed limit: each gets its share, and what they fetch counts
+  against the rest. A new limit reaches a running video within seconds.
+* yt-dlp, Deno and ffmpeg are downloaded to disk and checked as they arrive, not held in memory. A
+  video no longer waits while another download fetches a tool; *Pause* works while a tool
+  downloads; a failed update check is tried again after an hour, not at every video.
+* A `.torrent` link that sends more than 10 MiB, or a page for the site grabber over 8 MiB, is
+  refused instead of being read into memory.
+
 ## 0.7.0
 
 ### Torrents
