@@ -93,6 +93,28 @@ them from there — before anything is saved:
 This holds for files of any size — even a few kilobytes — and with Chrome's *Ask where to save
 each file* turned on.
 
+A hand-off that reIDM is slow to answer (a slow server, checked within 12 s) is asked again once
+with the same request id, so reIDM answers with what it made of the first instead of adding the
+file twice — and the browser is never left downloading a file reIDM took as well.
+
+### Refreshing an expired address
+
+When a download's address has expired, use **Refresh download address…** in reIDM and choose to
+click the link again in the browser. For the next three minutes, a link the extension hands over
+first asks **Use this link to refresh *name*?** — even with the dialog off, because you just asked
+for it:
+
+- **Refresh** — reIDM checks that the link serves the same file (the same size, and byte ranges
+  if part of it is already downloaded), then the waiting download carries on from it. A
+  notification says *Address refreshed*. If it is another file, reIDM refuses, and a download the
+  browser started stays with the browser.
+- **New download** — the link is downloaded as a download of its own (through the usual dialog,
+  if it is on); the waiting download keeps waiting.
+- **Cancel** — nothing is downloaded.
+
+With a reIDM older than 0.8, which doesn't tell the extension it is waiting, there is no
+question: reIDM tries every link against the waiting download itself.
+
 ### When reIDM isn't running
 
 The extension starts it. reIDM registers a small helper with your browsers
@@ -161,7 +183,9 @@ addresses for its videos — they are scrambled, or missing — so reIDM hands t
 choice to [yt-dlp](https://github.com/yt-dlp/yt-dlp), which keeps up with YouTube's changes:
 
 - **The quality you click is the one you get** when yt-dlp's list has it; otherwise the best at
-  that height, H.264 with AAC first (it plays anywhere).
+  that height, H.264 with AAC first (it plays anywhere). A picture-only quality gets sound in its
+  own container (WebM with Opus, MP4 with AAC), so a WebM stays a WebM; a *stable volume* audio
+  track is fetched as that track.
 - **Several connections at once,** as many as *Connections per download* in reIDM's Options:
   yt-dlp fetches the video in pieces, in parallel. One connection is throttled by YouTube, and a
   long one is often cut off.
@@ -246,7 +270,7 @@ most people need are at the top; the rest are under **Advanced**.
 | Leave downloads smaller than (KB) | 0 | 0 takes everything. |
 | Never take downloads from these sites | — | One host per line; subdomains are included. |
 | Also in incognito windows | off | Also needs *Allow in incognito* on the extension's details page. While off, reIDM does nothing in incognito windows — the right-click menu, the popup and the grabber included. When on, the incognito window's own cookies are used, never the normal profile's. |
-| Ask before each download | on | The *Download file info* dialog — name, folder, size; Start download, Download later, Cancel — for downloads the extension takes, clicked file links, the right-click menu, the popup and a video's qualities. Off: they start at once, except programs a page starts by itself. |
+| Ask before each download | on | The *Download file info* dialog — name, folder, size; Start download, Download later, Cancel — for downloads the extension takes, clicked file links, the right-click menu, the popup and a video's qualities. Off: they start at once, except programs a page starts by itself, and links offered to [refresh a waiting download](#refreshing-an-expired-address). |
 | Show a notification when reIDM takes a download | on | A desktop notification, *Downloading in reIDM*, with the file's name — the browser's own download bubble doesn't appear for what reIDM takes. Also when reIDM can't take one, and why. |
 | Start reIDM when it is not running | on | Uses the `com.zektopic.reidm` helper. |
 | reIDM port | 61002 | Only change it if you run reIDM on another port. |
@@ -271,6 +295,12 @@ web pages, so a site can't tell that it is installed.
 | `storage`, `alarms` | settings, and a once-a-minute check that reIDM is running |
 | `notifications` | *Downloading in reIDM*, and why reIDM couldn't take a download |
 | host access to all sites | reading media manifests, the grabber, and click interception; with `cookies`, reading the cookies of the one address being handed over. Taking over the browser's downloads needs no host access itself. |
+
+Why host access isn't optional: without it the extension can read no site's cookies, so every
+download that needs you signed in would fail in reIDM and fall back to the browser, and file
+links couldn't be taken on click. Asking for access site by site would make the first download
+from each site behave differently from the next, and asking for all sites at once is the same
+permission with an extra prompt. So the breadth is stated here instead.
 
 ## How it is secured
 
