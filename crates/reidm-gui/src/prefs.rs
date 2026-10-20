@@ -17,11 +17,15 @@ pub struct Prefs {
     /// Fill the Add URL dialog with the links on the clipboard.
     #[serde(default = "yes")]
     pub clipboard: bool,
+    /// The user has been told, on closing the window once, that downloads carry on in the
+    /// background.
+    #[serde(default)]
+    pub close_explained: bool,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { dark: false, notify_complete: true, clipboard: true }
+        Self { dark: false, notify_complete: true, clipboard: true, close_explained: false }
     }
 }
 
