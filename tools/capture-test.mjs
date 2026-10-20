@@ -52,6 +52,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -296,17 +297,37 @@ async function startDaemon() {
 async function stopDaemon() {
   if (daemon) daemon.kill('SIGTERM');
   daemon = null;
-  // A daemon the native host started is not our child; stop whatever holds the port.
-  for (let i = 0; i < 50 && (await apiUp()); i++) {
-    if (WIN) {
-      const pids = new Set(spawnSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8' }).stdout.split('\n')
-        .filter((l) => /127\.0\.0\.1:61002\s.*LISTENING/.test(l)).map((l) => l.trim().split(/\s+/).pop()));
-      for (const pid of pids) spawnSync('taskkill', ['/F', '/PID', pid]);
-    } else {
-      spawnSync('fuser', ['-k', '-TERM', '61002/tcp']);
+  // Wait for both ports, not just the API's: the service closes its HTTP port first and its
+  // extension socket only once the list is flushed, and the next run needs both. A daemon the
+  // native host started is not our child; stop whatever still holds a port after a grace period.
+  for (let i = 0; i < 100; i++) {
+    const held = [];
+    for (const port of [61001, 61002]) if (await portOpen(port)) held.push(port);
+    if (!held.length) return;
+    if (i >= 20) {
+      for (const port of held) {
+        if (WIN) {
+          const re = new RegExp(`127\\.0\\.0\\.1:${port}\\s.*LISTENING`);
+          const pids = new Set(spawnSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8' }).stdout.split('\n')
+            .filter((l) => re.test(l)).map((l) => l.trim().split(/\s+/).pop()));
+          for (const pid of pids) spawnSync('taskkill', ['/F', '/PID', pid]);
+        } else {
+          spawnSync('fuser', ['-k', '-TERM', `${port}/tcp`]);
+        }
+      }
     }
     await sleep(100);
   }
+  throw new Error('reIDM still holds its ports 10 s after being asked to stop');
+}
+function portOpen(port) {
+  return new Promise((resolve) => {
+    const c = net.connect({ host: '127.0.0.1', port }, () => {
+      c.destroy();
+      resolve(true);
+    });
+    c.on('error', () => resolve(false));
+  });
 }
 async function apiUp() {
   try {
@@ -899,6 +920,15 @@ async function main() {
   check('the extension has the fixed ID', !!sw && sw.includes(EXT_ID));
   // Let the worker publish reIDM's status for the content scripts.
   await inWorker('reidm.ping().then(i => !!i)');
+  // The service counts a check-in only from the extension itself (not a web page pinging it), by
+  // what Chrome says about where the request came from: make sure the real extension still counts.
+  const want = JSON.parse(fs.readFileSync(path.join(ROOT, 'extension', 'manifest.json'), 'utf8')).version;
+  const seen = await waitFor('the service to see the extension', async () => {
+    const r = await fetch(`${API}/api/status`, { headers: { 'X-Reidm-Token': token() } });
+    const ext = (await r.json()).extension;
+    return ext?.version === want ? ext : null;
+  }, 10000);
+  check('the service reports the extension as connected', !!seen, seen ? `version ${seen.version}` : `expected ${want}`);
   if (process.env.REIDM_ONLY_GRABBER) return grabberChecks();
 
   await openPage(`http://127.0.0.1:${SITE_PORT}/`);
