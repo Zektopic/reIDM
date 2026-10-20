@@ -37,9 +37,7 @@ function syncEnabled() {
 let dirty = false;
 const load = async () => show({ ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) });
 load();
-document.addEventListener('input', (e) => {
-  if (e.target.id !== 'port') dirty = true;
-});
+document.addEventListener('input', () => (dirty = true));
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'sync' && !dirty) load();
 });

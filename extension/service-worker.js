@@ -667,7 +667,11 @@ function advance() {
   dialog.current = null;
   const next = dialog.queue.shift();
   if (!next) {
-    if (dialog.windowId != null) chrome.windows.remove(dialog.windowId).catch(() => {});
+    // Forget the window before it is gone, so a request arriving meanwhile opens a new one
+    // instead of being shown in this one as it closes (and counted as cancelled).
+    const id = dialog.windowId;
+    Object.assign(dialog, { windowId: null, port: null });
+    if (id != null) chrome.windows.remove(id).catch(() => {});
     return;
   }
   dialog.current = next;
@@ -752,6 +756,7 @@ function onDialogConnect(port) {
   if (dialog.windowId == null) dialog.windowId = windowId;
   dialog.port = port;
   port.onMessage.addListener((m) => {
+    if (dialog.port !== port) return; // a window that is closing
     const cur = dialog.current;
     if (m.type === 'hello') {
       if (!cur) advance();
