@@ -152,3 +152,196 @@ async fn a_torrent_file_on_the_web_is_added_as_a_torrent_with_the_browsers_cooki
     assert_eq!(std::fs::read(kept).unwrap(), bytes, "the .torrent is kept in the data folder");
     assert_eq!(it.path.parent().unwrap(), dir.join("dl").join("Video"), "and filed by what it holds");
 }
+
+/// Another client on this machine seeding `what` (a file, or a folder of files): the torrent's
+/// bytes, its info hash, and the `ip:port` to reach it at. The session is returned so it lives
+/// as long as the test.
+async fn seed(what: &std::path::Path) -> (Vec<u8>, String, String, std::sync::Arc<Session>) {
+    let spawner = librqbit::spawn_utils::BlockingSpawner::new(2);
+    let created = librqbit::create_torrent(what, CreateTorrentOptions { name: None, trackers: vec![], piece_length: Some(16384) }, &spawner).await.unwrap();
+    let bytes = created.as_bytes().unwrap().to_vec();
+    let hash = created.info_hash().as_string();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let seeder = Session::new_with_opts(
+        what.parent().unwrap().to_path_buf(),
+        SessionOptions { dht: None, disable_trackers: true, listen: Some(ListenerOptions { listen_addr: (std::net::Ipv4Addr::LOCALHOST, port).into(), ..Default::default() }), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    // A folder's files are inside it; a single file is beside the others.
+    let out = if what.is_dir() { what.to_path_buf() } else { what.parent().unwrap().to_path_buf() };
+    let h = seeder
+        .add_torrent(AddTorrent::from_bytes(bytes.clone()), Some(AddTorrentOptions { output_folder: Some(out.to_string_lossy().into()), overwrite: true, ..Default::default() }))
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    wait_for("the seeder to check its files", || h.stats().finished).await;
+    (bytes, hash, format!("127.0.0.1:{port}"), seeder)
+}
+
+fn quiet_manager(dir: &std::path::Path) -> Manager {
+    let m = Manager::open(&dir.join("state"), dir.join("dl"), 4).unwrap();
+    m.update_settings(SettingsPatch { torrent_dht: Some(false), torrent_port: Some(0), seed_ratio: Some(0.0), ..Default::default() }).unwrap();
+    m
+}
+
+fn from_peer(dir: &std::path::Path, tag: &str, bytes: &[u8], hash: &str, peer: &str) -> Request {
+    let file = dir.join(format!("{tag}.torrent"));
+    std::fs::write(&file, bytes).unwrap();
+    Request { url: format!("magnet:?xt=urn:btih:{hash}"), torrent: Some(TorrentRequest { file: Some(file), peers: vec![peer.to_string()], ..Default::default() }), ..Default::default() }
+}
+
+async fn finished(m: &Manager, id: u64) -> reidm_core::Item {
+    wait_for("the torrent to end", || matches!(m.get(id).unwrap().status, Status::Done | Status::Failed(_))).await;
+    m.get(id).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_torrent_never_writes_over_a_file_that_is_already_there() {
+    let dir = tmp("collide");
+    std::fs::create_dir_all(dir.join("seeder")).unwrap();
+    let data = vec![42u8; 300_000];
+    std::fs::write(dir.join("seeder").join("payload.bin"), &data).unwrap();
+    let (bytes, hash, peer, _seeder) = seed(&dir.join("seeder").join("payload.bin")).await;
+
+    // The user's own, different, file of the same name, where the torrent would go.
+    std::fs::create_dir_all(dir.join("dl")).unwrap();
+    std::fs::write(dir.join("dl").join("payload.bin"), b"mine, not the torrent's").unwrap();
+    let m = quiet_manager(&dir);
+    let id = m.add(from_peer(&dir, "t", &bytes, &hash, &peer)).unwrap();
+    let it = finished(&m, id).await;
+    assert_eq!(it.status, Status::Done, "{:?}", it.status);
+    assert_eq!(std::fs::read(dir.join("dl").join("payload.bin")).unwrap(), b"mine, not the torrent's", "the user's file is untouched");
+    assert_eq!(it.path, dir.join("dl").join("payload").join("payload.bin"), "the torrent went into a folder of its own");
+    assert_eq!(std::fs::read(&it.path).unwrap(), data);
+    assert_eq!(it.torrent.unwrap().folder, Some(dir.join("dl").join("payload")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_of_several_files_gets_a_folder_of_its_own() {
+    let dir = tmp("multi");
+    let album = dir.join("seeder").join("Album");
+    std::fs::create_dir_all(&album).unwrap();
+    std::fs::write(album.join("one.flac"), vec![1u8; 70_000]).unwrap();
+    std::fs::write(album.join("two.flac"), vec![2u8; 50_000]).unwrap();
+    let (bytes, hash, peer, _seeder) = seed(&album).await;
+
+    // A folder of that name is already there, with a file the torrent also has.
+    std::fs::create_dir_all(dir.join("dl").join("Album")).unwrap();
+    std::fs::write(dir.join("dl").join("Album").join("one.flac"), b"another album").unwrap();
+    let m = quiet_manager(&dir);
+    let id = m.add(from_peer(&dir, "t", &bytes, &hash, &peer)).unwrap();
+    let it = finished(&m, id).await;
+    assert_eq!(it.status, Status::Done, "{:?}", it.status);
+    let folder = dir.join("dl").join("Album (1)");
+    assert_eq!(it.path, folder, "the list shows the torrent's folder");
+    assert_eq!(std::fs::read(folder.join("one.flac")).unwrap(), vec![1u8; 70_000]);
+    assert_eq!(std::fs::read(folder.join("two.flac")).unwrap(), vec![2u8; 50_000]);
+    assert_eq!(std::fs::read(dir.join("dl").join("Album").join("one.flac")).unwrap(), b"another album");
+    assert!(!dir.join("dl").join("two.flac").exists(), "nothing is scattered into the download folder");
+
+    // Removed with its files: the folder goes, the other album stays.
+    m.remove(id, true);
+    wait_for("its files to go", || !folder.join("one.flac").exists()).await;
+    assert!(dir.join("dl").join("Album").join("one.flac").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn starting_a_finished_torrent_again_downloads_it_again() {
+    let dir = tmp("restart");
+    std::fs::create_dir_all(dir.join("seeder")).unwrap();
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(dir.join("seeder").join("disc.iso"), &data).unwrap();
+    let (bytes, hash, peer, _seeder) = seed(&dir.join("seeder").join("disc.iso")).await;
+    let m = quiet_manager(&dir);
+    let id = m.add(from_peer(&dir, "t", &bytes, &hash, &peer)).unwrap();
+    let first = finished(&m, id).await;
+    assert_eq!(first.status, Status::Done);
+    // "Start again": its files are deleted and it is fetched anew. The deletion happens in the
+    // background; the new run must wait for it rather than pick up the torrent being removed
+    // (whose files would then be deleted from under it), or find its old file and step aside.
+    m.restart(id).await.unwrap();
+    let again = finished(&m, id).await;
+    assert_eq!(again.status, Status::Done, "{:?}", again.status);
+    assert_eq!(again.path, first.path, "the same place, not a folder beside it");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(std::fs::read(&again.path).unwrap(), data, "and its file stays");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_torrent_is_one_download_whatever_form_its_link_takes() {
+    let dir = tmp("twins");
+    std::fs::create_dir_all(dir.join("seeder")).unwrap();
+    std::fs::write(dir.join("seeder").join("song.mp3"), vec![9u8; 40_000]).unwrap();
+    let (bytes, hash, peer, _seeder) = seed(&dir.join("seeder").join("song.mp3")).await;
+    let m = quiet_manager(&dir);
+    let later = || reidm_core::AddOptions { later: true, ..Default::default() };
+    let a = m.add_with(from_peer(&dir, "first", &bytes, &hash, &peer), later()).unwrap();
+    // The same info hash in base32, as some sites write it, and the .torrent itself.
+    let b32 = base32(&hex(&hash));
+    let b = m.add_with(Request { url: format!("magnet:?xt=urn:btih:{b32}&dn=song.mp3"), ..Default::default() }, later()).unwrap();
+    assert_eq!(b.id, a.id, "hex and base32 name the same torrent");
+    assert_eq!(m.add_torrent_file(&bytes, None, true).unwrap().id, a.id);
+
+    // Under an address the list can't tell is the same: refused when it starts, not run twice.
+    m.resume(a.id).unwrap();
+    let first = finished(&m, a.id).await;
+    assert_eq!(first.status, Status::Done, "{:?}", first.status);
+    let mut other = from_peer(&dir, "other", &bytes, &hash, &peer);
+    other.url = "https://example.invalid/song.torrent".into();
+    let c = m.add(other).unwrap();
+    assert_ne!(c, a.id);
+    match finished(&m, c).await.status {
+        Status::Failed(e) => assert!(e.contains(&format!("already in the list (download {})", a.id)), "{e}"),
+        s => panic!("ran a second time: {s:?}"),
+    }
+    assert!(first.path.exists(), "the first one's file is untouched");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torrent_address_that_sends_without_end_is_refused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tmp("endless");
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let count = sent.clone();
+    tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut req = [0u8; 4096];
+        let _ = s.read(&mut req).await;
+        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-bittorrent\r\nTransfer-Encoding: chunked\r\n\r\n").await;
+        let chunk = format!("{:x}\r\n{}\r\n", 1 << 20, "d".repeat(1 << 20));
+        // Up to 1 GiB, unless the reader hangs up first.
+        for _ in 0..1024 {
+            if s.write_all(chunk.as_bytes()).await.is_err() {
+                return;
+            }
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    let m = quiet_manager(&dir);
+    let e = m.add_checked(Request { url: format!("http://{addr}/big.torrent"), ..Default::default() }, Default::default()).await.unwrap_err();
+    assert!(format!("{e:#}").contains("larger than 10 MiB"), "{e:#}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(sent.load(std::sync::atomic::Ordering::SeqCst) < 64, "stopped reading at the limit, not at the end");
+}
+
+fn hex(h: &str) -> Vec<u8> {
+    (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect()
+}
+
+fn base32(b: &[u8]) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let (mut out, mut bits, mut n) = (String::new(), 0u32, 0);
+    for &x in b {
+        bits = (bits << 8) | x as u32;
+        n += 8;
+        while n >= 5 {
+            n -= 5;
+            out.push(A[((bits >> n) & 31) as usize] as char);
+        }
+    }
+    out
+}

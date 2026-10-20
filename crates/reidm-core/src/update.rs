@@ -74,13 +74,26 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 }
 
 /// Look for a newer release. Returns `Ok(None)` when this build is already the newest.
+///
+/// Blocking, and safe to call from anywhere — including from inside a tokio runtime, as the
+/// `reidm update-check` command does: reqwest's blocking client panics when it is created or
+/// dropped on a runtime thread, so the request runs on a thread of its own.
 pub fn check(repo: &str, current: &str, token: Option<&str>) -> Result<Option<Release>> {
+    check_at("https://api.github.com", repo, current, token)
+}
+
+fn check_at(api: &str, repo: &str, current: &str, token: Option<&str>) -> Result<Option<Release>> {
+    let (api, repo, current, token) = (api.to_string(), repo.to_string(), current.to_string(), token.map(str::to_string));
+    std::thread::spawn(move || check_here(&api, &repo, &current, token.as_deref())).join().map_err(|_| anyhow::anyhow!("the update check stopped unexpectedly"))?
+}
+
+fn check_here(api: &str, repo: &str, current: &str, token: Option<&str>) -> Result<Option<Release>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .context("building the HTTP client")?;
 
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let url = format!("{api}/repos/{repo}/releases/latest");
     let mut req = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -132,6 +145,24 @@ mod tests {
         assert!(!is_newer("0.2.0", "0.2.0"));
         assert!(!is_newer("0.1.9", "0.2.0"));
         assert!(!is_newer("v0.2.0-beta.1", "0.2.0"), "a pre-release of the same version is not newer");
+    }
+
+    #[tokio::test]
+    async fn checking_from_inside_the_runtime_does_not_panic() {
+        // `reidm update-check` runs inside `#[tokio::main]`; reqwest's blocking client used to
+        // panic there.
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut req = [0u8; 2048];
+            let _ = s.read(&mut req);
+            let body = r#"{"tag_name":"v99.0.0","html_url":"https://example.invalid/r","assets":[]}"#;
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        let r = check_at(&api, "o/r", "0.1.0", None).unwrap().expect("a newer release");
+        assert_eq!(r.version(), "99.0.0");
     }
 
     #[test]

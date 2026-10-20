@@ -129,7 +129,8 @@ pub fn url_key(u: &url::Url) -> String {
     // A magnet link is its torrent, whatever trackers and name ride along.
     if u.scheme() == "magnet" {
         if let Some((_, xt)) = u.query_pairs().find(|(k, _)| k == "xt") {
-            return format!("magnet:{}", xt.to_ascii_lowercase());
+            // Hex or base32, the same hash is the same torrent.
+            return torrent::btih_hex(&xt).map_or_else(|| format!("magnet:{}", xt.to_ascii_lowercase()), |h| format!("magnet:urn:btih:{h}"));
         }
     }
     let mut q: Vec<(String, String)> = u.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
@@ -922,11 +923,7 @@ impl Manager {
         // (a private tracker wants them) and added from what arrives.
         let named_torrent = req.filename.as_deref().is_some_and(|f| f.to_ascii_lowercase().ends_with(".torrent"));
         if req.torrent.is_none() && req.media.is_none() && req.url.starts_with("http") && (named_torrent || torrent::is_torrent_url(&req.url)) {
-            let r = self.0.http.get(&req.url).headers(Self::headers(&req)).timeout(Duration::from_secs(30)).send().await?.error_for_status()?;
-            if r.content_length().is_some_and(|n| n > 16 << 20) {
-                bail!("that .torrent is too large to be one");
-            }
-            let bytes = r.bytes().await?;
+            let bytes = self.fetch_torrent_file(&req).await?;
             return self.add_torrent_file(&bytes, None, opts.later);
         }
         if req.torrent.is_some() || torrent::is_torrent_url(&req.url) {
