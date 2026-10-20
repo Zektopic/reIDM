@@ -50,6 +50,12 @@ Over HTTP to `http://127.0.0.1:61002`: `GET /ext/ping`, `POST /ext/add`, `POST /
   reIDM's token file. Browsers set `Origin` themselves, a page can't forge an extension's, and
   reIDM answers CORS preflights only for extension origins.
 
+Every `/ext/add` carries a `request_id` (a random UUID), the same on the one retry after a
+timeout, so reIDM can answer a repeat with its first answer. Before each hand-off of an http(s)
+link the worker pings reIDM: if `/ext/ping` reports `refresh_armed: {id, name}`, the dialog first
+asks "Use this link to refresh *name*?", and the answer goes to `/ext/add` as `refresh_id: <id>`
+(Refresh) or `no_refresh: true` (New download). Without the field, nothing is asked or sent.
+
 To start reIDM, it sends `{"cmd":"launch"}` to the native-messaging host `com.zektopic.reidm`
 (`reidm-host`), which starts the service and replies once it answers.
 
@@ -97,4 +103,10 @@ after any change to the capture path.
 | `tabs`, `scripting` | per-tab media lists, the grabber, and registering the page hook |
 | `storage`, `alarms` | settings, held downloads and recent hand-offs; the once-a-minute check that reIDM is running |
 | `notifications` | *Downloading in reIDM*, and why reIDM couldn't take a download |
-| host access to all sites | media detection, click interception, the grabber |
+| host access to all sites | media detection, click interception, the grabber, and (with `cookies`) the cookies of the address handed over |
+
+Host access is not made optional (`optional_host_permissions`, review L18): without it no
+cookies can be read, so a fresh install would hand reIDM signed-in downloads it then can't fetch,
+and click interception wouldn't run. Asking per site would make the first download from each
+site behave differently from the next; asking for all sites at first run is the same grant with
+an extra prompt.
