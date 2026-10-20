@@ -9,6 +9,325 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-20 — Extension 1.6.0: never lose a held download, one dialog, cheap when idle (0.8.0)
+
+Source: the October extension review (H1–H6, M1–M22, L1–L18).
+
+### Held downloads: one storage key each, tagged with the worker that holds them
+
+**Context.** A download held in `onDeterminingFilename` lived only in the worker's memory and in
+one `storage.session` object (read-modify-write). The audit asked whether Chrome releases a dead
+worker's filename hold (H3.5).
+**Evidence.** Measured in Chrome 156 over CDP: after `ServiceWorker.stopAllWorkers`, or
+`Target.closeTarget` on the worker, while a download was held and paused, Chrome **releases the
+name hold** (the browser names the file), but the download **stays paused** (`in_progress`,
+`paused: true`) until something resumes it. An extension reload also released it. So recovery
+means "resume", not "restart the download".
+**Decision.** Each held download is written to `storage.local` as `reidm-pending:<id>`:
+`{url, paused, stage: 'asking'|'taken', instance, at}`. `instance` is a random id for each worker
+start. At start-up, every record from another instance is an orphan, however young: if the
+download is still `in_progress` with the same URL, it is resumed (`asking`) or cancelled and
+erased (`taken`, meaning reIDM had already accepted). `taken` is written before the browser's copy
+is cancelled. A dialog whose port disconnects sends a `wake` message, so the next worker starts at
+once; the one-minute alarm is the backstop.
+**Alternatives.** `storage.session` (cleared by an extension reload, and it shares a 10 MB quota a
+page could fill: M4). The audit's 60-second "still in flight" heuristic (it misses orphans if the
+next worker stays up). Restarting orphans with `downloads.download` (not needed, per the evidence).
+Cost: three `storage.local` writes per download, and each wakes the content scripts'
+`storage.onChanged`. Acceptable per download, unlike the per-minute status write (M6).
+
+### One dialog window with a queue; four ways an answer can end
+
+**Context.** Each request opened its own focused popup window at the same place (M3). A window
+closed before its page connected left the download held for ever (H3.1). Enter on a focused
+Cancel started the download (M1). After a refusal the dialog showed dead buttons (M2).
+**Decision.** One window, port `confirm`, with requests queued in the worker ("N more waiting",
+**Start all**). Every request ends in exactly one of four answers:
+- `start` or `later`: the outcome is shown with `report()`;
+- `cancel`: Cancel, Escape, or closing the window while it shows that request;
+- `release`: the window closed before it ever showed (nobody saw it, so nobody declined it), or
+  nobody answered for 10 minutes. The caller gives the download to the browser.
+
+Closing the window while more requests wait reopens it for them. A refusal shows "reIDM couldn't
+take it: … The browser downloads it instead." (or "Nothing was downloaded." for menu, popup and
+picker requests) with only Close/Next. Enter acts only from the name field. *Don't ask again*
+applies only on Start or Later.
+**Alternatives.** Offsetting several windows and capping them (still steals focus). Treating "closed
+before shown" as Cancel (it would lose a download the user never saw).
+**Evidence.** Browser checks: Enter on Cancel; two at once give one window and 2 records; a refusal
+leaves only Close; a window closed at the moment it appears; the worker stopped while two slow
+downloads are held (both finish in the browser, intact).
+
+### The live-manifest loop (H4) was real, and much worse than the audit thought
+
+**Evidence.** A test page polled an HLS master and media playlist once a second. In 10 s the
+extension fetched them **~9,800 times each** (`Sec-Fetch-Site: none`), against 11 fetches by the
+page. The worker's own re-fetch is seen by its own `onBeforeRequest` (tab −1), and `noteManifest`
+fetched again, without end.
+**Decision.** `noteManifest` ignores tab < 0, and re-fetches a manifest at most once per tab and
+address (origin + path, because tokens in the query change on every poll). It skips the fetch when
+the hook already supplied the formats. Measured after the fix: 0–2 extension requests for the
+whole run.
+
+### Idle cost on weak PCs (M5–M8)
+
+- `onBeforeRequest` for media is filtered in the browser to `*://*/*.<ext>*` for the 15 media
+  extensions, and to the types main_frame, sub_frame, media, xmlhttprequest, object and other.
+  `onHeadersReceived` is limited to media and xmlhttprequest. Both listeners are removed while
+  *Look for video and audio* is off. Checked: a page with 60 images makes 0 listener calls. XHR
+  and fetch responses still reach `onHeadersReceived`, because a media type is only known from
+  the response.
+- `reidm-status` is written only when up, version, media, dir or folders change. Checked: three
+  pings produce no write.
+- Content script: no 1 s `getBoundingClientRect` timer (the button is positioned on scroll,
+  resize, ResizeObserver, `playing` and `mouseenter`); mutations scan only added or changed nodes,
+  debounced to 2 s and run in idle time; URLs already sent are not sent again; the format queries
+  run only when the picker opens; no button in frames under 200×150. SPA navigation comes from the
+  Navigation API's `navigatesuccess` instead of polling. A browser check confirms it reaches the
+  isolated world when the page itself calls pushState.
+- `inject.js` became a `world: "MAIN"` `document_start` content script registered with
+  `chrome.scripting.registerContentScripts`, only while media detection is on (M8 and M9). It now
+  runs before page scripts, a page's CSP can't block it, and `web_accessible_resources` is gone,
+  so pages can't fetch `chrome-extension://…/inject.js` to detect reIDM. Checked: off means
+  `window.fetch` is native; on means hooked; the fetch probe is blocked.
+- The MSE hook that reported the page itself as "media" is gone (M10).
+
+### Cookies from the tab's real store (H5)
+
+`chrome.cookies.getAllCookieStores()` maps tab ids to store ids. A download has no tab, so an
+incognito download uses the store of an incognito tab. If none can be found, the result is `null`,
+meaning **no cookies**, never the profile's. The menus, popup, grabber and picker all honour
+*Also in incognito windows*, with an error that names the setting. Checked: a normal tab resolves
+to `"0"`; incognito without an incognito tab resolves to `null`. Not exercised: a real incognito
+window, because enabling an unpacked extension in incognito needs the profile's protected
+preferences.
+
+### YouTube SPA navigation (H6): confirmed and fixed
+
+Confirmed with a fixture: the global `ytInitialPlayerResponse` stays on video A after pushState to
+B. Player responses are now kept by `videoDetails.videoId` (from the global,
+`/youtubei/v1/player`, and `movie_player.getPlayerResponse()`), and only the one matching the
+`v=`, `/shorts/`, `/live/` or `/embed/` id in the address is offered. The page sent is the
+canonical `watch?v=<id>`. With no match, the picker shows only **Best**, which is yt-dlp's best.
+Checked: A, then B after pushState, then C with no response (empty list, C's title).
+
+### Smaller decisions
+
+- **M19 (timeouts).** reIDM's probe is limited to 12 s, under the 25 s client timeout, so a timeout
+  is rare. After a timeout the extension asks again (60 s): reIDM answers a known address with
+  `existing` without checking it again, which makes the retry an idempotency check rather than a
+  guess. A real idempotency key needs the service (below).
+- **M16 (size probe).** The dialog's size probe is a `HEAD` request and is never sent for held
+  downloads, whose size the browser already knows. A ranged GET can use up a one-time link.
+- **M15 (protection).** Programs (`.exe`, `.msi`, `.dmg`, `.apk`, scripts…) that a page starts
+  always get the dialog, with a warning, even with *Ask* off. Downloads Chrome flags
+  (`danger` not safe or accepted) stay with the browser. Marking the files reIDM saves
+  (Mark-of-the-Web, quarantine) is the service's job (below).
+- **M13.** "Download all links" opens the grabber with links to files ticked, instead of queueing
+  up to 2,000 addresses, logout links included.
+- **L14.** An HLS quality outside YouTube goes to reIDM as `media: {format: 'best'}`, so yt-dlp
+  joins the segments instead of reIDM saving a playlist text file.
+- **L4.** The click hand-back still replays `a.click()`. Navigating from the worker would drop the
+  page as referrer, which download sites check. The dead `handedBack` WeakSet is removed.
+- **Not done:** L13 (yt-dlp's output extension: depends on the service's merge flags), L15 (PDF
+  stays on the click list, as in IDM), L18 (optional host permissions: a larger change).
+
+### The browser test no longer hangs
+
+A dialog button pressed through CDP `Runtime.evaluate` closes the window, and the evaluation's
+answer then never comes. The suite waited for ever. Buttons and keys are now pressed
+asynchronously. Every CDP call times out after 30 s and names its expression and session.
+`inWorker` retries while a newly started worker finishes evaluating (`reidm is not defined`).
+The test profile allows automatic downloads for the test site, which the several-at-once checks
+need.
+
+### What the service must change
+
+1. **M14, refresh-address.** Add the armed download to `GET /ext/ping`, for example
+   `"refresh_armed": {"id": 12, "name": "file.iso"}` or `null`. The extension can then say "Use
+   this link to refresh *file.iso*?" instead of a new-download dialog. In `refresh_address`, probe
+   and check the new address **before** `stop_and_wait`, and leave a running download untouched
+   when the check fails. Today any unrelated browser download within 180 s stops the armed one.
+   The extension already announces `outcome: "refreshed"` ("Address refreshed").
+2. **M19.** An idempotency key in `POST /ext/add` (for example `"request_id"`), answered from a
+   short-lived cache, so a retry after a client timeout can't add twice.
+3. **M15.** Write `Zone.Identifier` (ZoneId=3, ReferrerUrl, HostUrl) on Windows and
+   `com.apple.quarantine` on macOS for files reIDM saves from the extension.
+4. Optional, M16: a `dry_run` on `/ext/add` returning size and name, so the dialog needs no
+   request of its own.
+
+## 2026-10-20 — Service and window: long lists, a thread that never blocks, safer control paths (0.8.0)
+
+### 1. The list as rows, with deltas and 304s (C1, H1, F-PERF)
+
+**Context.** The window fetched `GET /api/downloads` — every field of every download — every 300 ms,
+through ureq 3, whose `read_to_string` stops at 10 MB. Reproduced: with 10,000 finished downloads
+(8 segments each) the full list is 13.8 MB and the old window shows "Service unavailable" with an
+empty list, permanently. At 5,000 it loads, and then costs ~20% of a core while idle.
+
+**Decision.**
+- `GET /api/downloads` keeps its shape (web view, CLI, scripts) and gains `ETag: "<boot>-r<revision>"`
+  and `304` on `If-None-Match`. Browsers revalidate this automatically, so the web view benefits too.
+- New `GET /api/downloads/rows[?since=<cursor>]`: a *row* per download (no segments, no torrent file
+  list, no validators/user agent; `connections`/`parts` counts, torrent `files`/`skipped` counts,
+  `folder`), and with a cursor only the rows that changed plus removed ids, or `304`.
+- The service keeps each row's serialised JSON (`crates/reidm/src/rows.rs`) and decides "changed" by
+  comparing bytes. So deltas need nothing from the engine but `Manager::revision()`, which only says
+  when looking again is worthwhile. Removals are kept in a ring of 4,096; a caller further behind,
+  with a cursor from another run (`boot` is random per run), or none, gets `full: true`.
+- `GET /api/downloads/{id}`: the full item, fetched by Properties about once a second while open.
+- The window's poller applies deltas to a `Vec<Arc<Item>>` (unchanged rows are shared, not copied),
+  and lifts the body limit to 256 MB as a backstop.
+
+**Alternatives.** Raising the ureq limit alone (keeps ~45 MB/s of JSON at 10k while idle); SSE push
+(more moving parts, and the 304 path already makes idle free); per-item revisions in the engine
+(better — see "Follow-up" — but not available, and the byte comparison works without it).
+
+**Evidence.** `rows::tests::*`, `web::tests::fifty_thousand_downloads_are_served_and_an_unchanged_list_costs_nothing`
+(50k items: full list 60 MB, rows 20.5 MB, a one-row delta < 1 KB, unchanged → 304 with no body),
+screenshots of old vs new window at 10k/50k (old: "Service unavailable", 0 total; new: 50000 total).
+
+### 2. A window that does nothing while nothing happens (H1, H2, H3)
+
+**Decision.**
+- View model (`crates/reidm-gui/src/view.rs`): visible order and all counts rebuilt only when
+  `(snapshot rev, view, search, sort, desc)` changes; lower-cased name/URL and category computed once
+  per row on arrival. Selection is a `HashSet`. No O(n²) `retain`s; rates tracked only for running
+  downloads and seeding torrents.
+- No unconditional `request_repaint_after(200ms)`: the poller and the command thread call
+  `request_repaint()` when something changed; otherwise the frame asks for one in 30 s (relative
+  "Last Try" times), sooner for a toast or a pending channel.
+- Adaptive polling (`Pace`): 500 ms while something runs and the window is focused, 1 s idle,
+  3 s unfocused, 5 s minimised; a command pokes the poller so its effect shows at once.
+
+**Evidence.** `view::tests` (an unchanged frame does not rebuild; 50k build ≈ 90 ms debug, 1,000
+unchanged frames 0.13 ms), `api::tests` (deltas in place, rates, pace), measurements below.
+
+### 3. Nothing blocks the window's thread (H4, H5, M12, L5)
+
+**Decision.**
+- One command thread (`worker.rs`) with a queue; jobs run in order and hand back a closure the frame
+  runs (toasts, dialog state). Bulk actions are one request (`POST /api/downloads/bulk`, ≤ 10,000 ids)
+  instead of a thread and a request per download. Long calls (playlist, torrent inspect, page scan,
+  refresh address) keep a thread each, so a 10-minute yt-dlp lookup doesn't hold up *Pause*.
+- One token cell shared by poller and commands; a `401` re-reads the file once and retries once; a
+  missing token is an immediate error (the 15 s sleep loop is gone from the UI path).
+- `ensure_daemon` moved from before the window to the poller; the window opens at once with
+  "Starting the download service…". `daemon_up` checks `/ext/ping` says `"app":"reIDM"` instead of a
+  bare TCP connect, and stops waiting if the spawned service exits (port taken / already running).
+- Dialogs open from the last polled settings instead of a blocking `fetch_settings`.
+
+**Not done.** `rfd::FileDialog` remains synchronous (fine on Windows/macOS; on Linux the portal call
+blocks the frame while the picker is open — judged acceptable, `AsyncFileDialog` is a later change).
+
+**Evidence.** `worker::tests` (5,000 commands, one thread, in order), `api::tests::a_restarted_service_s_new_token…`,
+`api::tests::no_token_means_an_answer_at_once…` (< 50 ms).
+
+### 4. Options can't overwrite settings it never loaded (H6)
+
+**Decision.** `options.rs`: the form remembers the settings it was opened with; Save sends only the
+changed fields (`category_dirs` as a whole when any folder changed, since the API replaces them all),
+and is disabled with "Loading the service's settings…" until they have loaded. Slider ranges are the
+service's own (connections 1–32, at once 1–64). `POST /api/settings` now answers `500` (not `400`)
+when the engine applied the settings but could not save them — detected by comparing settings before
+and after, not by matching the message.
+
+**Evidence.** `options::tests::*` (unchanged → empty patch; 32 at-once survives; one folder → all folders).
+
+### 5. Security of the control paths (H8, M1, M2, L1, L2, L4)
+
+**H8 — decision: the WebSocket no longer honours types 1001–1003.** Checked what the real IDM
+extension sends: types 0, 1, 2, 13, 14 (and 15+ for media), never ≥ 1000 — those were reIDM's own CLI
+additions (`docs/PROTOCOL.md`). So dropping them breaks nothing for Tonec's extension, while the
+socket (no token; any local process, any user) could pause, remove and *delete files*. The CLI's
+`pause`/`resume`/`rm` use the token-protected HTTP API and now fail for unknown ids. `reidm-host` also
+refuses to relay types ≥ 1000 and relays only for Tonec's two Chromium IDs or its Firefox ID.
+*Alternative rejected:* requiring the IDM extension's `Origin` — native host and patched copies send
+none, and a local process can forge it anyway.
+
+**M1.** `/ext/*` (and its preflight) check `Host` like `/api/*` (`127.0.0.1`, `localhost`, `[::1]`
+with the port). A ping marked `Sec-Fetch-Site: cross-site|same-site` is answered but not recorded as
+the extension checking in (an `<img>` on a page can't fake "Browser: connected").
+*Verified at merge by the browser suite.* The concern was: Chrome sends `Sec-Fetch-Site: none` (or no header) for the
+extension service worker's own GET; if it sends `cross-site`, "Browser: connected" would stop showing
+(capture is unaffected). I couldn't run `tools/capture-test.mjs` (ports in use by another agent).
+
+**M2.** Per-route `DefaultBodyLimit`: torrent routes `MAX_TORRENT_FILE/3*4 + 1 MiB` (14.3 MiB for the
+engine's 10 MiB cap), lists 8 MiB, 64 KiB elsewhere; a readable 413 (JSON on `/ext`). Batches capped at
+10,000 with a message. **L1** constant-time compare. **L2** host caller check and 1 MiB reply cap.
+**L4** one origin list (`chrome-`, `moz-`, `safari-web-`, `extension://`).
+
+**Evidence.** `web::tests::{the_token_is_checked_whatever_its_length, ext_endpoints_refuse_other_host_names,
+a_web_page_cannot_fake_the_extension_checking_in, oversized_requests_are_refused_with_an_explanation,
+unknown_downloads_are_reported_not_silently_accepted}`, `session::tests::control_messages_cannot_remove_downloads`,
+`reidm-host` `tests::{callers, control_messages_are_not_relayed}`.
+
+### 6. Start-up, handlers, CLI (M5, M7, L3, L8)
+
+- **M7:** a `daemon.lock` (std `File::try_lock`) in the data folder first, then both ports, then the
+  list; losing either port is fatal with a message naming it. SIGTERM, Ctrl-C and `POST /api/shutdown`
+  stop serving, remove the token file and `Manager::flush()` (logged if it fails).
+- **M5:** every engine call that touches the disk or clones the list runs in `spawn_blocking`;
+  helpers started by Open/Open folder are waited for on a thread (no zombies).
+- **L3:** the `bin/../../extension` fallback only in debug builds; Windows uninstall removes the
+  manifests it wrote. **L8:** `list` from the API (numeric order) with file fallback only when
+  unreachable, `export` likewise; `get` resumes in a stable per-URL folder and removes it when done;
+  `parse_rate` takes `MiB` and treats `8Mbps` as bits. `REIDM_UI_PORT`/`REIDM_LOCAL_PORT` for a
+  throw-away second service (tests, measurements); the extension ignores them.
+
+**Evidence.** `tests::a_second_service_for_the_same_folder_is_refused`, `tests::get_resumes_in_the_same_folder`,
+`tests::rates`, `web::tests::shutdown_stops_the_service_and_removes_the_token`,
+`web::tests::storage_problems_reach_the_status`; manual run: shutdown → token gone, list + `.bak` flushed.
+
+### 7. Window behaviour (M8, M9, L6, L7, L10, 5.3)
+
+Confirmations for Restart (says how much is thrown away, and that a finished file is replaced),
+Remove completed (with the count) and deleting files; Enter takes the harmless choice, Esc cancels,
+destructive buttons are red. First close explains downloads continue, with *Quit reIDM completely*
+(also in File). Limiter "turn on" with no rate opens its dialog. Time Left sorts by remaining time,
+Status by Running > Queued > Paused > Failed > Done, the last column is Address and sorts by URL.
+Grabber results, Properties' torrent files, the torrent picker and playlist rows use `show_rows`; the
+Add dialog's parse and the batch preview are cached; a batch range is checked (≤ 10,000) before
+expansion, which also avoids the core M10 overflow from the GUI. Storage warnings
+(`Manager::warnings()`, in `/api/status`) show as a banner. Wording: Pause/Resume everywhere, Remove
+for list removal, "Ready" / "Background service not running".
+
+### Measurements
+
+Release builds (LTO off, 16 codegen units, same for both), Xvfb 1280×800, a throw-away service on
+ports 61101/61102 with a fake `HOME` (no browser registrations touched), lists generated with 8
+segments per item. CPU is the share of one core over 30 s after the list had loaded.
+
+| Scenario | Window CPU | Service CPU | Window RSS | Service RSS |
+|---|---|---|---|---|
+| before, 5k idle | 19.6% | 9.0%¹ | 129 MB | 29 MB |
+| before, 10k idle | 7.1% (list fails to load) | 17.6%¹ | 84 MB | 59 MB |
+| before, 50k idle | 6.3% (list fails to load) | 53.7%¹ | 83 MB | 158 MB |
+| before, 5k, one download running | 19.9% | 9.4%¹ | 174 MB | 88 MB |
+| after, 5k idle | 0.1% | 0.0% | 133 MB | 31 MB |
+| after, 10k idle | 0.1% | 0.0% | 138 MB | 50 MB |
+| after, 50k idle | 0.0% | 0.0% | 193 MB | 156 MB |
+| after, 5k, one download running | 1.0% | 1.1% | 133 MB | 38 MB |
+| after, 50k, one download running | 1.3% | 11.7% | 163 MB | 218 MB |
+
+¹ The "before" window had to be run against this branch's service (the old one can't move its
+port off 61002), at a commit where the revision was still the temporary hash shim — so those service
+numbers include an extra list hash per request. The window numbers are the old window's own.
+
+Handler timings (debug build, from the tests): 50k full list 60 MB, rows 20.5 MB, a one-row delta
+< 1 KB. View-model rebuild for 50k rows ≈ 90 ms in debug (≈ 10× less in release), unchanged frames free.
+
+### Follow-up
+
+- **Service CPU with a long history and something running** (11.7% at 50k, one download): each
+  revision change makes the row cache clone and re-serialise the whole list to find the changed row.
+  The engine could expose which ids changed since a revision (or a per-item revision); `RowCache`
+  would then touch only those. Everything else in the design stays.
+- `rfd::AsyncFileDialog` for the Linux portal; accessibility (M11) and the UX/settings redesign are
+  phase 2. `reidm-host`'s `port_open` is still a bare TCP connect.
+- ~~Verify the `Sec-Fetch-Site` gate with the real-browser suite~~ — verified at merge: the suite
+  now checks that the real extension shows as connected (it does, version 1.6.0).
+
 ## 2026-10-20 — Engine: durable progress, a crash-safe list, and the HTTP engine's failure cases (0.8.0)
 
 **Context.** The October engine review (reviews/2026-10/engine.md C1, H1–H7, M1–M4, M8, M9, M11–M13,

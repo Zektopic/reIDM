@@ -37,6 +37,60 @@
 * The site grabber's *include* filter keeps links containing any one of the patterns, as documented
   (it required all of them).
 
+### The window and the service
+
+* **Very long lists work**: the window no longer stops with "Service unavailable" past about 7,000
+  downloads, and it fetches only what changed — nothing at all while the list is idle. Idle CPU
+  drops from about 20% of a core to near zero (measured with 5,000 downloads; 50,000 load fine).
+* The window never freezes on a click: commands run in the background, actions on many downloads
+  are a single request, and it opens at once while the background service starts.
+* After the background service restarts, the window carries on instead of failing every command.
+* Options never resets your folders or torrent settings: Save sends only what you changed, and waits
+  until the current settings have loaded. *Downloads at the same time* goes up to 64.
+* Restart, Remove completed and deleting files ask first. Closing the window the first time explains
+  that downloads continue, with *Quit reIDM completely* (also in the File menu).
+* Only one service runs per data folder, and it stops with a clear message if its ports are taken.
+  Quitting saves the list first. Problems with the list's storage show as a banner.
+* API: `GET /api/downloads/rows` (rows and deltas), `GET /api/downloads/{id}`,
+  `POST /api/downloads/bulk`, `POST /api/shutdown`; `ETag`/`304` on `GET /api/downloads`;
+  `warnings` in `/api/status`; `404` for unknown downloads.
+* CLI: `reidm list` shows the live list in numeric order; `reidm get` resumes when run again; rates
+  accept `MiB` and bits (`8Mbps`).
+
+### Security
+
+* The IDM-extension socket (port 1001/61001) can no longer pause, remove or delete downloads — any
+  program on the computer could. Tonec's extension never used those messages; `reidm pause`,
+  `resume` and `rm` now use the token-protected API and report unknown downloads.
+* The extension endpoints check the `Host` header (DNS rebinding), request sizes are limited per
+  endpoint with a clear message, and a web page can no longer make the window show the extension
+  as connected. The native-messaging host relays only for IDM's own extension.
+* Pages can no longer detect the extension through `inject.js`, use its privileged messages, or
+  plant fake formats in the video picker.
+
+### Extension 1.6.0
+
+* **A download held while the dialog was open could be lost** if the dialog closed early or the
+  extension restarted. The browser now always gets it back.
+* **On live streams the extension re-fetched the playlist in a loop**, thousands of times a second.
+* The popup's YouTube *best quality* row did nothing; *Download selected* with several items stopped
+  after the first.
+* On YouTube, after moving to another video, the picker offered the previous video's qualities and
+  title.
+* Incognito downloads went without cookies, and the menus, popup and grabber used the normal
+  profile's cookies. Each now uses its own window's cookies, and nothing works in incognito unless
+  allowed.
+* Enter on a focused Cancel or *Download later* started the download.
+* Several downloads at once share one *Download file info* dialog ("2 more waiting", *Start all*).
+  After a refusal it says the browser has the download.
+* Programs a page starts always ask first. Downloads the browser flags as dangerous stay with it.
+* *Download all links on this page* opens the grabber with the file links ticked.
+* Much lighter on busy pages: network listeners see only media addresses, nothing is written to
+  storage unless it changed, and with *Look for video and audio* off no page is touched.
+* HLS qualities outside YouTube are joined into one video by yt-dlp. The media badge is per tab.
+  *Just now* shows cancelled downloads as cancelled.
+* The options page puts the main settings first and the rest under *Advanced*.
+
 ### Improved
 
 * Adding thousands of links at once takes a moment instead of minutes (2,000 links: 51 s → 0.1 s),
