@@ -28,9 +28,9 @@ const PAGE: &str = include_str!("../assets/ui.html");
 /// Request bodies are small except where a file or a long list rides along. Anything bigger is
 /// refused before it is read, with a message saying so (see `explain_too_large`).
 const SMALL_BODY: usize = 64 * 1024;
-/// A `.torrent` file, base64 inside JSON: the engine accepts up to 16 MiB of torrent, which is
-/// 22 MiB once encoded.
-const TORRENT_BODY: usize = 24 * 1024 * 1024;
+/// A `.torrent` file, base64 inside JSON: base64 makes the engine's largest torrent a third
+/// bigger, plus room for the rest of the request (14.3 MiB for the 10 MiB cap).
+const TORRENT_BODY: usize = reidm_core::torrent::MAX_TORRENT_FILE / 3 * 4 + 1024 * 1024;
 /// A batch of URLs, or the extension's grabber with a cookie on every link.
 const BATCH_BODY: usize = 8 * 1024 * 1024;
 /// The most downloads one batch or bulk request may name.
@@ -392,7 +392,13 @@ async fn act_on(mgr: &Manager, id: u64, what: &str) -> Result<(), String> {
             let reveal = what == "folder";
             blocking(move || {
                 if let Some(it) = m.get(id) {
-                    crate::launch::open_path(&it.path, reveal);
+                    // A torrent's files are in a folder of their own: that folder is what
+                    // "open folder" means, and what "open" means for more than one file.
+                    let folder = it.torrent.as_ref().and_then(|t| t.folder.clone().filter(|_| reveal || t.files.len() > 1));
+                    match folder {
+                        Some(f) => crate::launch::open_path(&f, false),
+                        None => crate::launch::open_path(&it.path, reveal),
+                    }
                 }
                 Ok(())
             })

@@ -51,8 +51,8 @@ Invoke-RestMethod -Headers $h http://127.0.0.1:61002/api/downloads
 ```
 
 Request bodies are JSON (`Content-Type: application/json`). Fields not listed are ignored;
-optional fields may be left out. Bodies are limited in size: 24 MB where a `.torrent` file can
-ride along (`POST /api/downloads`, `/api/torrent/inspect`), 8 MB for lists (`/api/downloads/batch`,
+optional fields may be left out. Bodies are limited in size: 14.3 MiB where a `.torrent` file
+(up to 10 MiB, base64) can ride along (`POST /api/downloads`, `/api/torrent/inspect`), 8 MB for lists (`/api/downloads/batch`,
 `/api/downloads/bulk`, `/ext/add-batch`) and 64 KB everywhere else; a bigger one is refused with
 `413` and a sentence saying so. A batch or bulk request names at most 10,000 downloads.
 
@@ -146,7 +146,7 @@ item, and a poll while one download moves carries one row.
 A row has the item's fields except `request` (its `url` and `referer` are lifted out; `media`
 too, when set), `segments`, `etag` and `last_modified`; instead `connections` counts the ranges
 being written right now and `parts` all of them. A torrent's `torrent` has `files` and `skipped`
-as counts rather than the file list.
+as counts rather than the file list, and `folder`, where its files are, when known.
 
 Ask again with `?since=<cursor>` (or `If-None-Match: "<cursor>"`). The answer is then `304`
 while nothing changed, or `"full": false` with only the rows that changed in `rows` and the ids
@@ -238,7 +238,7 @@ Instead of (or as well as) `urls`, `items` takes entries with their own headers 
 | `POST /api/downloads/{id}/schedule` | put it in the scheduled queue (not a finished one) |
 | `POST /api/downloads/{id}/unschedule` | take it out of the scheduled queue |
 | `POST /api/downloads/{id}/open` | open the file, on the machine running reIDM |
-| `POST /api/downloads/{id}/folder` | open its folder, on the machine running reIDM |
+| `POST /api/downloads/{id}/folder` | open its folder (a torrent's own folder, when it has one), on the machine running reIDM |
 | `DELETE /api/downloads/{id}` | remove it from the list |
 | `DELETE /api/downloads/{id}?purge=true` | remove it and delete the file (finished, or the partial `.reidm`) |
 

@@ -54,6 +54,9 @@ pub struct Row<'a> {
 pub struct TorrentRow<'a> {
     pub info_hash: &'a str,
     pub name: &'a str,
+    /// Where its files are, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<&'a std::path::Path>,
     pub uploaded: u64,
     pub peers: u32,
     pub seeding: bool,
@@ -85,6 +88,7 @@ impl<'a> Row<'a> {
             torrent: it.torrent.as_ref().map(|t| TorrentRow {
                 info_hash: &t.info_hash,
                 name: &t.name,
+                folder: t.folder.as_deref(),
                 uploaded: t.uploaded,
                 peers: t.peers,
                 seeding: t.seeding,

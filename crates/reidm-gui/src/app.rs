@@ -2709,7 +2709,10 @@ impl App {
                     if let Some(m) = &it.request.media {
                         row(ui, "Fetched with", format!("yt-dlp, format {}", m.format));
                     }
-                    row(ui, "Saved to", it.path.display().to_string());
+                    match it.torrent.as_ref().and_then(|t| t.folder.as_ref()) {
+                        Some(f) => row(ui, "Saved in", f.display().to_string()),
+                        None => row(ui, "Saved to", it.path.display().to_string()),
+                    }
                     let status = match &it.status {
                         Status::Failed(e) => format!("Error: {e}"),
                         s => s.label().to_string(),
@@ -3148,7 +3151,8 @@ impl App {
                     icons::file_card(ui.painter(), r, it.category(), self.prefs.dark);
                     ui.vertical(|ui| {
                         ui.label(RichText::new(it.file_name()).strong());
-                        ui.label(RichText::new(format!("{} · {}", it.size.map(size_human).unwrap_or_default(), it.path.parent().map(|d| d.display().to_string()).unwrap_or_default())).color(p.text_dim).size(11.5));
+                        let folder = it.torrent.as_ref().and_then(|t| t.folder.clone()).or_else(|| it.path.parent().map(|d| d.to_path_buf()));
+                        ui.label(RichText::new(format!("{} · {}", it.size.map(size_human).unwrap_or_default(), folder.map(|d| d.display().to_string()).unwrap_or_default())).color(p.text_dim).size(11.5));
                     });
                 });
                 if self.completed.len() > 1 {

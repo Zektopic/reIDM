@@ -64,6 +64,9 @@ pub struct TorrentRow {
     pub info_hash: String,
     #[serde(default)]
     pub name: String,
+    /// Where its files are, when known.
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
     #[serde(default)]
     pub uploaded: u64,
     #[serde(default)]
