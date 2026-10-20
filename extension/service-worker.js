@@ -1392,17 +1392,21 @@ function formatFilename(title, format, url) {
 /**
  * The yt-dlp format selector for a format picked in the list: that exact format when yt-dlp
  * offers it (its list is not always the page's), else the best at the same height — H.264 with
- * AAC first, which plays anywhere. A format without sound gets the best audio joined to it.
- * With nothing picked (`null` from the popup's "best quality" row too), the best there is.
+ * AAC first, which plays anywhere. A format without sound gets the best audio in its own
+ * container joined to it (WebM with Opus, MP4 with AAC), so the file stays the type the dialog
+ * named rather than becoming an MKV. "Stable volume" audio is yt-dlp's `<itag>-drc`, else the
+ * plain one. With nothing picked (`null` from the popup's "best quality" row too), the best
+ * there is. reIDM names the file after yt-dlp's result, whatever the extension sent.
  */
 function ytdlpFormat(f) {
   f = f || {};
   const id = Number.isInteger(f.itag) ? String(f.itag) : null;
-  if (f.audioOnly) return [id, 'bestaudio[ext=m4a]', 'bestaudio'].filter(Boolean).join('/');
+  if (f.audioOnly) return [id && f.drc ? `${id}-drc` : null, id, 'bestaudio[ext=m4a]', 'bestaudio'].filter(Boolean).join('/');
   const h = Number(f.height) || parseInt(f.quality, 10) || 0;
   const cap = h ? `[height<=${h}]` : '';
+  const audio = /webm/i.test(f.mime || '') ? 'bestaudio[ext=webm]' : 'bestaudio[ext=m4a]';
   const alts = [];
-  if (id) alts.push(...(f.hasAudio ? [id] : [`${id}+bestaudio[ext=m4a]`, `${id}+bestaudio`]));
+  if (id) alts.push(...(f.hasAudio ? [id] : [`${id}+${audio}`, `${id}+bestaudio`]));
   alts.push(`bestvideo${cap}[vcodec^=avc1]+bestaudio[ext=m4a]`, `bestvideo${cap}+bestaudio`, `best${cap}`);
   return alts.join('/');
 }

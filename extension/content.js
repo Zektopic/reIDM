@@ -603,7 +603,7 @@
             itag: f.itag ?? null, quality: f.quality ?? null, kind: f.kind ?? null,
             videoCodec: f.videoCodec ?? null, audioCodec: f.audioCodec ?? null,
             mime: f.mime ?? null, bitrate: f.bitrate ?? null,
-            height: f.height ?? null, audioOnly: !!f.audioOnly, hasAudio: !!f.hasAudio,
+            height: f.height ?? null, audioOnly: !!f.audioOnly, hasAudio: !!f.hasAudio, drc: !!f.drc,
             // The whole file's size only when the format already has its sound.
             size: f.audioOnly || f.hasAudio ? f.size ?? null : null,
           }
