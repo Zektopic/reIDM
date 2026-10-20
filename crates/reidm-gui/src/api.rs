@@ -68,6 +68,8 @@ pub struct Service {
     pub refresh_armed: Option<u64>,
     /// The folder to point the browser's "Load unpacked" at.
     pub extension_dir: Option<String>,
+    /// Problems with the download list's storage the user should know about.
+    pub warnings: Vec<String>,
 }
 
 /// One line of a batch add's reply.
@@ -315,6 +317,7 @@ impl Client {
             extension: serde_json::from_value(v["extension"].clone()).ok(),
             refresh_armed: v["refresh_armed"].as_u64(),
             extension_dir: v["extension_dir"].as_str().map(str::to_string),
+            warnings: v["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect(),
             settings: self.settings().ok(),
         })
     }

@@ -14,11 +14,6 @@ use reidm_core::{AddOptions, Category, Manager, Media, Request, SettingsPatch};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 
-// TEMP: replaced by Manager::revision() when the engine branch lands. Brings the stand-in
-// `revision()` into scope; the engine's inherent method wins once it exists.
-#[allow(unused_imports)]
-use crate::revision::Revision as _;
-
 /// The port the API is served on, unless `REIDM_UI_PORT` says otherwise. The override exists so
 /// a second, throw-away service (a test, a measurement) can run beside the real one; the browser
 /// extension always dials this one.
@@ -1033,6 +1028,9 @@ async fn status(State(app): State<App>, h: HeaderMap) -> Response {
         "extension": ext,
         "refresh_armed": app.mgr.refresh_armed(),
         "extension_dir": crate::install::extension_dir().map(|p| p.to_string_lossy().into_owned()),
+        // What the user should know about the list's storage: a damaged file restored from its
+        // backup, saves that are failing.
+        "warnings": app.mgr.warnings(),
     }))
     .into_response()
 }
@@ -1079,8 +1077,18 @@ async fn set_settings(State(app): State<App>, h: HeaderMap, Json(b): Json<Settin
         torrent_dht: b.torrent_dht,
     };
     let mgr = app.mgr.clone();
-    match blocking(move || mgr.update_settings(patch)).await {
+    let (r, applied) = blocking(move || {
+        let before = serde_json::to_value(mgr.settings()).ok();
+        let r = mgr.update_settings(patch);
+        let applied = r.is_err() && serde_json::to_value(mgr.settings()).ok() != before;
+        (r, applied)
+    })
+    .await;
+    match r {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // In effect, but not on disk (a full disk, say): not a refusal of the request, so not a
+        // 400 — the caller should say the change will not outlast a restart.
+        Err(e) if applied => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
 }
@@ -1226,6 +1234,11 @@ mod tests {
     /// A service on an ephemeral port over a data folder holding `n` finished downloads, written
     /// straight to `downloads.json` (adding them one by one would take minutes).
     async fn server(name: &str, n: u64) -> Server {
+        server_with(name, n, None).await
+    }
+
+    /// As `server`, with `downloads.json` replaced by `raw` when given.
+    async fn server_with(name: &str, n: u64, raw: Option<&[u8]>) -> Server {
         let dir = std::env::temp_dir().join(format!("reidm-web-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1242,7 +1255,8 @@ mod tests {
                 }))
             })
             .collect();
-        std::fs::write(dir.join("downloads.json"), serde_json::to_vec(&serde_json::json!({ "next_id": n + 1, "items": items })).unwrap()).unwrap();
+        let list = serde_json::to_vec(&serde_json::json!({ "next_id": n + 1, "items": items })).unwrap();
+        std::fs::write(dir.join("downloads.json"), raw.unwrap_or(&list)).unwrap();
         let mgr = Manager::open(&dir, dir.join("dl"), 2).unwrap();
         let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = l.local_addr().unwrap().port();
@@ -1416,6 +1430,16 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("the token file outlived the service");
+    }
+
+    #[tokio::test]
+    async fn storage_problems_reach_the_status() {
+        let s = server("healthy", 1).await;
+        let v: serde_json::Value = s.get("/api/status").send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["warnings"], serde_json::json!([]));
+        let s = server_with("damaged", 0, Some(b"{ this is not json")).await;
+        let v: serde_json::Value = s.get("/api/status").send().await.unwrap().json().await.unwrap();
+        assert!(!v["warnings"].as_array().unwrap().is_empty(), "a damaged list is reported: {v}");
     }
 
     #[test]

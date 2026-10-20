@@ -1,7 +1,5 @@
 mod install;
 mod launch;
-// TEMP: replaced by Manager::revision() when the engine branch lands
-mod revision;
 mod rows;
 mod web;
 mod session;
@@ -497,7 +495,7 @@ async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool)
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let stop = std::sync::Arc::new(stop);
     let mut web = tokio::spawn(web::serve(ui, web::App::new(mgr.clone(), ui_port, idm_port, stop.clone())));
-    let mut socket = tokio::spawn(ws::serve(local, mgr));
+    let mut socket = tokio::spawn(ws::serve(local, mgr.clone()));
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminated() => {}
@@ -510,6 +508,10 @@ async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool)
     // at the next start.
     let _ = stop.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), web).await;
+    // The list is written a moment after each change; make sure the last ones are on disk.
+    if !tokio::task::spawn_blocking(move || mgr.flush()).await.unwrap_or(false) {
+        tracing::error!("could not save the download list before stopping; the most recent changes may be lost");
+    }
     Ok(())
 }
 

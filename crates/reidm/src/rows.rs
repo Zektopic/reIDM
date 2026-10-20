@@ -10,8 +10,8 @@
 //! moved.
 //!
 //! The cache holds each row's serialised JSON. Whether a row changed is decided by comparing
-//! bytes, so it needs no co-operation from the engine beyond a revision that says when looking
-//! again is worthwhile.
+//! bytes, so it needs no co-operation from the engine beyond `Manager::revision`, which says
+//! when looking again is worthwhile: while it stays put, a poll does not even clone the list.
 
 use reidm_core::{Item, Media, Status};
 use serde::Serialize;

@@ -369,6 +369,8 @@ curl -s -H "X-Reidm-Token: $TOKEN" -H 'Content-Type: application/json' \
 ```
 
 `204`, or `400` with the reason, for example `the start time "25:00" is not a time of day (use HH:MM)`.
+`500` means the new settings are in effect but could not be saved, so they will not outlast a
+restart of the service; the text says why.
 
 ## Status
 
@@ -386,7 +388,8 @@ What the service is able to do right now.
   "idm_port_number": 1001,
   "extension": { "seconds_ago": 12, "version": "1.1.0", "browser": "Chrome 153" },
   "extension_dir": "C:\\Users\\me\\AppData\\Roaming\\Zektopic\\reIDM\\data\\browser-extension",
-  "refresh_armed": null
+  "refresh_armed": null,
+  "warnings": []
 }
 ```
 
@@ -396,6 +399,7 @@ What the service is able to do right now.
 | `extension` | when reIDM's browser extension last checked in, its version and browser; `null` if it hasn't since the service started. It checks in once a minute |
 | `extension_dir` | the folder to load in the browser |
 | `refresh_armed` | the download waiting for a new address from the browser, if any |
+| `warnings` | problems with the download list's storage to tell the user about — the list was damaged and restored from its backup, or saving is failing. The window shows them as a banner |
 
 ## Export
 

@@ -1064,6 +1064,9 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
 
         // Panel order matters: outermost first, central panel last.
+        if !self.snap.service.warnings.is_empty() {
+            self.warnings_banner(ui, &p);
+        }
         if self.update.as_ref().is_some_and(|u| !u.version.is_empty() && !u.dismissed) {
             self.update_banner(ui, &p);
         }
@@ -1127,6 +1130,23 @@ impl eframe::App for App {
 // ── chrome ───────────────────────────────────────────────────────────────
 
 impl App {
+    /// What the service says is wrong with the download list's storage (a damaged list restored
+    /// from its backup, saves failing). Stays until the service stops reporting it.
+    fn warnings_banner(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let warnings = self.snap.service.warnings.clone();
+        egui::Panel::top("warnings")
+            .frame(egui::Frame::NONE.fill(p.warn.gamma_multiply(0.18)).inner_margin(egui::Margin::symmetric(10, 6)))
+            .show(ui, |ui| {
+                for w in &warnings {
+                    ui.horizontal(|ui| {
+                        icons::dot(ui.painter(), egui::Rect::from_center_size(ui.cursor().min + Vec2::new(5.0, 8.0), Vec2::splat(10.0)), p.warn);
+                        ui.add_space(14.0);
+                        ui.label(RichText::new(w).color(p.text));
+                    });
+                }
+            });
+    }
+
     fn update_banner(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let Some(u) = &self.update else { return };
         let (version, url, asset) = (u.version.clone(), u.url.clone(), u.asset.clone());
