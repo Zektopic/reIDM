@@ -852,8 +852,12 @@ async function mediaChecks() {
   await openPage(`${onRoot()}/spa/one`);
   const a = await hookAnswer();
   check('relative manifest fetch: the picker gets its three qualities', !!a && a.formats.length === 3 && a.formats.every((f) => /^http:\/\/127\.0\.0\.1:\d+\/spa\/hls\/v\d\.m3u8$/.test(f.url)), JSON.stringify(a && a.formats.map((f) => f.url)));
+  // The content script resets its picker on the Navigation API's event, which must reach its
+  // isolated world when the page itself calls pushState.
+  await inContentScript(`window.navigation.addEventListener('navigatesuccess', () => (window.__navSeen = location.pathname)); true`);
   await evalPage('next()');
   await sleep(300);
+  check('the content script sees the page’s SPA navigation', (await inContentScript('window.__navSeen')) === '/spa/two');
   const b = await hookAnswer();
   check('SPA navigation: the picker offers the new video, not the old one', !!b && b.formats.length === 1, JSON.stringify(b && b.formats.map((f) => f.url)));
 
