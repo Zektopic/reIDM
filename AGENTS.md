@@ -31,6 +31,15 @@ REIDM_PROMPT=1 xvfb-run -a node tools/capture-test.mjs            # with "Ask wh
 REIDM_ONLY_GRABBER=1 xvfb-run -a node tools/capture-test.mjs      # the resource grabber
 ```
 
+CI installs the **newest stable** Rust, which may be newer than yours, and a new deprecation then
+fails `-D warnings` there first. Before pushing, lint with CI's version as well (it is printed in
+the *Install Rust* step), in its own target folder so your normal build isn't redone:
+
+```sh
+rustup toolchain install 1.99.1 -c clippy -t x86_64-pc-windows-gnu
+CARGO_TARGET_DIR=target/ci cargo +1.99.1 clippy --workspace --all-targets --locked -- -D warnings
+```
+
 The browser suite needs a Chromium (`npx playwright install chromium`; it finds the newest) and
 ports 61001/61002 free — stop any running reIDM first. For macOS lint without a Mac:
 `CC_aarch64_apple_darwin=true AR_aarch64_apple_darwin=true cargo clippy … --target aarch64-apple-darwin`.
@@ -64,3 +73,5 @@ YouTube and the Debian swarm are done by hand and recorded in the devlog.
   off, so yt-dlp runs with `formats=dashy` and parallel fragments.
 - librqbit pauses restored torrents asynchronously; a pause can land during the start-up check.
 - Windows notifications may be switched off globally — never rely on them alone.
+- CI's newer Rust deprecated `Atomic*::fetch_update` (renamed `try_update`); neither name builds
+  warning-free on both old and new toolchains, so use a `compare_exchange_weak` loop.

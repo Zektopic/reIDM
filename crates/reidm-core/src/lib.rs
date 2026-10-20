@@ -345,7 +345,12 @@ impl Progress {
     }
 
     fn sub(&self, n: u64) {
-        let _ = self.bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(n)));
+        // A compare-and-swap loop rather than `fetch_update`, which newer Rust deprecates under a
+        // new name (`try_update`) that older toolchains don't have.
+        let mut cur = self.bytes.load(Ordering::Relaxed);
+        while let Err(seen) = self.bytes.compare_exchange_weak(cur, cur.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed) {
+            cur = seen;
+        }
         self.touch();
     }
 
