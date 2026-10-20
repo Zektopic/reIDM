@@ -197,11 +197,11 @@ to `127.0.0.1`, so each entry point says how it tells the two apart.
 
 | Entry point | Who is let in | How |
 |---|---|---|
-| `/api/*` (port 61002) | the window, the CLI, your scripts | a random token, new at every start, in a file only your user can read, sent as `X-Reidm-Token`. The `Host` must be `127.0.0.1:61002`/`localhost:61002` (stops DNS rebinding) and any `Origin` must be the service's own. |
+| `/api/*` (port 61002) | the window, the CLI, your scripts | a random token, new at every start, in a file only your user can read, sent as `X-Reidm-Token` and compared in constant time. The `Host` must be `127.0.0.1:61002`/`localhost:61002`/`[::1]:61002` (stops DNS rebinding) and any `Origin` must be the service's own. |
 | `/` (the web view) | your browser, typing the address | served without the token check, with the token embedded in the page. `Host` and `Origin` checks as above; `frame-ancestors 'none'` so no page can frame it. |
-| `/ext/*` (port 61002) | reIDM's browser extension | an `Origin` that is a browser extension, or no `Origin` at all. Browsers set `Origin` themselves; a page can't claim an extension's origin, and can't leave its own off. CORS preflights are answered only for extension origins, so a page can't even send the JSON request. |
-| WebSocket (61001, 1001) | Tonec's extension, `reidm-host`, the CLI | the same `Origin` rule, checked during the handshake. |
-| `reidm-host` | the two extensions | each native-messaging manifest lists exactly one extension ID in `allowed_origins`; the browser refuses every other caller. |
+| `/ext/*` (port 61002) | reIDM's browser extension | the same `Host` rule as `/api/*`, and an `Origin` that is a browser extension, or no `Origin` at all. Browsers set `Origin` themselves; a page can't claim an extension's origin, and can't leave its own off. CORS preflights are answered only for extension origins, so a page can't even send the JSON request. A ping a browser marks `Sec-Fetch-Site: cross-site` (an `<img>` on a page) is answered but not counted as the extension checking in. |
+| WebSocket (61001, 1001) | Tonec's extension, `reidm-host` | the same `Origin` rule, checked during the handshake. Only the IDM protocol is spoken: nothing on it can pause, remove or delete a download. |
+| `reidm-host` | the two extensions | each native-messaging manifest lists exactly one extension ID in `allowed_origins`; the browser refuses every other caller, and the host itself refuses to relay for any caller but those two. It passes on only the IDM protocol's own message types. |
 
 What this does and doesn't protect against:
 
@@ -214,8 +214,8 @@ What this does and doesn't protect against:
 - **Other users** on the same machine can't read your token (mode 0600 on Unix; on Windows the
   data folder is in your profile), so they can't use `/api/`. They *can* reach the extension
   endpoints and the WebSocket, which can't tell a local program from the extension, and so could
-  add downloads to your list. IDM's own port has the same property. On a personal machine it
-  doesn't arise; on a shared one, bear it in mind.
+  add downloads to your list — but not pause, remove or delete any. IDM's own port has the same
+  property. On a personal machine it doesn't arise; on a shared one, bear it in mind.
 - **Cookies.** The extension reads cookies only for the address it is handing over, only when it
   hands it over. reIDM keeps them with the download so it can resume, never returns them from
   the API, and never writes them into exports.

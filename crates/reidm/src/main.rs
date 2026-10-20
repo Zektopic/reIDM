@@ -2,18 +2,16 @@ mod install;
 mod launch;
 // TEMP: replaced by Manager::revision() when the engine branch lands
 mod revision;
+mod rows;
 mod web;
 mod session;
 mod ws;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use futures_util::{SinkExt, StreamExt};
 use reidm_core::{default_data_dir, default_download_dir, Manager, Request, Status};
-use reidm_proto::Message;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio_tungstenite::tungstenite::Message as Ws;
 
 #[derive(Parser)]
 #[command(name = "reidm", version, about = "reIDM - cross-platform download manager with IDM browser-extension support")]
@@ -217,24 +215,21 @@ fn human(n: u64) -> String {
     format!("{v:.1} {}", U[i])
 }
 
-async fn send_to_daemon(msgs: Vec<Message>) -> Result<Vec<Message>> {
-    let url = format!("ws://127.0.0.1:{}/", ws::LOCAL_PORT);
-    let (mut s, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .with_context(|| format!("cannot reach the reidm daemon at {url} (start it with `reidm daemon`)"))?;
-    let mut replies = Vec::new();
-    for m in msgs {
-        s.send(Ws::Binary(m.encode().into_bytes())).await?;
-        if m.flags & 1 != 0 {
-            if let Ok(Some(Ok(Ws::Binary(b)))) = tokio::time::timeout(Duration::from_secs(5), s.next()).await {
-                if let Ok((r, _)) = Message::decode(&b) {
-                    replies.push(r);
-                }
-            }
-        }
+/// The daemon could not be reached at all (not running, or its token file is missing), as
+/// opposed to answering with an error. Only this case may fall back to reading files directly.
+#[derive(Debug)]
+struct Unreachable(String);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
-    let _ = s.close(None).await;
-    Ok(replies)
+}
+
+impl std::error::Error for Unreachable {}
+
+fn unreachable(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Unreachable>().is_some()
 }
 
 /// The daemon's API token, as published in its data directory. A local, same-user client can
@@ -242,7 +237,7 @@ async fn send_to_daemon(msgs: Vec<Message>) -> Result<Vec<Message>> {
 fn api_token() -> Result<String> {
     let path = default_data_dir().join("api-token");
     let t = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {} — is the daemon running?", path.display()))?
+        .map_err(|_| Unreachable(format!("reIDM's service is not running (no {}); start it with `reidm daemon`", path.display())))?
         .trim()
         .to_string();
     if t.is_empty() {
@@ -251,65 +246,53 @@ fn api_token() -> Result<String> {
     Ok(t)
 }
 
-/// POST JSON to the daemon and decode the reply.
-async fn api_post(path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
-    let url = format!("http://127.0.0.1:{}{path}", web::UI_PORT);
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .header("X-Reidm-Token", api_token()?)
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await
-        .with_context(|| format!("cannot reach the daemon at {url} (start it with `reidm daemon`)"))?;
+/// One call to the daemon's API. Answers the body of a successful reply; an error status
+/// becomes an error carrying the daemon's own explanation.
+async fn api_call(method: reqwest::Method, path: &str, body: Option<serde_json::Value>, timeout: Duration) -> Result<String> {
+    let url = format!("http://127.0.0.1:{}{path}", web::ui_port());
+    let mut req = reqwest::Client::new().request(method, &url).header("X-Reidm-Token", api_token()?).timeout(timeout);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req.send().await.map_err(|e| {
+        if e.is_connect() {
+            anyhow::Error::new(Unreachable(format!("cannot reach the daemon at {url} (start it with `reidm daemon`)")))
+        } else {
+            anyhow::Error::new(e).context(format!("talking to the daemon at {url}"))
+        }
+    })?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("daemon said {status}: {text}");
+        bail!("{}", if text.trim().is_empty() { format!("the daemon said {status}") } else { text });
     }
+    Ok(text)
+}
+
+/// POST JSON to the daemon and decode the reply.
+async fn api_post(path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+    let text = api_call(reqwest::Method::POST, path, Some(body), Duration::from_secs(120)).await?;
     serde_json::from_str(&text).context("decoding the daemon's reply")
 }
 
 /// GET from the daemon and return the body.
 async fn api_get(path: &str) -> Result<String> {
-    let url = format!("http://127.0.0.1:{}{path}", web::UI_PORT);
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header("X-Reidm-Token", api_token()?)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .with_context(|| format!("cannot reach the daemon at {url} (start it with `reidm daemon`)"))?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        bail!("daemon said {status}: {text}");
-    }
-    Ok(text)
+    api_call(reqwest::Method::GET, path, None, Duration::from_secs(30)).await
 }
 
 /// POST JSON to an endpoint that answers with no body.
 async fn api_post_empty(path: &str, body: serde_json::Value) -> Result<()> {
-    let url = format!("http://127.0.0.1:{}{path}", web::UI_PORT);
-    let resp = reqwest::Client::new()
-        .post(&url)
-        .header("X-Reidm-Token", api_token()?)
-        .json(&body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await
-        .with_context(|| format!("cannot reach the daemon at {url} (start it with `reidm daemon`)"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("{}", resp.text().await.unwrap_or_else(|_| status.to_string()));
-    }
-    Ok(())
+    api_call(reqwest::Method::POST, path, Some(body), Duration::from_secs(120)).await.map(|_| ())
 }
 
-/// `500K`, `2M`, `1.5MB`, `800kb`, `1048576` -> bytes per second (binary units, as IDM uses).
+/// `500K`, `2M`, `1.5MB`, `1.5MiB`, `800kb/s`, `1048576` -> bytes per second. Units are binary
+/// (K = 1024), as IDM uses. A lowercase `b` before `ps` (`8Mbps`, `500kbps`) means bits, the way
+/// connection speeds are quoted, and is divided by eight.
 fn parse_rate(s: &str) -> Result<u64> {
-    let t = s.trim().to_ascii_lowercase();
-    let t = t.trim_end_matches("/s").trim_end_matches("ps").trim_end_matches('b');
+    let raw = s.trim();
+    let bits = raw.ends_with("bps") && !raw.ends_with("Bps");
+    let t = raw.to_ascii_lowercase();
+    let t = t.trim_end_matches("/s").trim_end_matches("ps").trim_end_matches('b').trim_end_matches('i');
     let (num, mul) = match t.chars().last() {
         Some('k') => (&t[..t.len() - 1], 1024.0),
         Some('m') => (&t[..t.len() - 1], 1024.0 * 1024.0),
@@ -320,7 +303,11 @@ fn parse_rate(s: &str) -> Result<u64> {
     if v.is_nan() || v <= 0.0 {
         bail!("a speed limit must be above zero; use `reidm limit off` to remove it");
     }
-    Ok((v * mul) as u64)
+    let bytes = v * mul / if bits { 8.0 } else { 1.0 };
+    if bytes < 1.0 {
+        bail!("{s:?} is less than one byte per second");
+    }
+    Ok(bytes as u64)
 }
 
 /// Read a file, or stdin when the path is `-`.
@@ -362,12 +349,168 @@ fn report_batch(v: &serde_json::Value) {
     println!("{added} queued, {existing} resumed, {complete} already complete, {failed} failed");
 }
 
-fn ctl(ty: u32, id: u64, extra: Option<i64>) -> Message {
-    let mut m = Message::new(1, ty, 1, 1).with_args([id as i64]);
-    if let Some(e) = extra {
-        m.args.push(reidm_proto::Arg::Int(e));
+/// One line per download, for `reidm list`, from the API's items or from `downloads.json`.
+fn print_list(mut items: Vec<serde_json::Value>) {
+    if items.is_empty() {
+        println!("no downloads");
+        return;
     }
-    m
+    // Numerically: ids are keys of a JSON object on disk, which would otherwise sort 1, 10, 2.
+    items.sort_by_key(|it| it["id"].as_u64().unwrap_or(0));
+    for it in &items {
+        let state = match it["status"]["state"].as_str().unwrap_or("?") {
+            // Download Later: stopped, but waiting for the queue rather than for the user.
+            "Paused" if it["scheduled"].as_bool() == Some(true) => "Scheduled",
+            s => s,
+        };
+        println!(
+            "{:>4}  {:<10} {:>10}/{:<10}  {}",
+            it["id"].as_u64().unwrap_or(0),
+            state,
+            human(it["downloaded"].as_u64().unwrap_or(0)),
+            it["size"].as_u64().map(human).unwrap_or("?".into()),
+            it["path"].as_str().unwrap_or("")
+        );
+        if let Some(e) = it["status"]["error"].as_str() {
+            println!("      {e}");
+        }
+        if let Some(n) = it["note"].as_str().filter(|_| state == "Running") {
+            println!("      {n}…");
+        }
+    }
+}
+
+/// Where `reidm get` keeps its list for one address: the same folder for the same address and
+/// destination, so running the same command again after an interruption resumes it.
+fn get_data_dir(url: &str, dir: Option<&std::path::Path>) -> PathBuf {
+    // FNV-1a: stable across builds, unlike the standard library's hasher.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in url.bytes().chain([0]).chain(dir.map(|d| d.to_string_lossy().into_owned()).unwrap_or_default().into_bytes()) {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    std::env::temp_dir().join(format!("reidm-get-{h:016x}"))
+}
+
+/// Hold this for as long as the service runs: a second `reidm daemon` for the same data folder
+/// would otherwise load the same `downloads.json`, and the two would overwrite each other's
+/// changes.
+fn single_instance(data: &std::path::Path) -> Result<std::fs::File> {
+    let path = data.join("daemon.lock");
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).with_context(|| format!("cannot create {}", path.display()))?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "reIDM's service is already running for {} (it holds {}). Use that one, or stop it first.",
+            data.display(),
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("cannot lock {}", path.display())),
+    }
+}
+
+/// Resolves when the system asks the service to stop (logout, `systemctl stop`, `kill`).
+async fn terminated() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            s.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await
+}
+
+async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool) -> Result<()> {
+    let data = default_data_dir();
+    std::fs::create_dir_all(&data).with_context(|| format!("cannot create reIDM's data folder {}", data.display()))?;
+    let _lock = single_instance(&data)?;
+
+    // Both ports before anything else: a service without its API is invisible to the window
+    // and the extension, which would wait for it forever, so losing either is fatal.
+    let ui_port = web::ui_port();
+    let ui = tokio::net::TcpListener::bind(("127.0.0.1", ui_port)).await.with_context(|| {
+        format!("cannot serve reIDM's API on 127.0.0.1:{ui_port}: another program is using that port. Close it, then start reIDM again")
+    })?;
+    let local_port = ws::local_port();
+    let local = ws::bind(&format!("127.0.0.1:{local_port}"))
+        .await
+        .with_context(|| format!("cannot serve the extension socket on 127.0.0.1:{local_port}: another program is using that port"))?;
+
+    let mgr = Manager::open(&data, dir.unwrap_or_else(default_download_dir), connections)?;
+    mgr.spawn_scheduler();
+    // Finished torrents go on sharing where they left off.
+    {
+        let m = mgr.clone();
+        tokio::spawn(async move { m.resume_seeding().await });
+    }
+    // Keep browser integration current: a fresh copy of the extension for "Load unpacked",
+    // and the native host the extension uses to start reIDM. Both are idempotent and only
+    // write what changed, so doing it at every start is what keeps them right after an
+    // update or a move.
+    std::thread::spawn(|| {
+        match install::stage_extension() {
+            Ok((dir, true)) => tracing::info!("browser extension updated in {}", dir.display()),
+            Ok(_) => {}
+            Err(e) => tracing::debug!("browser extension not staged: {e:#}"),
+        }
+        match install::ensure_reidm_host() {
+            Ok(changes) => {
+                for c in changes {
+                    tracing::info!("native host: {c}");
+                }
+            }
+            Err(e) => tracing::debug!("native host not registered: {e:#}"),
+        }
+    });
+    let idm_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if !no_idm_port {
+        let m = mgr.clone();
+        let bound = idm_port.clone();
+        tokio::spawn(async move {
+            match ws::bind(&format!("127.0.0.1:{}", ws::IDM_PORT)).await {
+                Ok(l) => {
+                    bound.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) = ws::serve(l, m).await {
+                        tracing::error!("extension port {} stopped: {e:#}", ws::IDM_PORT);
+                    }
+                }
+                Err(e) => {
+                    // On Unix 1001 is privileged, so the usual cause there is the port
+                    // number itself rather than a competing download manager.
+                    let hint = if e.to_string().contains("os error 13") {
+                        "ports below 1024 need privileges on this system"
+                    } else {
+                        "another download manager may be using it"
+                    };
+                    tracing::warn!(
+                        "not serving the extension's default port {}: {e} ({hint}). \
+                         The native-messaging host and `reidm patch-extension` still work — \
+                         see docs/EXTENSION.md.",
+                        ws::IDM_PORT
+                    );
+                }
+            }
+        });
+    }
+
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let stop = std::sync::Arc::new(stop);
+    let mut web = tokio::spawn(web::serve(ui, web::App::new(mgr.clone(), ui_port, idm_port, stop.clone())));
+    let mut socket = tokio::spawn(ws::serve(local, mgr));
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminated() => {}
+        _ = stopped.wait_for(|s| *s) => {}
+        r = &mut web => bail!("reIDM's API stopped: {}", r.map_err(anyhow::Error::from).and_then(|r| r).err().map(|e| format!("{e:#}")).unwrap_or_default()),
+        r = &mut socket => bail!("the extension socket stopped: {}", r.map_err(anyhow::Error::from).and_then(|r| r).err().map(|e| format!("{e:#}")).unwrap_or_default()),
+    }
+    tracing::info!("shutting down");
+    // Stop serving and take the token file away; downloads carry on from their last checkpoint
+    // at the next start.
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), web).await;
+    Ok(())
 }
 
 #[tokio::main]
@@ -376,80 +519,10 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "reidm=info,reidm_core=info".into()))
         .init();
     match Cli::parse().cmd {
-        Cmd::Daemon { connections, dir, no_idm_port } => {
-            let mgr = Manager::open(&default_data_dir(), dir.unwrap_or_else(default_download_dir), connections)?;
-            mgr.spawn_scheduler();
-            // Finished torrents go on sharing where they left off.
-            {
-                let m = mgr.clone();
-                tokio::spawn(async move { m.resume_seeding().await });
-            }
-            // Keep browser integration current: a fresh copy of the extension for "Load unpacked",
-            // and the native host the extension uses to start reIDM. Both are idempotent and only
-            // write what changed, so doing it at every start is what keeps them right after an
-            // update or a move.
-            std::thread::spawn(|| {
-                match install::stage_extension() {
-                    Ok((dir, true)) => tracing::info!("browser extension updated in {}", dir.display()),
-                    Ok(_) => {}
-                    Err(e) => tracing::debug!("browser extension not staged: {e:#}"),
-                }
-                match install::ensure_reidm_host() {
-                    Ok(changes) => {
-                        for c in changes {
-                            tracing::info!("native host: {c}");
-                        }
-                    }
-                    Err(e) => tracing::debug!("native host not registered: {e:#}"),
-                }
-            });
-            let idm_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            if !no_idm_port {
-                let m = mgr.clone();
-                let bound = idm_port.clone();
-                tokio::spawn(async move {
-                    match ws::bind(&format!("127.0.0.1:{}", ws::IDM_PORT)).await {
-                        Ok(l) => {
-                            bound.store(true, std::sync::atomic::Ordering::Relaxed);
-                            if let Err(e) = ws::serve(l, m).await {
-                                tracing::error!("extension port {} stopped: {e:#}", ws::IDM_PORT);
-                            }
-                        }
-                        Err(e) => {
-                            // On Unix 1001 is privileged, so the usual cause there is the port
-                            // number itself rather than a competing download manager.
-                            let hint = if e.to_string().contains("os error 13") {
-                                "ports below 1024 need privileges on this system"
-                            } else {
-                                "another download manager may be using it"
-                            };
-                            tracing::warn!(
-                                "not serving the extension's default port {}: {e} ({hint}). \
-                                 The native-messaging host and `reidm patch-extension` still work — \
-                                 see docs/EXTENSION.md.",
-                                ws::IDM_PORT
-                            );
-                        }
-                    }
-                });
-            }
-            {
-                let m = mgr.clone();
-                let bound = idm_port.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = web::serve(m, bound).await {
-                        tracing::error!("web UI unavailable: {e} (is another reidm running?)");
-                    }
-                });
-            }
-            let local = format!("127.0.0.1:{}", ws::LOCAL_PORT);
-            tokio::select! {
-                r = ws::listen(&local, mgr) => r?,
-                _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
-            }
-        }
+        Cmd::Daemon { connections, dir, no_idm_port } => run_daemon(connections, dir, no_idm_port).await?,
         Cmd::Get { url, connections, dir, output, referer, cookie } => {
-            let mgr = Manager::open(&std::env::temp_dir().join(format!("reidm-get-{}", std::process::id())), dir.clone().unwrap_or_else(default_download_dir), connections)?;
+            let data = get_data_dir(&url, dir.as_deref());
+            let mgr = Manager::open(&data, dir.clone().unwrap_or_else(default_download_dir), connections)?;
             let id = mgr.add(Request { url, filename: output, referer, cookie, dir, ..Default::default() })?;
             loop {
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -457,6 +530,9 @@ async fn main() -> Result<()> {
                 match &it.status {
                     Status::Done => {
                         eprintln!("\rdone: {}                                   ", it.path.display());
+                        // Its list is only there to resume an interrupted run.
+                        drop(mgr);
+                        let _ = std::fs::remove_dir_all(&data);
                         break;
                     }
                     Status::Failed(e) => bail!("failed: {e}"),
@@ -575,7 +651,9 @@ async fn main() -> Result<()> {
             let format = format.unwrap_or_else(|| if file.to_ascii_lowercase().ends_with(".ef2") { "ef2".into() } else { "txt".into() });
             let text = match api_get(&format!("/api/export?format={format}")).await {
                 Ok(t) => t,
-                // No daemon: read the list straight from disk.
+                // No daemon: read the list straight from disk. Any other failure (a refused
+                // token, a full disk) is reported rather than papered over.
+                Err(e) if !unreachable(&e) => return Err(e),
                 Err(_) => {
                     let path = default_data_dir().join("downloads.json");
                     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no downloads yet ({})", path.display()))?)?;
@@ -697,39 +775,36 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::List => {
-            let path = default_data_dir().join("downloads.json");
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no downloads yet ({})", path.display()))?)?;
-            let items = v["items"].as_object().filter(|m| !m.is_empty());
-            if items.is_none() {
-                println!("no downloads");
-            }
-            for (id, it) in items.into_iter().flatten() {
-                let state = match it["status"]["state"].as_str().unwrap_or("?") {
-                    // Download Later: stopped, but waiting for the queue rather than for the user.
-                    "Paused" if it["scheduled"].as_bool() == Some(true) => "Scheduled",
-                    s => s,
-                };
-                println!(
-                    "{:>4}  {:<10} {:>10}/{:<10}  {}",
-                    id,
-                    state,
-                    human(it["downloaded"].as_u64().unwrap_or(0)),
-                    it["size"].as_u64().map(human).unwrap_or("?".into()),
-                    it["path"].as_str().unwrap_or("")
-                );
-                if let Some(e) = it["status"]["error"].as_str() {
-                    println!("      {e}");
+            let items: Vec<serde_json::Value> = match api_get("/api/downloads").await {
+                Ok(text) => serde_json::from_str(&text).context("decoding the daemon's list")?,
+                // No daemon: the list as it was last saved.
+                Err(e) if unreachable(&e) => {
+                    let path = default_data_dir().join("downloads.json");
+                    let Ok(bytes) = std::fs::read(&path) else {
+                        println!("no downloads");
+                        return Ok(());
+                    };
+                    let v: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| format!("{} is not a download list", path.display()))?;
+                    v["items"].as_object().into_iter().flatten().map(|(_, it)| it.clone()).collect()
                 }
-                if let Some(n) = it["note"].as_str().filter(|_| state == "Running") {
-                    println!("      {n}…");
-                }
-            }
+                Err(e) => return Err(e),
+            };
+            print_list(items);
         }
-        Cmd::Pause { id } => drop(send_to_daemon(vec![ctl(session::T_CTL_PAUSE, id, None)]).await?),
-        Cmd::Resume { id } => drop(send_to_daemon(vec![ctl(session::T_CTL_RESUME, id, None)]).await?),
-        Cmd::Rm { id, purge } => drop(send_to_daemon(vec![ctl(session::T_CTL_REMOVE, id, Some(purge as i64))]).await?),
+        Cmd::Pause { id } => {
+            api_post_empty(&format!("/api/downloads/{id}/pause"), serde_json::json!({})).await?;
+            println!("download #{id} paused");
+        }
+        Cmd::Resume { id } => {
+            api_post_empty(&format!("/api/downloads/{id}/resume"), serde_json::json!({})).await?;
+            println!("download #{id} resumed");
+        }
+        Cmd::Rm { id, purge } => {
+            api_call(reqwest::Method::DELETE, &format!("/api/downloads/{id}?purge={purge}"), None, Duration::from_secs(60)).await?;
+            println!("download #{id} removed{}", if purge { ", and its file deleted" } else { "" });
+        }
         Cmd::Ui => {
-            let up = || std::net::TcpStream::connect_timeout(&format!("127.0.0.1:{}", web::UI_PORT).parse().unwrap(), Duration::from_millis(300)).is_ok();
+            let up = || std::net::TcpStream::connect_timeout(&format!("127.0.0.1:{}", web::ui_port()).parse().unwrap(), Duration::from_millis(300)).is_ok();
             if !up() {
                 launch::spawn_daemon()?;
                 for _ in 0..40 {
@@ -739,7 +814,7 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             }
-            launch::open_url(&format!("http://127.0.0.1:{}/", web::UI_PORT));
+            launch::open_url(&format!("http://127.0.0.1:{}/", web::ui_port()));
         }
         Cmd::UpdateCheck => {
             let current = env!("CARGO_PKG_VERSION");
@@ -815,7 +890,7 @@ fn patch_extension(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     if !js.contains(GATE) || !js.contains(PORTS) {
         bail!("this extension version does not match the known patch points (tested with 6.43.1)");
     }
-    js = js.replacen(GATE, "", 1).replacen(PORTS, &format!(r#"La=["127.0.0.1:{}"]"#, ws::LOCAL_PORT), 1);
+    js = js.replacen(GATE, "", 1).replacen(PORTS, &format!(r#"La=["127.0.0.1:{}"]"#, ws::DEFAULT_LOCAL_PORT), 1);
     std::fs::write(&bg, js)?;
     println!("patched extension written to {}\nLoad it via chrome://extensions -> Developer mode -> Load unpacked.", dst.display());
     Ok(())
@@ -823,7 +898,27 @@ fn patch_extension(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rate;
+    use super::{get_data_dir, parse_rate, single_instance};
+
+    #[test]
+    fn a_second_service_for_the_same_folder_is_refused() {
+        let d = std::env::temp_dir().join(format!("reidm-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let first = single_instance(&d).unwrap();
+        let err = single_instance(&d).unwrap_err().to_string();
+        assert!(err.contains("already running"), "{err}");
+        drop(first);
+        single_instance(&d).expect("free again once the first has stopped");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn get_resumes_in_the_same_folder() {
+        let a = get_data_dir("https://x/a.iso", None);
+        assert_eq!(a, get_data_dir("https://x/a.iso", None));
+        assert_ne!(a, get_data_dir("https://x/b.iso", None));
+        assert_ne!(a, get_data_dir("https://x/a.iso", Some(std::path::Path::new("/tmp"))));
+    }
 
     #[test]
     fn rates() {
@@ -832,6 +927,10 @@ mod tests {
         assert_eq!(parse_rate("1.5MB").unwrap(), 1_572_864);
         assert_eq!(parse_rate("800kb/s").unwrap(), 800 * 1024);
         assert_eq!(parse_rate("4096").unwrap(), 4096);
+        assert_eq!(parse_rate("1.5MiB").unwrap(), 1_572_864);
+        assert_eq!(parse_rate("8Mbps").unwrap(), 1024 * 1024, "megabits");
+        assert_eq!(parse_rate("8MBps").unwrap(), 8 * 1024 * 1024, "megabytes");
+        assert_eq!(parse_rate("500kbps").unwrap(), 500 * 1024 / 8);
         assert!(parse_rate("0").is_err());
         assert!(parse_rate("fast").is_err());
     }

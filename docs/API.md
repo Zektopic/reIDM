@@ -34,7 +34,8 @@ data folder — readable only by your user — and deleted when the service stop
 Two more rules keep web pages out (a page in your browser can send requests to `127.0.0.1`
 too):
 
-- the `Host` header must be `127.0.0.1:61002` or `localhost:61002`, which defeats DNS rebinding;
+- the `Host` header must be `127.0.0.1:61002`, `localhost:61002` or `[::1]:61002`, which defeats
+  DNS rebinding (this applies to the [extension endpoints](#browser-extension-endpoints) too);
 - if an `Origin` header is present, it must be the service's own (`http://127.0.0.1:61002`).
 
 Command-line tools send no `Origin` and the right `Host`, so the token is all they need:
@@ -50,7 +51,15 @@ Invoke-RestMethod -Headers $h http://127.0.0.1:61002/api/downloads
 ```
 
 Request bodies are JSON (`Content-Type: application/json`). Fields not listed are ignored;
-optional fields may be left out.
+optional fields may be left out. Bodies are limited in size: 24 MB where a `.torrent` file can
+ride along (`POST /api/downloads`, `/api/torrent/inspect`), 8 MB for lists (`/api/downloads/batch`,
+`/api/downloads/bulk`, `/ext/add-batch`) and 64 KB everywhere else; a bigger one is refused with
+`413` and a sentence saying so. A batch or bulk request names at most 10,000 downloads.
+
+For a second, throw-away service beside the real one (a test, a measurement), set
+`REIDM_UI_PORT` (and `REIDM_LOCAL_PORT` for the extension socket) together with
+`REIDM_DATA_DIR`, for both `reidm daemon` and the clients. The browser extension always uses the
+standard ports.
 
 ## Downloads
 
@@ -106,6 +115,48 @@ Every download, in the order they were added. Cookies are never included.
 | `scheduled` | in the scheduled queue (*Download Later*) |
 
 The transfer rate isn't a field: take two readings of `downloaded` a few seconds apart.
+
+The answer carries an `ETag`. Send it back as `If-None-Match` and, while nothing in the list has
+changed (progress included), the answer is `304 Not Modified` with no body — polling an idle
+list costs next to nothing.
+
+### `GET /api/downloads/rows`
+
+The list as the window shows it: one small row per download, and after the first request only
+what changed. This is what to poll for a long list — a row is about a third the size of an
+item, and a poll while one download moves carries one row.
+
+```json
+{
+  "cursor": "9f2c41d07a3be210-42",
+  "full": true,
+  "rows": [
+    {
+      "id": 7, "url": "https://example.com/big.iso", "referer": "https://example.com/downloads",
+      "path": "/home/me/Downloads/big.iso", "size": 40000000, "downloaded": 4849664,
+      "status": { "state": "Running" }, "added": 1792019963, "last_try": 1792019963,
+      "finished_at": null, "resumable": true, "speed_limit": null, "scheduled": false,
+      "connections": 2, "parts": 2
+    }
+  ],
+  "removed": []
+}
+```
+
+A row has the item's fields except `request` (its `url` and `referer` are lifted out; `media`
+too, when set), `segments`, `etag` and `last_modified`; instead `connections` counts the ranges
+being written right now and `parts` all of them. A torrent's `torrent` has `files` and `skipped`
+as counts rather than the file list.
+
+Ask again with `?since=<cursor>` (or `If-None-Match: "<cursor>"`). The answer is then `304`
+while nothing changed, or `"full": false` with only the rows that changed in `rows` and the ids
+of downloads removed since in `removed`. When the cursor is too old, or from before the service
+restarted, the answer is the whole list again with `"full": true`: replace what you had.
+
+### `GET /api/downloads/{id}`
+
+One download with every field, as in `GET /api/downloads` — for its segment map, or a torrent's
+files. `404` if there is no such download.
 
 ### Adding
 
@@ -191,8 +242,28 @@ Instead of (or as well as) `urls`, `items` takes entries with their own headers 
 | `DELETE /api/downloads/{id}` | remove it from the list |
 | `DELETE /api/downloads/{id}?purge=true` | remove it and delete the file (finished, or the partial `.reidm`) |
 
-These take no body and answer `204 No Content`, or `400` with the reason as text — for
-example `that download is already complete`.
+These take no body and answer `204 No Content`; `404` if there is no such download; or `400`
+with the reason as text — for example `that download is already complete`.
+
+#### `POST /api/downloads/bulk`
+
+The same actions for many downloads in one request — *Delete completed*, *Start all*:
+
+```json
+{ "ids": [3, 4, 9], "action": "remove" }
+```
+
+`action` is `pause`, `resume`, `restart`, `remove`, `purge` (remove and delete the files),
+`schedule`, `unschedule`, `seed` or `stop-seeding`. Up to 10,000 ids. The answer is per download:
+
+```json
+{ "ok": 2, "failed": 1, "results": [ { "id": 3 }, { "id": 4 }, { "id": 9, "error": "there is no download #9" } ] }
+```
+
+#### `POST /api/shutdown`
+
+Stop the service, as *Quit reIDM completely* in the window does. Downloads stop where they are
+and continue from there the next time it starts. Answers `202 Accepted`.
 
 ### Refreshing an address
 
@@ -433,7 +504,9 @@ for extension origins only.
 #### `GET /ext/ping?v=<extension version>`
 
 Is reIDM running, and with what defaults? A ping that carries `v` is recorded as the extension
-checking in (shown in `/api/status`).
+checking in (shown in `/api/status`) — unless the browser marks it as coming from a web page
+(`Sec-Fetch-Site: cross-site` or `same-site`), so that an `<img>` on some page can't make the
+window report the extension connected.
 
 ```json
 { "app": "reIDM", "version": "0.6.0", "default_dir": "/home/me/Downloads", "connections": 8, "max_concurrent": 4, "media": true, "folders": { "…": "as in GET /api/settings" } }
@@ -493,7 +566,8 @@ with `"ok": true`.
 | `400` | refused, with the reason in plain text (JSON on `/ext/`) — or the body isn't valid JSON |
 | `401` | missing or wrong `X-Reidm-Token` |
 | `403` | wrong `Host`, or an `Origin` that isn't allowed |
-| `404` | no such endpoint or action, or (for `open`/`folder`) no such download |
+| `404` | no such endpoint or action, or no such download |
+| `413` | the body is bigger than this endpoint accepts (see [Authentication](#authentication)) |
 | `415` | a JSON body without `Content-Type: application/json` |
 | `422` | valid JSON of the wrong shape, such as a missing `url` |
 

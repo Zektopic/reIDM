@@ -36,10 +36,12 @@ const T_DOWNLOAD: u32 = 14;
 // Message types sent by the server.
 const T_HELLO_ACK: u32 = 3;
 const T_SETTINGS: u32 = 4;
-// reIDM control extensions (never emitted by the real extension).
-pub const T_CTL_PAUSE: u32 = 1001;
-pub const T_CTL_RESUME: u32 = 1002;
-pub const T_CTL_REMOVE: u32 = 1003;
+/// Types from here up were reIDM's own additions to the protocol (pause 1001, resume 1002,
+/// remove 1003), which the real extension never sends. They are no longer honoured: this socket
+/// has no authentication — any local process, another user's included, can connect — and
+/// "remove and delete the file" must not be one connection away. The CLI uses the
+/// token-protected HTTP API instead.
+pub const T_RESERVED: u32 = 1000;
 
 // Reply codes understood by the extension (`mc()` in background.js).
 const R_IGNORE: i64 = 0;
@@ -166,21 +168,9 @@ impl Session {
                 if wants_reply { vec![Self::reply(m, &[R_IGNORE])] } else { vec![] }
             }
             T_REPLY => vec![], // answer to something we sent; nothing pending
-            T_CTL_PAUSE | T_CTL_RESUME | T_CTL_REMOVE => {
-                let id = m.arg(0).unwrap_or(-1);
-                if id >= 0 {
-                    let id = id as u64;
-                    match m.ty {
-                        T_CTL_PAUSE => self.mgr.pause(id),
-                        T_CTL_RESUME => {
-                            if let Err(e) = self.mgr.resume(id) {
-                                tracing::warn!("resume {id}: {e:#}");
-                            }
-                        }
-                        _ => self.mgr.remove(id, m.arg(1).unwrap_or(0) != 0),
-                    }
-                }
-                vec![Self::reply(m, &[1])]
+            t if t >= T_RESERVED => {
+                tracing::warn!("ignoring control message type {t} on the extension socket; use the HTTP API");
+                vec![]
             }
             _ => {
                 if wants_reply { vec![Self::reply(m, &[])] } else { vec![] }
@@ -225,6 +215,22 @@ mod tests {
         let out = s.handle(&Message::new(9, T_KEEPALIVE, 1, 1));
         assert_eq!(out[0].ty, T_REPLY);
         assert_eq!(out[0].arg(0), Some(9));
+    }
+
+    #[tokio::test]
+    async fn control_messages_cannot_remove_downloads() {
+        let d = std::env::temp_dir().join(format!("reidm-test-ctl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let mgr = Manager::open(&d, d.clone(), 2).unwrap();
+        let id = mgr.add_with(Request { url: "https://example.invalid/a.bin".into(), ..Default::default() }, reidm_core::AddOptions { later: true, ..Default::default() }).unwrap().id;
+        let mut s = Session::new(mgr.clone());
+        for ty in [1001, 1002, 1003] {
+            // `1003 id 1` used to remove the download and delete its file.
+            let out = s.handle(&Message::new(1, ty, 1, 1).with_args([id as i64, 1]));
+            assert!(out.is_empty(), "type {ty} must get no answer that it was done");
+        }
+        assert!(mgr.get(id).is_some(), "the download is still listed");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -4,29 +4,84 @@
 //! the `Host` header must be our own address (blocks DNS rebinding), mutating calls need the
 //! per-run token that is only embedded in the page we serve, and cross-origin `Origin`s are refused.
 
-use axum::extract::{Path, Query, State};
+use crate::rows::{Answer, RowCache};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use reidm_core::{AddOptions, Category, Manager, Media, Request, SettingsPatch};
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-pub const UI_PORT: u16 = 61002;
+// TEMP: replaced by Manager::revision() when the engine branch lands. Brings the stand-in
+// `revision()` into scope; the engine's inherent method wins once it exists.
+#[allow(unused_imports)]
+use crate::revision::Revision as _;
+
+/// The port the API is served on, unless `REIDM_UI_PORT` says otherwise. The override exists so
+/// a second, throw-away service (a test, a measurement) can run beside the real one; the browser
+/// extension always dials this one.
+pub const DEFAULT_UI_PORT: u16 = 61002;
 const PAGE: &str = include_str!("../assets/ui.html");
 
+/// Request bodies are small except where a file or a long list rides along. Anything bigger is
+/// refused before it is read, with a message saying so (see `explain_too_large`).
+const SMALL_BODY: usize = 64 * 1024;
+/// A `.torrent` file, base64 inside JSON: the engine accepts up to 16 MiB of torrent, which is
+/// 22 MiB once encoded.
+const TORRENT_BODY: usize = 24 * 1024 * 1024;
+/// A batch of URLs, or the extension's grabber with a cookie on every link.
+const BATCH_BODY: usize = 8 * 1024 * 1024;
+/// The most downloads one batch or bulk request may name.
+const MAX_BATCH: usize = 10_000;
+
+pub fn ui_port() -> u16 {
+    port_from_env("REIDM_UI_PORT", DEFAULT_UI_PORT)
+}
+
+pub fn port_from_env(var: &str, default: u16) -> u16 {
+    std::env::var(var).ok().and_then(|v| v.trim().parse().ok()).filter(|p| *p != 0).unwrap_or(default)
+}
+
 #[derive(Clone)]
-struct App {
+pub struct App {
     mgr: Manager,
     token: Arc<String>,
+    /// The port this API is served on, which the `Host` header must name.
+    port: u16,
+    /// Random per run: part of every `ETag` and list cursor, so one from a previous run of the
+    /// service is never mistaken for a current one.
+    boot: u64,
     /// Whether the daemon owns the port the *unmodified* extension dials first (1001). On Windows
     /// that is the difference between "works out of the box" and "another download manager got
     /// there first", which is worth telling the user about rather than burying in a log.
     idm_port: Arc<std::sync::atomic::AtomicBool>,
     /// When reIDM's own extension last checked in, so the window can say whether browser
     /// capture is actually connected rather than guessing.
-    ext: Arc<std::sync::Mutex<Option<ExtSeen>>>,
+    ext: Arc<Mutex<Option<ExtSeen>>>,
+    /// The list as rows, and what changed in it when (`GET /api/downloads/rows`).
+    rows: Arc<Mutex<RowCache>>,
+    /// Set to `true` to stop the service (`POST /api/shutdown`).
+    shutdown: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl App {
+    pub fn new(mgr: Manager, port: u16, idm_port: Arc<std::sync::atomic::AtomicBool>, shutdown: Arc<tokio::sync::watch::Sender<bool>>) -> App {
+        // Its own random value rather than part of the token: the boot id is sent in every
+        // `ETag`, and nothing about the token should ever be.
+        let boot = u64::from_str_radix(&random_token()[..16], 16).unwrap_or(0);
+        App {
+            mgr,
+            token: Arc::new(random_token()),
+            port,
+            boot,
+            idm_port,
+            ext: Default::default(),
+            rows: Arc::new(Mutex::new(RowCache::new(boot))),
+            shutdown,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -34,6 +89,15 @@ struct ExtSeen {
     at: std::time::SystemTime,
     version: String,
     browser: String,
+}
+
+/// Run blocking engine work (file system, a full-list clone) off the async workers, which also
+/// serve the browser extension and must not stall behind a slow disk.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
 }
 
 fn random_token() -> String {
@@ -79,20 +143,66 @@ fn random_token() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Our own address as the `Host` header names it, or `None` for any other: a page that rebinds
+/// its own host name to 127.0.0.1 still sends that name.
+fn our_host(h: &HeaderMap, port: u16) -> Option<&str> {
+    let host = h.get(header::HOST).and_then(|v| v.to_str().ok())?;
+    let (name, p) = host.rsplit_once(':')?;
+    (p.parse::<u16>().ok()? == port && matches!(name, "127.0.0.1" | "localhost" | "[::1]")).then_some(host)
+}
+
+/// Compare a secret without stopping at the first difference, so how long a wrong guess takes
+/// says nothing about how much of it was right.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && std::hint::black_box(a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y))) == 0
+}
+
 fn guard(app: &App, h: &HeaderMap, need_token: bool) -> Result<(), StatusCode> {
-    let host = h.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if host != format!("127.0.0.1:{UI_PORT}") && host != format!("localhost:{UI_PORT}") {
-        return Err(StatusCode::FORBIDDEN);
-    }
+    let Some(host) = our_host(h, app.port) else { return Err(StatusCode::FORBIDDEN) };
     if let Some(o) = h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if o != format!("http://{host}") {
             return Err(StatusCode::FORBIDDEN);
         }
     }
-    if need_token && h.get("x-reidm-token").and_then(|v| v.to_str().ok()) != Some(app.token.as_str()) {
-        return Err(StatusCode::UNAUTHORIZED);
+    if need_token {
+        let given = h.get("x-reidm-token").map(|v| v.as_bytes()).unwrap_or_default();
+        if !same_secret(given, app.token.as_bytes()) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
     }
     Ok(())
+}
+
+/// Does `If-None-Match` name `tag`?
+fn etag_matches(h: &HeaderMap, tag: &str) -> bool {
+    h.get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().trim_start_matches("W/") == tag)
+}
+
+fn with_etag(mut r: Response, tag: &str) -> Response {
+    if let Ok(v) = tag.parse() {
+        r.headers_mut().insert(header::ETAG, v);
+    }
+    // Revalidate every time: the list is live, and a 304 costs next to nothing.
+    r.headers_mut().insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache"));
+    r
+}
+
+fn json_bytes(body: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// "No such download", as every per-download call says it.
+fn not_found(id: u64) -> Response {
+    (StatusCode::NOT_FOUND, format!("there is no download #{id} (it may have been removed)")).into_response()
+}
+
+async fn exists(mgr: &Manager, id: u64) -> bool {
+    let mgr = mgr.clone();
+    blocking(move || mgr.get(id).is_some()).await
 }
 
 async fn index(State(app): State<App>, h: HeaderMap) -> Response {
@@ -105,15 +215,76 @@ async fn index(State(app): State<App>, h: HeaderMap) -> Response {
     r
 }
 
+/// Every download with every field. Answers `304 Not Modified` to an `If-None-Match` naming the
+/// list as it still is, so a client that polls costs nothing while nothing changes.
 async fn list(State(app): State<App>, h: HeaderMap) -> Response {
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    let mut items = app.mgr.list();
-    for i in &mut items {
-        i.request.cookie = None; // never expose session cookies to the page
+    // The revision first, the list after: the list is then never older than its tag.
+    let mgr = app.mgr.clone();
+    let rev = blocking(move || mgr.revision()).await;
+    let tag = format!("\"{:x}-r{rev:x}\"", app.boot);
+    if etag_matches(&h, &tag) {
+        return with_etag(StatusCode::NOT_MODIFIED.into_response(), &tag);
     }
-    Json(items).into_response()
+    let mgr = app.mgr.clone();
+    let body = blocking(move || {
+        let mut items = mgr.list();
+        for i in &mut items {
+            i.request.cookie = None; // never expose session cookies to the page
+        }
+        serde_json::to_vec(&items).unwrap_or_default()
+    })
+    .await;
+    with_etag(json_bytes(body), &tag)
+}
+
+#[derive(Deserialize)]
+struct RowsQuery {
+    #[serde(default)]
+    since: Option<String>,
+}
+
+/// The list as the window shows it: small rows, and after the first request only the rows that
+/// changed (see `rows.rs`). The cursor comes back as `cursor` and as the `ETag`; send it as
+/// `?since=` or `If-None-Match`.
+async fn rows(State(app): State<App>, h: HeaderMap, Query(q): Query<RowsQuery>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let since = q.since.or_else(|| h.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()).map(str::to_string));
+    let (mgr, cache) = (app.mgr.clone(), app.rows.clone());
+    let (cursor, answer) = blocking(move || {
+        let rev = mgr.revision();
+        let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if !c.is_current(rev) {
+            c.refresh(rev, &mgr.list());
+        }
+        (c.cursor(), c.answer(since.as_deref()))
+    })
+    .await;
+    let tag = format!("\"{cursor}\"");
+    match answer {
+        Answer::NotModified => with_etag(StatusCode::NOT_MODIFIED.into_response(), &tag),
+        Answer::Body(b) => with_etag(json_bytes(b), &tag),
+    }
+}
+
+/// One download with every field, for the Properties window: its segment map and a torrent's
+/// files, which the rows leave out.
+async fn get_one(State(app): State<App>, h: HeaderMap, Path(id): Path<u64>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let mgr = app.mgr.clone();
+    match blocking(move || mgr.get(id)).await {
+        Some(mut it) => {
+            it.request.cookie = None;
+            Json(it).into_response()
+        }
+        None => not_found(id),
+    }
 }
 
 #[derive(Deserialize)]
@@ -166,7 +337,8 @@ async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Re
             Ok(b) => b,
             Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
         };
-        return match app.mgr.add_torrent_file(&bytes, b.torrent.as_ref().and_then(|t| t.files.clone()), b.later) {
+        let (mgr, files, later) = (app.mgr.clone(), b.torrent.as_ref().and_then(|t| t.files.clone()), b.later);
+        return match blocking(move || mgr.add_torrent_file(&bytes, files, later)).await {
             Ok(o) => Json(serde_json::json!({ "id": o.id, "outcome": o.outcome })).into_response(),
             Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
         };
@@ -181,7 +353,8 @@ async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Re
         media: b.media,
         torrent: b.torrent.as_ref().map(|t| reidm_core::TorrentRequest { files: t.files.clone(), ..Default::default() }),
     };
-    match app.mgr.add_with(req, AddOptions { later: b.later, ..Default::default() }) {
+    let (mgr, later) = (app.mgr.clone(), b.later);
+    match blocking(move || mgr.add_with(req, AddOptions { later, ..Default::default() })).await {
         Ok(o) => Json(serde_json::json!({ "id": o.id, "outcome": o.outcome })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
@@ -191,41 +364,105 @@ async fn act(State(app): State<App>, h: HeaderMap, Path((id, what)): Path<(u64, 
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    match what.as_str() {
-        "pause" => app.mgr.pause(id),
-        "resume" => {
-            if let Err(e) = app.mgr.resume(id) {
-                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
-            }
-        }
+    if !ACTIONS.contains(&what.as_str()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !exists(&app.mgr, id).await {
+        return not_found(id);
+    }
+    match act_on(&app.mgr, id, &what).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// What `POST /api/downloads/{id}/{what}` and the bulk call can do to a download.
+const ACTIONS: [&str; 10] = ["pause", "resume", "open", "folder", "restart", "seed", "stop-seeding", "schedule", "unschedule", "refresh-capture"];
+
+/// Do one of `ACTIONS` (or `remove`/`purge`, for the bulk call) to a download that exists.
+async fn act_on(mgr: &Manager, id: u64, what: &str) -> Result<(), String> {
+    let m = mgr.clone();
+    let r = match what {
+        "pause" => blocking(move || {
+            m.pause(id);
+            Ok(())
+        }).await,
+        "resume" => blocking(move || m.resume(id)).await,
         "open" | "folder" => {
-            let Some(it) = app.mgr.get(id) else { return StatusCode::NOT_FOUND.into_response() };
-            crate::launch::open_path(&it.path, what == "folder");
+            let reveal = what == "folder";
+            blocking(move || {
+                if let Some(it) = m.get(id) {
+                    crate::launch::open_path(&it.path, reveal);
+                }
+                Ok(())
+            })
+            .await
         }
-        "restart" => {
-            if let Err(e) = app.mgr.restart(id).await {
-                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
-            }
-        }
-        "seed" | "stop-seeding" => {
-            if let Err(e) = app.mgr.set_seeding(id, what == "seed").await {
-                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
-            }
-        }
+        "restart" => m.restart(id).await,
+        "seed" | "stop-seeding" => m.set_seeding(id, what == "seed").await,
         "schedule" | "unschedule" => {
-            if let Err(e) = app.mgr.set_scheduled(id, what == "schedule") {
-                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
-            }
+            let on = what == "schedule";
+            blocking(move || m.set_scheduled(id, on)).await
+        }
+        "remove" | "purge" => {
+            let purge = what == "purge";
+            blocking(move || {
+                m.remove(id, purge);
+                Ok(())
+            }).await
         }
         // Take the next link the browser hands over as this download's new address.
-        "refresh-capture" => {
-            if let Err(e) = app.mgr.arm_refresh(id) {
-                return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response();
-            }
-        }
-        _ => return StatusCode::NOT_FOUND.into_response(),
+        "refresh-capture" => blocking(move || m.arm_refresh(id)).await,
+        other => return Err(format!("unknown action {other:?}")),
+    };
+    r.map_err(|e| format!("{e:#}"))
+}
+
+#[derive(Deserialize)]
+struct BulkBody {
+    ids: Vec<u64>,
+    action: String,
+}
+
+/// One action on many downloads, in one request: *Delete completed*, *Start all*, a selection of
+/// thousands. Answers per download, like the batch add.
+async fn bulk(State(app): State<App>, h: HeaderMap, Json(b): Json<BulkBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
     }
-    StatusCode::NO_CONTENT.into_response()
+    let action = b.action.as_str();
+    if !(ACTIONS.contains(&action) || matches!(action, "remove" | "purge")) || matches!(action, "open" | "folder" | "refresh-capture") {
+        return (StatusCode::BAD_REQUEST, format!("unknown bulk action {action:?}: use pause, resume, restart, remove, purge, schedule, unschedule, seed or stop-seeding")).into_response();
+    }
+    if b.ids.len() > MAX_BATCH {
+        return (StatusCode::BAD_REQUEST, format!("{} downloads is more than one request may name ({MAX_BATCH}); send them in parts", b.ids.len())).into_response();
+    }
+    let mgr = app.mgr.clone();
+    let known: std::collections::HashSet<u64> = blocking(move || mgr.list().into_iter().map(|i| i.id).collect()).await;
+    let (mut ok, mut results) = (0usize, Vec::with_capacity(b.ids.len()));
+    for id in b.ids {
+        let r = if known.contains(&id) { act_on(&app.mgr, id, action).await } else { Err(format!("there is no download #{id}")) };
+        results.push(match r {
+            Ok(()) => {
+                ok += 1;
+                serde_json::json!({ "id": id })
+            }
+            Err(e) => serde_json::json!({ "id": id, "error": e }),
+        });
+    }
+    let failed = results.len() - ok;
+    Json(serde_json::json!({ "ok": ok, "failed": failed, "results": results })).into_response()
+}
+
+/// Stop the service: *Quit reIDM completely* in the window. Downloads stop where they are and
+/// carry on from there the next time it starts.
+async fn shutdown(State(app): State<App>, h: HeaderMap) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    tracing::info!("asked to shut down");
+    let _ = app.shutdown.send(true);
+    StatusCode::ACCEPTED.into_response()
 }
 
 #[derive(Deserialize)]
@@ -260,7 +497,11 @@ async fn set_limit(State(app): State<App>, h: HeaderMap, Path(id): Path<u64>, Js
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    match app.mgr.set_speed_limit(id, b.limit) {
+    if !exists(&app.mgr, id).await {
+        return not_found(id);
+    }
+    let mgr = app.mgr.clone();
+    match blocking(move || mgr.set_speed_limit(id, b.limit)).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
@@ -271,11 +512,13 @@ async fn queue(State(app): State<App>, h: HeaderMap, Path(what): Path<String>) -
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    let n = match what.as_str() {
-        "start" => app.mgr.start_queue(),
-        "stop" => app.mgr.stop_queue(),
+    let start = match what.as_str() {
+        "start" => true,
+        "stop" => false,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    let mgr = app.mgr.clone();
+    let n = blocking(move || if start { mgr.start_queue() } else { mgr.stop_queue() }).await;
     Json(serde_json::json!({ "count": n })).into_response()
 }
 
@@ -284,7 +527,8 @@ async fn refresh_cancel(State(app): State<App>, h: HeaderMap) -> Response {
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    app.mgr.disarm_refresh();
+    let mgr = app.mgr.clone();
+    blocking(move || mgr.disarm_refresh()).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -300,7 +544,8 @@ async fn export(State(app): State<App>, h: HeaderMap, Query(q): Query<ExportQuer
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    let items = app.mgr.list();
+    let mgr = app.mgr.clone();
+    let items = blocking(move || mgr.list()).await;
     let body = match q.format.as_deref().unwrap_or("txt") {
         "ef2" => {
             let entries: Vec<reidm_core::lists::Entry> = items
@@ -334,20 +579,24 @@ async fn export(State(app): State<App>, h: HeaderMap, Query(q): Query<ExportQuer
 // Extension requests with `host_permissions` are not subject to CORS, so nothing is needed for
 // the extension itself to read the responses.
 
-/// Is this an extension origin? Browsers set `Origin` themselves and page script cannot forge
+/// Is this an extension's origin? Browsers set `Origin` themselves and page script cannot forge
 /// it, so this is a reliable discriminator — a web page always arrives with its own http(s)
 /// origin. It is not a *credential*: any local process can send the header, but such a process
-/// could already read the daemon's token file.
-fn is_extension_origin(h: &HeaderMap) -> bool {
-    matches!(
-        h.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
-        Some(o) if o.starts_with("chrome-extension://")
-            || o.starts_with("moz-extension://")
-            || o.starts_with("safari-web-extension://")
-    )
+/// could already read the daemon's token file. The WebSocket uses the same test.
+pub fn is_extension_origin_str(o: &str) -> bool {
+    ["chrome-extension://", "moz-extension://", "safari-web-extension://", "extension://"].iter().any(|p| o.starts_with(p))
 }
 
-fn extension_caller(h: &HeaderMap) -> Result<(), StatusCode> {
+fn is_extension_origin(h: &HeaderMap) -> bool {
+    h.get(header::ORIGIN).and_then(|v| v.to_str().ok()).is_some_and(is_extension_origin_str)
+}
+
+/// Who may use `/ext/*`: requests addressed to us by our own name (so a page that rebinds its
+/// host name to 127.0.0.1 is refused, as on `/api`), from an extension or from a local process.
+fn extension_caller(app: &App, h: &HeaderMap) -> Result<(), StatusCode> {
+    if our_host(h, app.port).is_none() {
+        return Err(StatusCode::FORBIDDEN);
+    }
     match h.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         Some(_) if is_extension_origin(h) => Ok(()),
         // No Origin: a local process (curl, a script). It could already read the token file, so
@@ -357,14 +606,24 @@ fn extension_caller(h: &HeaderMap) -> Result<(), StatusCode> {
     }
 }
 
+/// Whether a ping without an extension `Origin` may count as the extension checking in. Chrome
+/// sends no `Origin` on an extension's GET, but it does say where a request came from: a web
+/// page's `<img src="http://127.0.0.1:61002/ext/ping?v=x">` or no-cors `fetch` arrives marked
+/// `Sec-Fetch-Site: cross-site`, and must not make the window report "Browser: connected".
+/// An extension's own request, and a local tool that sends no such header, are not refused.
+fn may_check_in(h: &HeaderMap) -> bool {
+    is_extension_origin(h)
+        || !matches!(h.get("sec-fetch-site").and_then(|v| v.to_str().ok()), Some("cross-site" | "same-site"))
+}
+
 /// Answer a CORS preflight.
 ///
 /// Chrome may preflight the extension's JSON POST even though host permissions normally lift
 /// the response check, so refusing every preflight would break the extension. The reply is
 /// scoped to the asking extension origin, which a web page cannot obtain: it would have to send
 /// `Origin: chrome-extension://…`, and browsers do not let page script set that header.
-async fn ext_preflight(h: HeaderMap) -> Response {
-    if !is_extension_origin(&h) {
+async fn ext_preflight(State(app): State<App>, h: HeaderMap) -> Response {
+    if !is_extension_origin(&h) || our_host(&h, app.port).is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
     let origin = h.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
@@ -389,14 +648,14 @@ struct PingQuery {
 
 /// What the extension answers on start-up to decide whether reIDM is running.
 async fn ext_ping(State(app): State<App>, h: HeaderMap, Query(q): Query<PingQuery>) -> Response {
-    if let Err(c) = extension_caller(&h) {
+    if let Err(c) = extension_caller(&app, &h) {
         return c.into_response();
     }
     // Chrome attaches `Origin` to an extension's POSTs but not to its GETs, so the version
     // parameter, which only reIDM's extension sends, is what identifies the ping.
-    if q.v.is_some() || is_extension_origin(&h) {
+    if (q.v.is_some() || is_extension_origin(&h)) && may_check_in(&h) {
         let browser = h.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(browser_name).unwrap_or_default();
-        *app.ext.lock().unwrap() = Some(ExtSeen {
+        *app.ext.lock().unwrap_or_else(|p| p.into_inner()) = Some(ExtSeen {
             at: std::time::SystemTime::now(),
             version: q.v.unwrap_or_default().chars().take(32).collect(),
             browser,
@@ -458,7 +717,7 @@ fn ext_error(e: anyhow::Error) -> Response {
 }
 
 async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) -> Response {
-    if let Err(c) = extension_caller(&h) {
+    if let Err(c) = extension_caller(&app, &h) {
         return c.into_response();
     }
     let req = Request {
@@ -486,7 +745,12 @@ async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) ->
     }
 
     let opts = AddOptions { later: b.later, refuse_html: b.refuse_html };
-    let r = if b.verify { app.mgr.add_checked(req, opts).await } else { app.mgr.add_with(req, opts) };
+    let r = if b.verify {
+        app.mgr.add_checked(req, opts).await
+    } else {
+        let mgr = app.mgr.clone();
+        blocking(move || mgr.add_with(req, opts)).await
+    };
     match r {
         Ok(o) => Json(serde_json::json!({ "ok": true, "id": o.id, "outcome": o.outcome })).into_response(),
         Err(e) => ext_error(e),
@@ -515,7 +779,7 @@ struct ExtBatch {
 
 /// Many links at once, from the extension's resource grabber. Answers per URL.
 async fn ext_add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtBatch>) -> Response {
-    if let Err(c) = extension_caller(&h) {
+    if let Err(c) = extension_caller(&app, &h) {
         return c.into_response();
     }
     if b.items.len() > 5000 {
@@ -535,9 +799,9 @@ async fn ext_add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtBa
             torrent: None,
         })
         .collect();
-    let results: Vec<serde_json::Value> = app
-        .mgr
-        .add_many_with(reqs, AddOptions { later: b.later, ..Default::default() })
+    let (mgr, later) = (app.mgr.clone(), b.later);
+    let results: Vec<serde_json::Value> = blocking(move || mgr.add_many_with(reqs, AddOptions { later, ..Default::default() }))
+        .await
         .into_iter()
         .map(|(url, r)| match r {
             Ok(o) => serde_json::json!({ "url": url, "id": o.id, "outcome": o.outcome }),
@@ -574,6 +838,9 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
+    if b.urls.len() + b.items.len() > MAX_BATCH {
+        return (StatusCode::BAD_REQUEST, format!("{} addresses is more than one batch may hold ({MAX_BATCH}); add them in parts", b.urls.len() + b.items.len())).into_response();
+    }
     let dir = b.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from);
     let single = b.urls.len() + b.items.len() == 1;
     let mut reqs: Vec<Request> = b
@@ -602,9 +869,9 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
         media: None,
         torrent: None,
     }));
-    let mut results: Vec<serde_json::Value> = app
-        .mgr
-        .add_many_with(reqs, AddOptions { later: b.later, ..Default::default() })
+    let (mgr, later) = (app.mgr.clone(), b.later);
+    let mut results: Vec<serde_json::Value> = blocking(move || mgr.add_many_with(reqs, AddOptions { later, ..Default::default() }))
+        .await
         .into_iter()
         .map(|(url, r)| match r {
             Ok(o) => serde_json::json!({ "url": url, "id": o.id, "outcome": o.outcome }),
@@ -743,7 +1010,7 @@ async fn status(State(app): State<App>, h: HeaderMap) -> Response {
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    let ext = app.ext.lock().unwrap().clone().map(|e| {
+    let ext = app.ext.lock().unwrap_or_else(|p| p.into_inner()).clone().map(|e| {
         serde_json::json!({
             "seconds_ago": e.at.elapsed().map(|d| d.as_secs()).unwrap_or(0),
             "version": e.version,
@@ -753,8 +1020,8 @@ async fn status(State(app): State<App>, h: HeaderMap) -> Response {
     Json(serde_json::json!({
         "idm_port": app.idm_port.load(std::sync::atomic::Ordering::Relaxed),
         "idm_port_number": crate::ws::IDM_PORT,
-        "local_port": crate::ws::LOCAL_PORT,
-        "ui_port": UI_PORT,
+        "local_port": crate::ws::local_port(),
+        "ui_port": app.port,
         "platform": std::env::consts::OS,
         "version": env!("CARGO_PKG_VERSION"),
         "extension": ext,
@@ -805,7 +1072,8 @@ async fn set_settings(State(app): State<App>, h: HeaderMap, Json(b): Json<Settin
         torrent_port: b.torrent_port,
         torrent_dht: b.torrent_dht,
     };
-    match app.mgr.update_settings(patch) {
+    let mgr = app.mgr.clone();
+    match blocking(move || mgr.update_settings(patch)).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
@@ -821,8 +1089,13 @@ async fn remove(State(app): State<App>, h: HeaderMap, Path(id): Path<u64>, Query
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    app.mgr.remove(id, q.purge);
-    StatusCode::NO_CONTENT.into_response()
+    if !exists(&app.mgr, id).await {
+        return not_found(id);
+    }
+    match act_on(&app.mgr, id, if q.purge { "purge" } else { "remove" }).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
 }
 
 /// Publish the API token so a *local, same-user* client (the desktop GUI) can authenticate without
@@ -858,19 +1131,16 @@ fn clear_token_file(dir: &std::path::Path) {
     let _ = std::fs::remove_file(dir.join("api-token"));
 }
 
-pub async fn serve(mgr: Manager, idm_port: Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
-    // Bind *before* touching the token file: a losing second daemon must not overwrite the token
-    // the daemon that actually owns the port is handing out.
-    let l = tokio::net::TcpListener::bind(("127.0.0.1", UI_PORT)).await?;
-
-    let token = random_token();
-    let data_dir = mgr.data_dir().to_path_buf();
-    write_token_file(&data_dir, &token);
-    let app = App { mgr, token: Arc::new(token), idm_port, ext: Default::default() };
-    let router = Router::new()
+/// Every route, with its body limit.
+pub fn router(app: App) -> Router {
+    let big = |n| DefaultBodyLimit::max(n);
+    Router::new()
         .route("/", get(index))
-        .route("/api/downloads", get(list).post(add))
-        .route("/api/downloads/:id", delete(remove))
+        .route("/api/downloads", get(list).post(add).layer(big(TORRENT_BODY)))
+        .route("/api/downloads/rows", get(rows))
+        .route("/api/downloads/bulk", post(bulk).layer(big(BATCH_BODY)))
+        .route("/api/downloads/batch", post(add_batch).layer(big(BATCH_BODY)))
+        .route("/api/downloads/:id", get(get_one).delete(remove))
         .route("/api/downloads/:id/refresh", post(refresh))
         .route("/api/downloads/:id/limit", post(set_limit))
         .route("/api/downloads/:id/:what", post(act))
@@ -879,23 +1149,273 @@ pub async fn serve(mgr: Manager, idm_port: Arc<std::sync::atomic::AtomicBool>) -
         .route("/api/export", get(export))
         .route("/api/settings", get(settings).post(set_settings))
         .route("/api/status", get(status))
-        .route("/api/downloads/batch", post(add_batch))
+        .route("/api/shutdown", post(shutdown))
         .route("/api/media/playlist", post(media_playlist))
         .route("/api/media/info", post(media_info))
-        .route("/api/torrent/inspect", post(torrent_inspect))
+        .route("/api/torrent/inspect", post(torrent_inspect).layer(big(TORRENT_BODY)))
         .route("/api/grab", post(grab))
         .route("/ext/ping", get(ext_ping).options(ext_preflight))
         .route("/ext/add", post(ext_add).options(ext_preflight))
-        .route("/ext/add-batch", post(ext_add_batch).options(ext_preflight))
-        .with_state(app);
-    tracing::info!("web UI at http://127.0.0.1:{UI_PORT}/");
-    let r = axum::serve(l, router).await;
+        .route("/ext/add-batch", post(ext_add_batch).options(ext_preflight).layer(big(BATCH_BODY)))
+        .layer(DefaultBodyLimit::max(SMALL_BODY))
+        .layer(axum::middleware::from_fn(explain_too_large))
+        .with_state(app)
+}
+
+/// axum answers an oversized body with a bare `413`. Say what happened instead, in the shape
+/// each caller reads: JSON for the extension, text for the API.
+async fn explain_too_large(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let ext = req.uri().path().starts_with("/ext/");
+    let r = next.run(req).await;
+    if r.status() != StatusCode::PAYLOAD_TOO_LARGE {
+        return r;
+    }
+    let msg = "the request is larger than reIDM accepts for this call; send fewer items at once";
+    if ext {
+        (StatusCode::PAYLOAD_TOO_LARGE, Json(serde_json::json!({ "ok": false, "error": msg }))).into_response()
+    } else {
+        (StatusCode::PAYLOAD_TOO_LARGE, msg).into_response()
+    }
+}
+
+/// Serve the API on a port the caller has already taken. Publishes the token, and removes it
+/// again when the service stops: on `POST /api/shutdown`, or when `shutdown` is set.
+pub async fn serve(l: tokio::net::TcpListener, app: App) -> anyhow::Result<()> {
+    let data_dir = app.mgr.data_dir().to_path_buf();
+    write_token_file(&data_dir, &app.token);
+    let mut stop = app.shutdown.subscribe();
+    let port = app.port;
+    tracing::info!("web UI at http://127.0.0.1:{port}/");
+    let r = axum::serve(l, router(app))
+        .with_graceful_shutdown(async move {
+            let _ = stop.wait_for(|s| *s).await;
+        })
+        .await;
     clear_token_file(&data_dir);
     r?;
     Ok(())
 }
 
-// TEMP: replaced by Manager::revision() when the engine branch lands. Brings the stand-in
-// `revision()` into scope; the engine's inherent method wins once it exists.
-#[allow(unused_imports)]
-use crate::revision::Revision as _;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    struct Server {
+        base: String,
+        port: u16,
+        token: String,
+        stop: Arc<tokio::sync::watch::Sender<bool>>,
+        dir: std::path::PathBuf,
+        mgr: Manager,
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.stop.send(true);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A service on an ephemeral port over a data folder holding `n` finished downloads, written
+    /// straight to `downloads.json` (adding them one by one would take minutes).
+    async fn server(name: &str, n: u64) -> Server {
+        let dir = std::env::temp_dir().join(format!("reidm-web-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let segs: Vec<serde_json::Value> = (0..8u64).map(|k| serde_json::json!({ "start": k << 20, "end": (k << 20) + 1048575, "done": 1048576, "finished": true })).collect();
+        let items: serde_json::Map<String, serde_json::Value> = (1..=n)
+            .map(|id| {
+                (id.to_string(), serde_json::json!({
+                    "id": id,
+                    "request": { "url": format!("https://downloads.example.com/releases/v{id}/package-{id}.tar.gz?token=abcdef0123456789"), "referer": "https://example.com/download", "cookie": "session=secret", "user_agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/141.0.0.0", "filename": null, "dir": null },
+                    "path": format!("/home/user/Downloads/package-{id}.tar.gz"),
+                    "size": 8388608, "downloaded": 8388608, "status": { "state": "Done" },
+                    "segments": segs, "resumable": true, "added": 1_790_000_000u64, "last_try": 1_790_000_100u64, "finished_at": 1_790_000_100u64,
+                    "etag": "\"5f3e-abc\"", "last_modified": "Mon, 01 Jan 2026 00:00:00 GMT",
+                }))
+            })
+            .collect();
+        std::fs::write(dir.join("downloads.json"), serde_json::to_vec(&serde_json::json!({ "next_id": n + 1, "items": items })).unwrap()).unwrap();
+        let mgr = Manager::open(&dir, dir.join("dl"), 2).unwrap();
+        let l = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (stop, _) = tokio::sync::watch::channel(false);
+        let stop = Arc::new(stop);
+        let app = App::new(mgr.clone(), port, Default::default(), stop.clone());
+        let token = app.token.to_string();
+        tokio::spawn(serve(l, app));
+        // `serve` writes the token file first; wait until it answers.
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Server { base: format!("http://127.0.0.1:{port}"), port, token, stop, dir, mgr }
+    }
+
+    impl Server {
+        fn get(&self, path: &str) -> reqwest::RequestBuilder {
+            reqwest::Client::new().get(format!("{}{path}", self.base)).header("X-Reidm-Token", &self.token)
+        }
+        fn post(&self, path: &str, body: serde_json::Value) -> reqwest::RequestBuilder {
+            reqwest::Client::new().post(format!("{}{path}", self.base)).header("X-Reidm-Token", &self.token).json(&body)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fifty_thousand_downloads_are_served_and_an_unchanged_list_costs_nothing() {
+        let s = server("big", 50_000).await;
+
+        let t = Instant::now();
+        let r = s.get("/api/downloads").send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let tag = r.headers()[header::ETAG].to_str().unwrap().to_string();
+        let full = r.bytes().await.unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&full).unwrap();
+        assert_eq!(items.len(), 50_000);
+        assert!(items.iter().all(|i| i["request"]["cookie"].is_null()), "cookies never leave the service");
+        eprintln!("GET /api/downloads, 50k: {} bytes in {:?}", full.len(), t.elapsed());
+
+        let t = Instant::now();
+        let r = s.get("/api/downloads").header(header::IF_NONE_MATCH, &tag).send().await.unwrap();
+        assert_eq!(r.status(), 304, "the same list again is a 304");
+        assert!(r.bytes().await.unwrap().is_empty());
+        eprintln!("GET /api/downloads, 50k, unchanged: 304 in {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let r = s.get("/api/downloads/rows").send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["full"], true);
+        assert_eq!(v["rows"].as_array().unwrap().len(), 50_000);
+        let rows_len = serde_json::to_vec(&v["rows"]).unwrap().len();
+        eprintln!("GET /api/downloads/rows, 50k: {rows_len} bytes in {:?}", t.elapsed());
+        assert!(rows_len * 2 < full.len(), "rows {rows_len} vs items {}", full.len());
+        let cursor = v["cursor"].as_str().unwrap().to_string();
+
+        let t = Instant::now();
+        let r = s.get(&format!("/api/downloads/rows?since={cursor}")).send().await.unwrap();
+        assert_eq!(r.status(), 304);
+        eprintln!("GET /api/downloads/rows?since, 50k, unchanged: 304 in {:?}", t.elapsed());
+
+        // One change shows up as one row.
+        let r = s.post("/api/downloads/7/schedule", serde_json::json!({})).send().await.unwrap();
+        assert_eq!(r.status(), 400, "a finished download can't be scheduled: {}", r.text().await.unwrap());
+        let r = reqwest::Client::new().delete(format!("{}/api/downloads/9", s.base)).header("X-Reidm-Token", &s.token).send().await.unwrap();
+        assert_eq!(r.status(), 204);
+        let v: serde_json::Value = s.get(&format!("/api/downloads/rows?since={cursor}")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["full"], false);
+        assert_eq!(v["rows"].as_array().unwrap().len(), 0);
+        assert_eq!(v["removed"], serde_json::json!([9]));
+
+        // The full item, for Properties.
+        let one: serde_json::Value = s.get("/api/downloads/5").send().await.unwrap().json().await.unwrap();
+        assert_eq!(one["segments"].as_array().unwrap().len(), 8);
+        assert!(one["request"]["cookie"].is_null());
+        assert_eq!(s.get("/api/downloads/9").send().await.unwrap().status(), 404);
+    }
+
+    #[tokio::test]
+    async fn unknown_downloads_are_reported_not_silently_accepted() {
+        let s = server("unknown", 3).await;
+        let r = s.post("/api/downloads/999/pause", serde_json::json!({})).send().await.unwrap();
+        assert_eq!(r.status(), 404);
+        assert!(r.text().await.unwrap().contains("no download #999"));
+        let r = reqwest::Client::new().delete(format!("{}/api/downloads/999", s.base)).header("X-Reidm-Token", &s.token).send().await.unwrap();
+        assert_eq!(r.status(), 404);
+
+        let v: serde_json::Value = s.post("/api/downloads/bulk", serde_json::json!({ "ids": [1, 2, 999], "action": "remove" })).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["ok"], 2);
+        assert_eq!(v["failed"], 1);
+        assert!(v["results"][2]["error"].as_str().unwrap().contains("999"));
+        assert!(s.mgr.get(1).is_none() && s.mgr.get(3).is_some());
+        let r = s.post("/api/downloads/bulk", serde_json::json!({ "ids": [3], "action": "open" })).send().await.unwrap();
+        assert_eq!(r.status(), 400, "opening thousands of files at once is not a bulk action");
+    }
+
+    #[tokio::test]
+    async fn the_token_is_checked_whatever_its_length() {
+        let s = server("token", 0).await;
+        let c = reqwest::Client::new();
+        for t in ["", "x", &"0".repeat(64), &format!("{}0", s.token)] {
+            let r = c.get(format!("{}/api/status", s.base)).header("X-Reidm-Token", t).send().await.unwrap();
+            assert_eq!(r.status(), 401, "token {t:?}");
+        }
+        assert_eq!(s.get("/api/status").send().await.unwrap().status(), 200);
+        assert!(same_secret(b"abc", b"abc"));
+        assert!(!same_secret(b"abc", b"abd") && !same_secret(b"abc", b"abcd"));
+    }
+
+    #[tokio::test]
+    async fn ext_endpoints_refuse_other_host_names() {
+        let s = server("host", 0).await;
+        let c = reqwest::Client::new();
+        let ping = |host: String| c.get(format!("{}/ext/ping", s.base)).header(header::HOST, host).send();
+        // DNS rebinding: the page's own name, pointed at 127.0.0.1.
+        assert_eq!(ping(format!("evil.example:{}", s.port)).await.unwrap().status(), 403);
+        assert_eq!(ping(format!("127.0.0.1:{}", s.port + 1)).await.unwrap().status(), 403);
+        for ok in [format!("127.0.0.1:{}", s.port), format!("localhost:{}", s.port), format!("[::1]:{}", s.port)] {
+            assert_eq!(ping(ok.clone()).await.unwrap().status(), 200, "{ok}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_web_page_cannot_fake_the_extension_checking_in() {
+        let s = server("checkin", 0).await;
+        let c = reqwest::Client::new();
+        let seen = || async { s.get("/api/status").send().await.unwrap().json::<serde_json::Value>().await.unwrap()["extension"].clone() };
+        // `<img src="http://127.0.0.1:61002/ext/ping?v=x">` on some web page.
+        let r = c.get(format!("{}/ext/ping?v=9.9", s.base)).header("sec-fetch-site", "cross-site").header("sec-fetch-dest", "image").send().await.unwrap();
+        assert_eq!(r.status(), 200, "the answer itself is harmless: a page can't read it");
+        assert!(seen().await.is_null(), "a page's ping must not count as the extension");
+        // The extension's own ping.
+        c.get(format!("{}/ext/ping?v=0.8.0", s.base)).header("sec-fetch-site", "none").send().await.unwrap();
+        assert_eq!(seen().await["version"], "0.8.0");
+    }
+
+    #[tokio::test]
+    async fn oversized_requests_are_refused_with_an_explanation() {
+        let s = server("limits", 0).await;
+        let big = "x".repeat(SMALL_BODY + 1);
+        let r = s.post("/api/settings", serde_json::json!({ "default_dir": big })).send().await.unwrap();
+        assert_eq!(r.status(), 413);
+        assert!(r.text().await.unwrap().contains("larger than reIDM accepts"));
+        let r = reqwest::Client::new().post(format!("{}/ext/add", s.base)).json(&serde_json::json!({ "url": big })).send().await.unwrap();
+        assert_eq!(r.status(), 413);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["ok"], false, "the extension reads JSON");
+
+        let urls: Vec<String> = (0..=MAX_BATCH).map(|i| format!("https://e.invalid/{i}")).collect();
+        let r = s.post("/api/downloads/batch", serde_json::json!({ "urls": urls })).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(r.text().await.unwrap().contains("in parts"));
+
+        // A torrent file well over the old 2 MB limit is read (and then refused as not a torrent).
+        use base64::Engine;
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![b'd'; 3 << 20]);
+        let r = s.post("/api/torrent/inspect", serde_json::json!({ "data": data })).send().await.unwrap();
+        assert_eq!(r.status(), 400, "read, not refused for its size");
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_service_and_removes_the_token() {
+        let s = server("shutdown", 0).await;
+        assert!(s.dir.join("api-token").exists());
+        assert_eq!(s.post("/api/shutdown", serde_json::json!({})).send().await.unwrap().status(), 202);
+        for _ in 0..100 {
+            if !s.dir.join("api-token").exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the token file outlived the service");
+    }
+
+    #[test]
+    fn if_none_match_lists() {
+        let mut h = HeaderMap::new();
+        h.insert(header::IF_NONE_MATCH, "\"a\", W/\"b\"".parse().unwrap());
+        assert!(etag_matches(&h, "\"a\"") && etag_matches(&h, "\"b\"") && !etag_matches(&h, "\"c\""));
+    }
+}
