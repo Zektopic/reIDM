@@ -4,6 +4,23 @@
 
 ### Fixed
 
+* **A download could be left with a hole in it after a crash, power cut or full disk**: progress
+  was counted before it reached the disk. It is now recorded only once it is safely written.
+* **The download list survives a crash or power cut**: it is written safely, the previous copy is
+  kept as `downloads.json.bak`, and a damaged list is recovered from it instead of stopping reIDM.
+* **A finished download never replaces a file that is already there**: it is saved as
+  `name (1).ext`.
+* Pause works straight away even when the server has stopped answering, and on downloads waiting
+  in the queue; Resume pressed while a download is stopping is no longer lost.
+* Downloads on a flaky connection keep their connections and finish, instead of dropping to one
+  connection and failing.
+* Re-adding a link whose finished file was deleted downloads it again; re-adding a stopped link
+  uses the browser's fresh cookies.
+* Changing the temporary folder no longer restarts unfinished downloads from nothing.
+* More changed files are noticed instead of being joined to the old version: a server that drops
+  byte ranges, a file that got shorter, or a new modification date.
+* A batch pattern with a huge range is refused at once instead of freezing the window.
+* The scheduler no longer starts or stops the queue twice when the clocks go back.
 * **Torrents of several files were put straight into the download folder** — every file loose in
   *Compressed*, *Video*… — instead of a folder named after the torrent, and a file already there
   with the same name was overwritten. A torrent now gets a folder of its own, and a new torrent never
@@ -22,6 +39,13 @@
 
 ### Improved
 
+* Adding thousands of links at once takes a moment instead of minutes (2,000 links: 51 s → 0.1 s),
+  and the service stays responsive while the list is saved.
+* Files taken from the browser are marked as downloaded from the internet (Windows SmartScreen,
+  macOS Gatekeeper), as the browser would have marked them.
+* On Linux, a disk too small for a download says so when it starts. On Windows, large downloads no
+  longer stall while the disk is filled with zeros.
+* The download list and settings are readable only by you on Linux and macOS (they hold cookies).
 * Videos and torrents keep to the global speed limit: each gets its share, and what they fetch counts
   against the rest. A new limit reaches a running video within seconds.
 * yt-dlp, Deno and ffmpeg are downloaded to disk and checked as they arrive, not held in memory. A
