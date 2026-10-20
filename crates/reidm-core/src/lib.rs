@@ -1865,12 +1865,19 @@ impl Manager {
 
     /// Set (or clear) what a running download is busy with; see [`Item::note`].
     fn set_note(&self, id: u64, note: Option<&str>) {
-        let changed = match self.0.db.lock().unwrap().items.get_mut(&id) {
-            Some(it) if it.note.as_deref() != note => {
-                it.note = note.map(str::to_string);
-                true
+        // Looked at before it is taken for writing: taking it counts as a change, and a torrent
+        // calls this twice a second.
+        let changed = {
+            let mut db = self.0.db.lock().unwrap();
+            match db.items.get(&id) {
+                Some(it) if it.note.as_deref() != note => {
+                    if let Some(it) = db.items.get_mut(&id) {
+                        it.note = note.map(str::to_string);
+                    }
+                    true
+                }
+                _ => false,
             }
-            _ => false,
         };
         // Saved, since `reidm list` reads the saved list; notes change a few times a download.
         if changed {
@@ -2596,6 +2603,25 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn repeating_a_note_is_not_a_change() {
+        // Torrents set their note twice a second; an unchanged note must not move the revision
+        // (every poller would refetch the list) or schedule a save (an idle seed rewriting it).
+        let dir = std::env::temp_dir().join(format!("reidm-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = Manager::open(&dir.join("data"), dir.join("dl"), 4).unwrap();
+        let id = m.add_with(Request { url: "http://127.0.0.1:9/f.bin".into(), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap().id;
+        m.set_note(id, Some("looking for peers"));
+        let rev = m.revision();
+        for _ in 0..10 {
+            m.set_note(id, Some("looking for peers"));
+        }
+        assert_eq!(m.revision(), rev);
+        m.set_note(id, None);
+        assert!(m.revision() > rev);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

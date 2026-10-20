@@ -490,18 +490,30 @@ impl Manager {
     /// Copy a torrent's numbers into its row. True when anything shown changed.
     fn record(&self, id: u64, st: &librqbit::TorrentStats) -> bool {
         let mut db = self.0.db.lock().unwrap();
+        let peers = peers_of(st);
+        // Taking an item mutably counts as a change (and schedules a save), and this runs every
+        // 500 ms for every torrent: look first, and only write when a number moved, so an idle
+        // seed doesn't rewrite the list.
+        let Some(it) = db.items.get(&id) else { return false };
+        let same = it.downloaded == st.progress_bytes
+            && it.size == Some(st.total_bytes)
+            && it.torrent.as_ref().is_none_or(|t| {
+                t.uploaded == st.uploaded_bytes && t.peers == peers && t.files.iter().map(|f| f.done).eq(st.file_progress.iter().copied().take(t.files.len()))
+            });
+        if same {
+            return false;
+        }
         let Some(it) = db.items.get_mut(&id) else { return false };
-        let before = (it.downloaded, it.size, it.torrent.as_ref().map(|t| (t.uploaded, t.peers)));
         it.downloaded = st.progress_bytes;
         it.size = Some(st.total_bytes);
         if let Some(t) = it.torrent.as_mut() {
             t.uploaded = st.uploaded_bytes;
-            t.peers = peers_of(st);
+            t.peers = peers;
             for (f, done) in t.files.iter_mut().zip(&st.file_progress) {
                 f.done = *done;
             }
         }
-        before != (it.downloaded, it.size, it.torrent.as_ref().map(|t| (t.uploaded, t.peers)))
+        true
     }
 
     /// Start or stop sharing a finished torrent.
