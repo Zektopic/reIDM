@@ -143,12 +143,16 @@ pub struct HeightInfo {
 async fn ytdlp_json(m: &Manager, args: &[&str], url: &str) -> Result<serde_json::Value> {
     use tokio::io::AsyncReadExt;
     let data_dir = m.data_dir().to_path_buf();
-    let exe = ytdlp(&m.0.http, &data_dir).await?;
-    let js = js_runtime(&m.0.http, &data_dir).await;
+    let exe = ytdlp(&m.http(), &data_dir).await?;
+    let js = js_runtime(&m.http(), &data_dir).await;
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.args(["-J", "--no-warnings", "--no-colors", "--encoding", "utf-8"]).args(args);
     if let Some(js) = &js {
         cmd.args(["--js-runtimes", js]);
+    }
+    let proxy = m.ytdlp_proxy(&data_dir);
+    if let Some(p) = &proxy {
+        cmd.arg("--config-locations").arg(&p.0);
     }
     cmd.arg("--").arg(url);
     cmd.env("PYTHONIOENCODING", "utf-8").env("PYTHONUTF8", "1").stdin(std::process::Stdio::null());
@@ -908,6 +912,41 @@ const CARRY_ON: u32 = 20;
 /// slider must not restart it at every step.
 const RESTART_AT_MOST_EVERY: Duration = Duration::from_secs(5);
 
+/// An options file telling yt-dlp which proxy to use (`--proxy`), so the proxy's password is
+/// never on a command line, where every user of the computer could read it. Readable by this
+/// user only, and removed when dropped.
+struct ProxyFile(PathBuf);
+
+impl Drop for ProxyFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// yt-dlp's options-file line for `proxy` (an empty one means "connect directly"). The address
+/// is quoted; it holds no quote of its own (its user name and password are percent-encoded, and
+/// a host name with one is refused).
+fn proxy_option(proxy: &str) -> String {
+    format!("--proxy \"{proxy}\"\n")
+}
+
+impl Manager {
+    /// The `--config-locations` file with the proxy yt-dlp should use, written into `dir`; none
+    /// when yt-dlp should follow the system, as reIDM does.
+    fn ytdlp_proxy(&self, dir: &Path) -> Option<ProxyFile> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let proxy = self.0.settings.lock().unwrap().proxy.for_videos()?;
+        let path = dir.join(format!("yt-dlp-proxy-{}-{}.conf", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        match write_private(&path, &proxy_option(&proxy)) {
+            Ok(()) => Some(ProxyFile(path)),
+            Err(e) => {
+                tracing::warn!("cannot give yt-dlp the proxy: {e}");
+                None
+            }
+        }
+    }
+}
+
 /// The cookies file for yt-dlp, readable by this user only from the moment it exists.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -951,18 +990,18 @@ impl Manager {
         if !tools.join(format!("yt-dlp{EXE}")).is_file() {
             self.set_note(id, Some("getting yt-dlp (first time only)"));
         }
-        let Some(ytdlp) = unless_stopped(&live.cancel, ytdlp(&self.0.http, &data_dir)).await else { return Ok(false) };
+        let Some(ytdlp) = unless_stopped(&live.cancel, ytdlp(&self.http(), &data_dir)).await else { return Ok(false) };
         let ytdlp = ytdlp?;
         if !tools.join(format!("deno{EXE}")).is_file() && ["deno", "node", "bun"].iter().all(|n| find_on_path(n).is_none()) {
             self.set_note(id, Some("getting Deno for yt-dlp (first time only)"));
         }
-        let Some(js) = unless_stopped(&live.cancel, js_runtime(&self.0.http, &data_dir)).await else { return Ok(false) };
+        let Some(js) = unless_stopped(&live.cancel, js_runtime(&self.http(), &data_dir)).await else { return Ok(false) };
         let merging = media.format.contains('+') || media.audio.is_some();
         let ffmpeg = if merging {
             if cfg!(windows) && !tools.join("ffmpeg").join("ffmpeg.exe").is_file() && find_on_path("ffmpeg").is_none() {
                 self.set_note(id, Some("getting ffmpeg (first time only)"));
             }
-            let Some(f) = unless_stopped(&live.cancel, ffmpeg(&self.0.http, &data_dir)).await else { return Ok(false) };
+            let Some(f) = unless_stopped(&live.cancel, ffmpeg(&self.http(), &data_dir)).await else { return Ok(false) };
             f.unwrap_or_else(|e| {
                 tracing::warn!("ffmpeg unavailable: {e:#}");
                 None
@@ -1056,6 +1095,10 @@ impl Manager {
             if let Some(p) = &cookies {
                 cmd.arg("--cookies").arg(p);
             }
+            let proxy = self.ytdlp_proxy(if beside { &data_dir } else { &work });
+            if let Some(p) = &proxy {
+                cmd.arg("--config-locations").arg(&p.0);
+            }
             // `--` so an address can never be read as an option. Always the page, never the
             // addresses of its video: those expire, and every run reads the page again for new ones.
             cmd.arg("--").arg(page.as_str());
@@ -1074,6 +1117,7 @@ impl Manager {
             if let Some(p) = &cookies {
                 let _ = std::fs::remove_file(p);
             }
+            drop(proxy);
             match ended? {
                 Ended::Stopped => return Ok(false),
                 Ended::Restart => {
@@ -1085,10 +1129,13 @@ impl Manager {
                     let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                     live.progress.store(len, Ordering::Relaxed);
                     if let Some(it) = self.0.db.lock().unwrap().items.get_mut(&id) {
-                        it.path = path;
+                        it.path = path.clone();
                         it.size = Some(len);
                         it.downloaded = len;
                     }
+                    // Marked as from the internet, as the browser would have marked it.
+                    let (url, referer) = (item.request.url.clone(), item.request.referer.clone());
+                    let _ = tokio::task::spawn_blocking(move || disk::mark_from_internet(&path, &url, referer.as_deref())).await;
                     return Ok(true);
                 }
                 Ended::Failed { stderr, code, progressed } => {
@@ -1143,9 +1190,19 @@ impl Manager {
         let mut whole: Option<u64> = None;
         let mut final_path: Option<PathBuf> = None;
         let mut last_save = Instant::now();
+        let mut last_space = Instant::now();
         let mut buf = Vec::new();
         let mut why_stopped = None;
         loop {
+            // reIDM doesn't see yt-dlp's writes, so it looks at the space now and then.
+            if last_space.elapsed() >= crate::SPACE_CHECK_EVERY {
+                last_space = Instant::now();
+                if let Some(it) = self.get(id) {
+                    if let Some(why) = self.short_of_space(&it).await {
+                        live.stop_for_space(why);
+                    }
+                }
+            }
             // Checked on every pass: yt-dlp reports progress several times a second, which
             // would keep resetting a timer that only looked when the output went quiet.
             if live.cancel.load(Ordering::SeqCst) {
@@ -1290,6 +1347,29 @@ mod tests {
         );
         assert_eq!(parse_progress("REIDM-PROGRESS NA NA NA NA 18"), None);
         assert_eq!(parse_progress("[download] 50%"), None);
+    }
+
+    #[test]
+    fn the_proxy_reaches_yt_dlp_in_a_private_file_not_on_its_command_line() {
+        assert_eq!(proxy_option("socks5h://me:p%40ss@proxy.lan:1080"), "--proxy \"socks5h://me:p%40ss@proxy.lan:1080\"\n");
+        assert_eq!(proxy_option(""), "--proxy \"\"\n", "yt-dlp's way of saying: no proxy");
+        let dir = std::env::temp_dir().join(format!("reidm-ytproxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = Manager::open(&dir, dir.join("dl"), 2).unwrap();
+        assert!(m.ytdlp_proxy(&dir).is_none(), "the system's proxy: yt-dlp finds it itself");
+        let proxy = crate::Proxy { mode: crate::ProxyMode::Manual, host: "proxy.lan".into(), port: 3128, username: Some("me".into()), password: Some("secret".into()), ..Default::default() };
+        m.update_settings(crate::SettingsPatch { proxy: Some(proxy), ..Default::default() }).unwrap();
+        let f = m.ytdlp_proxy(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&f.0).unwrap(), "--proxy \"http://me:secret@proxy.lan:3128\"\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&f.0).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let path = f.0.clone();
+        drop(f);
+        assert!(!path.exists(), "removed once yt-dlp is done");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

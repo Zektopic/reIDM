@@ -10,7 +10,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use reidm_core::{AddOptions, Category, Manager, Media, Request, SettingsPatch};
+use reidm_core::{AddOptions, Category, Manager, Media, Performance, Proxy, Request, SettingsPatch};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 
@@ -347,6 +347,7 @@ async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Re
         dir: b.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from),
         media: b.media,
         torrent: b.torrent.as_ref().map(|t| reidm_core::TorrentRequest { files: t.files.clone(), ..Default::default() }),
+        checksum: None,
     };
     let (mgr, later) = (app.mgr.clone(), b.later);
     match blocking(move || mgr.add_with(req, AddOptions { later, ..Default::default() })).await {
@@ -730,6 +731,7 @@ async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) ->
         dir: None,
         media: b.media,
         torrent: None,
+        checksum: None,
     };
 
     // A download waiting for a fresh address takes the next link that is the same file.
@@ -798,6 +800,7 @@ async fn ext_add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtBa
             dir: None,
             media: None,
             torrent: None,
+            checksum: None,
         })
         .collect();
     let (mgr, later) = (app.mgr.clone(), b.later);
@@ -869,6 +872,7 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
         filename: if single { b.filename.clone() } else { None },
         media: None,
         torrent: None,
+        checksum: None,
     }));
     let (mgr, later) = (app.mgr.clone(), b.later);
     let mut results: Vec<serde_json::Value> = blocking(move || mgr.add_many_with(reqs, AddOptions { later, ..Default::default() }))
@@ -987,6 +991,27 @@ struct SettingsBody {
     torrent_port: Option<u16>,
     #[serde(default)]
     torrent_dht: Option<bool>,
+    #[serde(default)]
+    performance: Option<Performance>,
+    #[serde(default)]
+    write_buffer_kib: Option<usize>,
+    #[serde(default)]
+    retries: Option<u32>,
+    #[serde(default)]
+    retry_wait_secs: Option<u64>,
+    #[serde(default)]
+    idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    connect_timeout_secs: Option<u64>,
+    /// The whole proxy. Without `password`, the one already set is kept; `""` removes it.
+    #[serde(default)]
+    proxy: Option<Proxy>,
+    #[serde(default)]
+    keep_awake: Option<bool>,
+    #[serde(default)]
+    keep_awake_seeding: Option<bool>,
+    #[serde(default)]
+    min_free_space_mib: Option<u64>,
 }
 
 /// The folders, as the window's Folders tab and the extension's dialog show them: each
@@ -1052,8 +1077,42 @@ async fn settings(State(app): State<App>, h: HeaderMap) -> Response {
         "upload_limit": s.upload_limit,
         "torrent_port": s.torrent_port,
         "torrent_dht": s.torrent_dht,
+        "performance": s.performance,
+        // What each preset sets, so the window shows the numbers without keeping its own copy.
+        "profiles": profiles_json(),
+        "write_buffer_kib": s.write_buffer_kib,
+        "retries": s.retries,
+        "retry_wait_secs": s.retry_wait_secs,
+        "idle_timeout_secs": s.idle_timeout_secs,
+        "connect_timeout_secs": s.connect_timeout_secs,
+        "proxy": proxy_json(&s.proxy),
+        "keep_awake": s.keep_awake,
+        "keep_awake_seeding": s.keep_awake_seeding,
+        "min_free_space_mib": s.min_free_space_mib,
     }))
     .into_response()
+}
+
+/// The proxy as the API shows it: the password is never sent back, only whether there is one.
+fn proxy_json(p: &Proxy) -> serde_json::Value {
+    let (shown, set) = p.without_password();
+    let mut v = serde_json::to_value(shown).unwrap_or_default();
+    v["password_set"] = set.into();
+    v
+}
+
+fn profiles_json() -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for p in [Performance::Light, Performance::Balanced, Performance::Maximum] {
+        if let Some(pr) = p.profile() {
+            let name = serde_json::to_value(p).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            m.insert(
+                name,
+                serde_json::json!({ "connections": pr.connections, "max_concurrent": pr.max_concurrent, "write_buffer_kib": pr.write_buffer_kib, "torrent_peers": pr.torrent_peers }),
+            );
+        }
+    }
+    m.into()
 }
 
 async fn set_settings(State(app): State<App>, h: HeaderMap, Json(b): Json<SettingsBody>) -> Response {
@@ -1075,6 +1134,16 @@ async fn set_settings(State(app): State<App>, h: HeaderMap, Json(b): Json<Settin
         upload_limit: b.upload_limit,
         torrent_port: b.torrent_port,
         torrent_dht: b.torrent_dht,
+        performance: b.performance,
+        write_buffer_kib: b.write_buffer_kib,
+        retries: b.retries,
+        retry_wait_secs: b.retry_wait_secs,
+        idle_timeout_secs: b.idle_timeout_secs,
+        connect_timeout_secs: b.connect_timeout_secs,
+        proxy: b.proxy,
+        keep_awake: b.keep_awake,
+        keep_awake_seeding: b.keep_awake_seeding,
+        min_free_space_mib: b.min_free_space_mib,
     };
     let mgr = app.mgr.clone();
     let (r, applied) = blocking(move || {
