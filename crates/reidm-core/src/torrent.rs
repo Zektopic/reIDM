@@ -684,9 +684,9 @@ async fn share_the_limit(me: std::sync::Weak<Inner>) {
         if let Some(before) = fetched {
             let fresh = now.saturating_sub(before);
             if fresh > 0 {
-                // Charged without waiting (the flag says "don't"): the HTTP connections do the
-                // waiting, as if they had fetched it themselves.
-                m.0.limiter.take(fresh, &AtomicBool::new(true)).await;
+                // Charged without waiting: the HTTP connections do the waiting, as if they had
+                // fetched it themselves.
+                m.0.limiter.charge(fresh);
             }
         }
         fetched = Some(now);
