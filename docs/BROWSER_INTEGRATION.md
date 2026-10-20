@@ -69,8 +69,15 @@ them from there — before anything is saved:
 2. It pauses the transfer and shows reIDM's **Download file info** dialog, as IDM does: the
    address, the file name (which you can change), the folder it will be saved in and its size.
    **Start download** carries on; **Download later** puts it in reIDM's scheduled queue;
-   **Cancel**, or closing the dialog, means nobody downloads it — neither reIDM nor the browser.
-   (*Don't ask again*, or Options › *Ask before each download*, turns the dialog off.)
+   **Cancel** (or Escape, or closing the dialog) means nobody downloads it — neither reIDM nor
+   the browser. Enter starts the download from the name field; on a focused button it does what
+   that button says. (*Don't ask again*, or Options › *Ask before each download*, turns the
+   dialog off; programs a page starts — `.exe`, `.msi`, `.dmg`, `.apk`, scripts — always ask,
+   with a warning, because reIDM saves them without the browser's download protection.)
+
+   Several downloads at once share **one** dialog window, which says how many more are waiting
+   and offers **Start all**. If nobody answers for 10 minutes, or the window closes before it
+   could show anything, the browser gets the download, as if reIDM weren't there.
 3. It asks reIDM to take the download, sending the final address, the referring page, your
    cookies for that site, and the browser's user agent.
 4. reIDM fetches the first byte to prove it can download it.
@@ -78,7 +85,10 @@ them from there — before anything is saved:
    download bubble, no *Save as* dialog, and no partial file.
 6. If reIDM can't take it — it isn't running and can't be started, the site refuses it, it's a
    one-time link the browser has already used — the download is resumed and released exactly as
-   it was. **The worst case is "the browser downloads it", never "nobody does".**
+   it was, and the dialog says so. **The worst case is "the browser downloads it", never "nobody
+   does".** That includes the extension itself stopping half-way (an update, a crash): every
+   download it holds is written down, and the next start of the extension hands each one back
+   to the browser.
 
 This holds for files of any size — even a few kilobytes — and with Chrome's *Ask where to save
 each file* turned on.
@@ -99,6 +109,7 @@ the popup's **Start reIDM** button tries the helper too.
 | Form submissions (`POST`) that return a file | reIDM would have to repeat the form, which the server would answer differently or not at all |
 | Files a page builds itself (`blob:`, `data:`) | they exist only inside the page |
 | Downloads started by other extensions | they asked for the browser's downloader specifically |
+| Downloads the browser flags as dangerous | the browser's own warning applies |
 | Alt+click | IDM's convention for "let the browser have this one" |
 | Sites on your never-capture list | your choice |
 | Incognito windows, unless enabled | reIDM keeps a history of what it downloaded |
@@ -110,13 +121,17 @@ Click the reIDM icon in the toolbar to see:
 
 - whether reIDM is running (with **Start reIDM** if it isn't);
 - **Take over browser downloads** — the master switch — and **Never on *this site***;
-- **Just now** — the last downloads handed over, and for any the browser kept, the reason;
-- **Media on this page** — video and audio the extension has seen, with type and size;
+- **Just now** — the last downloads handed over: *in reIDM*, *cancelled*, *browser kept it* (with
+  the reason), or *not downloaded*;
+- **Media on this page** — video and audio the extension has seen, with type and size.
+  **Download selected** hands over what you tick, each through the *Download file info* dialog;
+  it carries on after the popup closes;
 - **Grab resources…** — the resource grabber for the current page;
 - a box to paste any link.
 
-The badge counts the media found on the current tab. It briefly shows ✓ when a download was
-handed over, = when reIDM already had the file, and ! when the browser kept one.
+The badge counts the media found on the tab you are looking at — each tab its own. It briefly
+shows ✓ when a download was handed over, = when reIDM already had the file, and ! when the browser
+kept one.
 
 ## Right-click menu
 
@@ -125,7 +140,7 @@ handed over, = when reIDM already had the file, and ! when the browser kept one.
 | a link | **Download with reIDM** |
 | an image, video or audio | **Download this media with reIDM** |
 | selected text that is a URL | **Download the selected link with reIDM** |
-| the page | **Download all links on this page with reIDM** (up to 2,000, in one batch) |
+| the page | **Download all links on this page with reIDM…** — opens the grabber with the links to files (video, audio, documents, archives, programs) ticked; press *Download* to hand them over |
 | the page or a frame | **Grab resources from this page with reIDM…** |
 
 ## Video and audio
@@ -161,6 +176,9 @@ choice to [yt-dlp](https://github.com/yt-dlp/yt-dlp), which keeps up with YouTub
 - Your YouTube cookies go with it, so what you can watch signed in (age-checked videos, members'
   videos) you can download. They are written to a file only yt-dlp reads, and deleted when it
   finishes.
+- The list starts with **Best**: yt-dlp's own choice of the best picture and sound, which works
+  even before the page has shown its list for that video. After moving to another video, the list
+  is always that video's, never the previous one's.
 - The toolbar popup offers the video on a YouTube page as one row, in the best quality.
 
 **The first YouTube download takes a minute longer:** reIDM fetches what it needs, once, into
@@ -188,8 +206,9 @@ taken like any download, and reIDM adds the torrent in it rather than saving the
 
 Limits that come from the platforms, not from the extension:
 
-- Elsewhere, reIDM downloads the stream file you pick (a playlist or a single representation); it
-  does not merge HLS/DASH segments into one video file.
+- Elsewhere, an HLS quality goes to reIDM's yt-dlp, which fetches the pieces and joins them into
+  one video. A DASH representation is downloaded as the file it is — often picture without
+  sound.
 - DRM-protected streams (Widevine, PlayReady, FairPlay) can't be captured by any tool.
 
 ## The resource grabber
@@ -207,14 +226,16 @@ offers, from every frame:
 
 Filter by type (Video, Audio, Images, Documents, Archives, Programs, Streams, Subtitles), by text
 or `/regular expression/`, by site, and by minimum image size (icons and spacers are hidden by
-default; so are links to other web pages). **Get sizes** asks each server for its file size.
+default; so are links to other web pages). **Get sizes** asks each server for its file size —
+only for addresses that name a file, never for plain page links.
 Then **Download with reIDM** sends the selection in one batch, with the page as the referrer and
 your cookies for each site — or **Download later** to put it in the scheduled queue, **Copy
 addresses**, or **Export** as an IDM `.ef2` list.
 
 ## Capture rules
 
-Open the extension's **Options** (popup › Options, or right-click the toolbar icon).
+Open the extension's **Options** (popup › Options, or right-click the toolbar icon). The settings
+most people need are at the top; the rest are under **Advanced**.
 
 | Setting | Default | |
 |---|---|---|
@@ -224,20 +245,21 @@ Open the extension's **Options** (popup › Options, or right-click the toolbar 
 | File types | IDM's list | Space-separated extensions; `R0*` style wildcards work. |
 | Leave downloads smaller than (KB) | 0 | 0 takes everything. |
 | Never take downloads from these sites | — | One host per line; subdomains are included. |
-| Also in incognito windows | off | Also needs *Allow in incognito* on the extension's details page. |
-| Ask before each download | on | The *Download file info* dialog — name, folder, size; Start download, Download later, Cancel — for downloads the extension takes, clicked file links, the right-click menu and a video's qualities. Off: they start at once. |
+| Also in incognito windows | off | Also needs *Allow in incognito* on the extension's details page. While off, reIDM does nothing in incognito windows — the right-click menu, the popup and the grabber included. When on, the incognito window's own cookies are used, never the normal profile's. |
+| Ask before each download | on | The *Download file info* dialog — name, folder, size; Start download, Download later, Cancel — for downloads the extension takes, clicked file links, the right-click menu, the popup and a video's qualities. Off: they start at once, except programs a page starts by itself. |
 | Show a notification when reIDM takes a download | on | A desktop notification, *Downloading in reIDM*, with the file's name — the browser's own download bubble doesn't appear for what reIDM takes. Also when reIDM can't take one, and why. |
 | Start reIDM when it is not running | on | Uses the `com.zektopic.reidm` helper. |
 | reIDM port | 61002 | Only change it if you run reIDM on another port. |
-| Look for video and audio | on | Media detection, the popup's list and the quality picker. |
+| Look for video and audio | on | Media detection, the popup's list and the quality picker. Off: no page is watched — the extension's page hook isn't loaded and the video button doesn't appear. |
 | Never capture or list addresses starting with | `blob:`, `data:`, … | Address prefixes the extension ignores entirely. |
 
 ## Privacy and permissions
 
 The extension talks only to reIDM on your own machine (`127.0.0.1`). It reads cookies **only for
-the address being handed over, at the moment it is handed over**, and sends them only to reIDM,
-so reIDM can download what you, signed in, can. Nothing is collected, stored remotely or sent
-anywhere else.
+the address being handed over, at the moment it is handed over**, and sends their values — HttpOnly
+ones included — only to reIDM, so reIDM can download what you, signed in, can. Nothing is
+collected, stored remotely or sent anywhere else. The extension's own files can't be fetched by
+web pages, so a site can't tell that it is installed.
 
 | Permission | Used for |
 |---|---|
@@ -247,7 +269,8 @@ anywhere else.
 | `webRequest` | noticing media and form submissions (observation only) |
 | `contextMenus`, `tabs`, `scripting` | the right-click entries, the grabber, and per-tab media lists |
 | `storage`, `alarms` | settings, and a once-a-minute check that reIDM is running |
-| host access to all sites | reading media manifests, the grabber, and click interception |
+| `notifications` | *Downloading in reIDM*, and why reIDM couldn't take a download |
+| host access to all sites | reading media manifests, the grabber, and click interception; with `cookies`, reading the cookies of the one address being handed over. Taking over the browser's downloads needs no host access itself. |
 
 ## How it is secured
 
