@@ -95,12 +95,26 @@ Properties:
 | *Requested format is not available* | that format isn't offered any more; pick another quality. The list's choices fall back to the nearest quality by themselves, so this comes from a hand-written `reidm add --video` format |
 | *Sign in to confirm you're not a bot* | open the video in the browser while signed in to YouTube and start it from there: your cookies go with it |
 | *…need ffmpeg to be joined* | install ffmpeg (`sudo apt install ffmpeg`, `brew install ffmpeg`), or pick a format with sound (360p and below usually have it). On Windows reIDM fetches ffmpeg itself |
-| *could not get yt-dlp* | reIDM couldn't reach GitHub to fetch it. Check the connection, or install yt-dlp yourself and put it on the `PATH` |
+| *could not get yt-dlp* | reIDM couldn't reach GitHub to fetch it. Check the connection, or install yt-dlp yourself and put it on the `PATH`. After a failure reIDM waits two minutes before trying again, so a queue of videos doesn't each wait on the same failed connection |
 | *Video unavailable*, *Private video* | the video can't be watched from your account or country, so it can't be downloaded either |
 
 When YouTube changes something, yt-dlp usually follows within days. reIDM checks for a newer
-yt-dlp once a day; to force it, delete the `tools` folder in the
-[data folder](USER_GUIDE.md#where-reidm-keeps-things).
+yt-dlp once a day (an hour after a check that failed); to force it, delete the `tools` folder in
+the [data folder](USER_GUIDE.md#where-reidm-keeps-things).
+
+A long video download can outlive the addresses YouTube gave for it (they expire after about six
+hours), or lose its connection partway. reIDM then runs yt-dlp again by itself: it reads the
+video's page afresh for new addresses and carries on from the pieces it has. It keeps doing so as
+long as each run gets further than the last; a video refused from the start fails at once with
+yt-dlp's reason.
+
+**A torrent fails with *a file this torrent would create already exists*.** reIDM never writes
+over a file it didn't create. That happens only if something else put a file there in the moment
+between reIDM choosing the place and the torrent starting: move it away and resume.
+
+**A torrent fails with *this torrent is already in the list*.** The same torrent was added twice
+under different addresses (a magnet link and a `.torrent` from another site, say). Keep one; two
+would share one set of files, and removing either with its files would delete the other's.
 
 **A torrent stays at *Looking for peers*.** No one is sharing it right now, or none can be
 reached: a magnet link needs the DHT (Options › Torrents), and a firewall may be blocking

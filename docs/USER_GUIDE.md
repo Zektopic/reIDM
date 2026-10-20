@@ -162,7 +162,11 @@ reIDM downloads torrents, and shares them back — *seeding* — the way a torre
 
 A torrent sits in the list like any download: it takes a turn in *Downloads at the same time*,
 stops and resumes where it was (even across restarts), and is filed by what it holds (a film in
-`Video`, an `.iso` in `Programs`; a torrent of many files is a folder). The status column says
+`Video`, an `.iso` in `Programs`; a torrent of many files is a folder of its name). A torrent
+never writes over a file that is already there: if `debian.iso` or the folder `Album` already
+exists, the new torrent goes into `debian/debian.iso` or `Album (1)` instead. The same torrent
+can't be in the list twice, whether its link is a magnet (in either form of its hash) or a
+`.torrent` from another site. The status column says
 *Downloading · 25 peers*; *Transfer rate* shows the upload beside the download (*↑ 120 KB/s*).
 Properties shows its info hash, what it has uploaded, its share ratio, its peers and — for a
 torrent of several files — each file's progress.
@@ -205,6 +209,14 @@ at once; the rest wait their turn. That limit applies to all downloads, not just
 total download speed — shared across every download and connection — and applies immediately to
 transfers already running. Turning it off keeps the value for next time. A single download can
 also have its own, lower limit in its Properties.
+
+Videos and torrents are fetched by other engines (yt-dlp, and the torrent engine), which can't
+draw from reIDM's shared allowance connection by connection. Each gets an even share of the limit
+— with four downloads running, a video may use a quarter of it — and what they fetch is counted
+against the rest, so together they stay close to the limit. Two differences remain: a video keeps
+the share it started with until the limit itself changes (a new limit restarts its yt-dlp, which
+carries on where it was, within a few seconds), and the total can briefly run over the limit
+while downloads start and stop.
 
 From a terminal: `reidm limit 500K`, `reidm limit 2M`, `reidm limit off`.
 
