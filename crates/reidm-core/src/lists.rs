@@ -138,6 +138,10 @@ pub enum Sequence {
 /// not a million queued downloads.
 pub const MAX_PATTERN_ITEMS: usize = 10_000;
 
+/// The widest zero-padding a number may have: the largest number has 20 digits, so wider only
+/// costs memory.
+pub const MAX_PATTERN_WIDTH: usize = 20;
+
 /// Expand a pattern with exactly one `*`.
 pub fn expand_pattern(pattern: &str, seq: &Sequence) -> Result<Vec<String>> {
     let pattern = pattern.trim();
@@ -149,9 +153,15 @@ pub fn expand_pattern(pattern: &str, seq: &Sequence) -> Result<Vec<String>> {
     let items: Vec<String> = match *seq {
         Sequence::Numbers { from, to, width } => {
             let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
-            let n = hi - lo + 1;
-            if n > MAX_PATTERN_ITEMS as u64 {
-                bail!("{n} addresses is more than the {MAX_PATTERN_ITEMS} a pattern may produce");
+            // Checked: `0` to `u64::MAX` is one more than a u64 holds, and an unchecked count
+            // wrapped to 0, passed the size check and then never finished counting.
+            let n = (hi - lo).checked_add(1);
+            if n.is_none_or(|n| n > MAX_PATTERN_ITEMS as u64) {
+                let n = n.map_or_else(|| "18446744073709551616".to_string(), |n| n.to_string());
+                bail!("{lo} to {hi} is {n} addresses, more than the {MAX_PATTERN_ITEMS} a pattern may produce; use a smaller range");
+            }
+            if width > MAX_PATTERN_WIDTH {
+                bail!("numbers can be padded to at most {MAX_PATTERN_WIDTH} digits (asked for {width})");
             }
             (lo..=hi).map(|i| format!("{i:0width$}", width = width.max(1))).collect()
         }
@@ -247,5 +257,17 @@ mod tests {
         assert!(expand_pattern("https://x/a.jpg", &Sequence::Numbers { from: 1, to: 2, width: 0 }).is_err());
         assert!(expand_pattern("https://x/*/*.jpg", &Sequence::Numbers { from: 1, to: 2, width: 0 }).is_err());
         assert!(expand_pattern("https://x/*.jpg", &Sequence::Numbers { from: 0, to: 1_000_000, width: 0 }).is_err());
+    }
+
+    #[test]
+    fn huge_ranges_and_widths_are_refused_at_once() {
+        // The whole of u64 used to wrap the count to zero and then expand without end.
+        let e = expand_pattern("https://x/*", &Sequence::Numbers { from: 0, to: u64::MAX, width: 0 }).unwrap_err();
+        assert!(e.to_string().contains("more than the 10000"), "{e}");
+        assert!(expand_pattern("https://x/*", &Sequence::Numbers { from: u64::MAX, to: 1, width: 0 }).is_err());
+        assert!(expand_pattern("https://x/*", &Sequence::Numbers { from: 1, to: 2, width: usize::MAX }).is_err());
+        // The boundaries themselves still work.
+        assert_eq!(expand_pattern("https://x/*", &Sequence::Numbers { from: u64::MAX, to: u64::MAX, width: 20 }).unwrap(), ["https://x/18446744073709551615"]);
+        assert_eq!(expand_pattern("https://x/*", &Sequence::Numbers { from: 1, to: 10_000, width: 0 }).unwrap().len(), 10_000);
     }
 }
