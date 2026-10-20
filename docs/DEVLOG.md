@@ -9,6 +9,37 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-20 — Torrents, videos and tools after the review (0.8.0)
+
+**Context.** The engine review's torrent/video/tool findings (reviews/2026-10/engine.md M5–M7,
+M10, L3, L9, L10, L13), plus one it missed. Checking librqbit 9.0.1 showed that with an explicit
+`output_folder` it does **not** add the torrent's name as a subfolder (`session.rs:1286`), so 0.7.0
+wrote a multi-file torrent's files loose into the category folder, over any same-named file, while
+the list pointed at a folder that didn't exist.
+**Decisions.**
+- *Placement before creation.* Describe the torrent first (kept `.torrent`, a capped fetch, or peers
+  for a magnet), choose a free place under the list lock, record it (`TorrentStatus.folder`) and save
+  — only then let librqbit create files, with `overwrite: false` unless reIDM is carrying on its own
+  files. Rejected: renaming single files (needs a custom librqbit storage); refusing outright
+  ("explain, don't just fail" when a safe place exists). 0.7.0 torrents keep their layout.
+- *Videos with holes.* yt-dlp's default skips a piece it can't fetch and reports success; reIDM now
+  passes `--abort-on-unavailable-fragments` and re-runs yt-dlp (re-reading the page, so fresh
+  addresses) up to 20 times while each run makes progress.
+- *Speed limit.* yt-dlp gets `--limit-rate` = its share of the global limit, restarted (≤ every 5 s)
+  when the limit changes; the torrent session's limit is its share, updated every 500 ms; both are
+  charged to the shared allowance. Known gap: a running video keeps the share it started with when
+  other downloads start or stop — restarting on every queue change would re-extract constantly.
+- *Tools.* Streamed to disk with SHA-256 computed on the way; one lock per tool, taken after a
+  lock-free "installed" check; 30 s answer/stall timeouts; failures remembered in memory (update
+  check: 1 h, missing tool: 2 min) — a restart is a fair time to try again.
+- *Bodies.* `.torrent` capped at 10 MiB, grabber pages 8 MiB, enforced while reading.
+**Evidence.** 10 new integration tests (tests/torrent.rs, tests/media.rs) and 11 unit tests; the
+lib, torrent and media tests passed 8 runs in a row. One honest gap: the restart-vs-delete test also
+passes without the fix on this machine (the race window is small), so it guards behaviour, not the
+race.
+**Follow-ups.** Scheduler across a daylight-saving change (L14) belongs in `spawn_scheduler`: hold
+`prev` when the clock goes back by less than 2 h.
+
 ## 2026-10-20 — Four reviews, and the plan they set (0.8.0, in progress)
 
 **Context.** Before adding more features, the code was reviewed in four independent passes:
