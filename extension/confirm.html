@@ -24,31 +24,42 @@
   input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   .hint { grid-column: 2; color: var(--mut); font-size: 11.5px; margin-top: -4px; }
   .err { grid-column: 1 / -1; color: var(--err); min-height: 1em; }
+  .warn { grid-column: 1 / -1; color: var(--err); font-weight: 600; }
+  .waiting { color: var(--mut); font-size: 12px; margin-left: auto; }
+  [hidden] { display: none !important; }
   footer { display: flex; align-items: center; gap: 8px; padding: 10px 16px 14px; }
   footer label { display: flex; align-items: center; gap: 6px; color: var(--mut); font-size: 12px; margin-right: auto; }
   button { font: inherit; padding: 7px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--fg); cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button:disabled { opacity: .5; cursor: default; }
+  .ask { display: flex; gap: 8px; }
 </style>
 </head>
 <body>
 <header>
   <img src="icons/48.png" alt="">
   <span class="name">Download file info</span>
+  <span class="waiting" id="waiting" hidden></span>
 </header>
 <main>
   <span class="k">Address</span><span class="v" id="url">—</span>
+  <span class="k" id="fromK" hidden>From</span><span class="v" id="from" hidden></span>
   <span class="k">Save as</span><input type="text" id="name" spellcheck="false" autocomplete="off">
   <span class="k">Folder</span><span class="v" id="dir">reIDM's download folder</span>
   <span class="hint">Change it in reIDM's Options.</span>
   <span class="k">Size</span><span class="v" id="size">checking…</span>
-  <span class="err" id="err"></span>
+  <span class="warn" id="program" hidden>This is a program. Run it only if you trust the site it came from.</span>
+  <span class="err" id="err" role="alert"></span>
 </main>
 <footer>
-  <label><input type="checkbox" id="noAsk"> Don't ask again</label>
-  <button id="cancel">Cancel</button>
-  <button id="later">Download later</button>
-  <button id="start" class="primary">Start download</button>
+  <label id="noAskLabel"><input type="checkbox" id="noAsk"> Don't ask again <span style="opacity:.8">(turn back on in Options)</span></label>
+  <span class="ask">
+    <button id="cancel">Cancel</button>
+    <button id="later" title="Adds it to reIDM's queue; it starts on reIDM's schedule">Download later</button>
+    <button id="all" hidden>Start all</button>
+    <button id="start" class="primary">Start download</button>
+  </span>
+  <button id="close" class="primary" hidden>Close</button>
 </footer>
 <script src="confirm.js"></script>
 </body>

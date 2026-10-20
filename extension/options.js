@@ -1,25 +1,8 @@
 // reIDM Integration — options page.
 //
-// The defaults must match `DEFAULTS` in service-worker.js.
+// The defaults come from defaults.js, which the service worker and content scripts share.
 
-const DEFAULTS = {
-  port: 61002,
-  capture: true,
-  interceptClicks: true,
-  captureAll: true,
-  fileTypes:
-    '3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 DEB DMG EXE FLAC GZ GZIP IMG ISO LZH M4A M4V MKV MOV MP3 MP4 ' +
-    'MPA MPE MPEG MPG MSI MSU OGG OGV PDF PKG PLJ PPS PPT QT RA RAR RM RMVB RPM SEA SIT SITX TAR TGZ TIF TIFF ' +
-    'WAV WEBM WMA WMV XZ Z ZIP ZST',
-  minSizeKB: 0,
-  skipHosts: [],
-  captureIncognito: false,
-  launchReidm: true,
-  notifications: true,
-  askBeforeDownload: true,
-  sniffMedia: true,
-  ignore: ['blob:', 'data:', 'chrome:', 'chrome-extension://', 'about:', 'file://', 'filesystem:'],
-};
+const DEFAULTS = globalThis.REIDM_DEFAULTS;
 
 const $ = (id) => document.getElementById(id);
 const lines = (id) =>
@@ -49,18 +32,33 @@ function syncEnabled() {
   for (const id of ['interceptClicks', 'captureAll', 'fileTypes', 'minSizeKB', 'skipHosts', 'captureIncognito']) $(id).disabled = !on;
 }
 
-(async () => show({ ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) }))();
+/** Whether the user has edited something not yet saved. Until then, a change made elsewhere
+ *  (the popup's switches) is shown here, so Save cannot quietly undo it. */
+let dirty = false;
+const load = async () => show({ ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) });
+load();
+document.addEventListener('input', (e) => {
+  if (e.target.id !== 'port') dirty = true;
+});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'sync' && !dirty) load();
+});
+
+const clampPort = (v) => {
+  const n = Math.round(Number(v));
+  return n >= 1 && n <= 65535 ? n : null;
+};
 
 $('capture').addEventListener('change', syncEnabled);
 
 $('test').addEventListener('click', async () => {
-  const port = Number($('port').value) || DEFAULTS.port;
+  const port = clampPort($('port').value);
+  if (!port) return setStatus('a port is a number from 1 to 65535', 'err');
   setStatus('checking…');
   // Through the service worker: a fetch here carries this page's origin, which reIDM would
-  // rightly refuse.
-  await chrome.storage.sync.set({ port });
+  // rightly refuse. The port is tried, not saved: Save does that.
   const r = await new Promise((resolve) =>
-    chrome.runtime.sendMessage({ type: 'ping' }, (x) => {
+    chrome.runtime.sendMessage({ type: 'ping', port }, (x) => {
       void chrome.runtime.lastError;
       resolve(x);
     }),
@@ -76,14 +74,16 @@ $('save').addEventListener('click', async () => {
     .map((t) => t.replace(/^\./, ''))
     .filter(Boolean)
     .join(' ');
+  const port = clampPort($('port').value);
+  if (!port) return setStatus('a port is a number from 1 to 65535', 'err');
   await chrome.storage.sync.set({
-    port: Number($('port').value) || DEFAULTS.port,
+    port,
     capture: $('capture').checked,
     interceptClicks: $('interceptClicks').checked,
     captureAll: $('captureAll').checked,
     fileTypes,
     minSizeKB: Math.max(0, Number($('minSizeKB').value) || 0),
-    skipHosts: lines('skipHosts').map((h) => h.toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '')),
+    skipHosts: lines('skipHosts').map((h) => h.toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/:\d+$/, '')).filter(Boolean),
     captureIncognito: $('captureIncognito').checked,
     launchReidm: $('launchReidm').checked,
     notifications: $('notifications').checked,
@@ -91,14 +91,18 @@ $('save').addEventListener('click', async () => {
     sniffMedia: $('sniffMedia').checked,
     ignore: lines('ignore'),
   });
-  $('fileTypes').value = fileTypes;
+  dirty = false;
+  load();
   $('saved').textContent = 'saved';
   setTimeout(() => ($('saved').textContent = ''), 2000);
 });
 
 $('reset').addEventListener('click', async () => {
-  await chrome.storage.sync.set(DEFAULTS);
-  show(DEFAULTS);
+  if (!confirm('Put every setting back to its default? Your list of sites to leave alone is kept.')) return;
+  const { skipHosts, ...rest } = DEFAULTS;
+  await chrome.storage.sync.set(rest);
+  dirty = false;
+  await load();
   $('saved').textContent = 'defaults restored';
   setTimeout(() => ($('saved').textContent = ''), 2000);
 });
