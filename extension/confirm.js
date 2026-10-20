@@ -3,6 +3,10 @@
 // waiting"). The service worker opened it and waits for each answer, which goes back over a
 // port; the port also keeps the worker alive while the user decides.
 //
+// While reIDM waits for a new address for one of its downloads, a request first asks "Use this
+// link to refresh <name>?" (Refresh / New download / Cancel); *New download* turns it into the
+// usual form, or starts it at once when the user has the dialog off.
+//
 // States: `asking` (the buttons work), `sending` (an answer is being handed to reIDM), `result`
 // (reIDM refused, or nobody answered in time: only Close/Next), `gone` (the worker this dialog
 // belonged to stopped: only Close).
@@ -13,6 +17,10 @@ let current = null; // the id of the download shown
 let state = 'idle';
 let fallback = '';
 let waiting = 0;
+/** `offer`: asking whether to refresh; `form`: the usual new-download form. */
+let mode = 'form';
+/** Whether *New download* shows the form (the dialog is on) or starts at once (it is off). */
+let askNew = true;
 
 function human(n) {
   if (!(n > 0)) return null;
@@ -28,9 +36,15 @@ function human(n) {
 function setState(next) {
   state = next;
   const asking = next === 'asking';
-  document.querySelector('.ask').hidden = !(asking || next === 'sending');
-  $('noAskLabel').hidden = !asking;
-  for (const b of ['start', 'later', 'all', 'cancel']) $(b).disabled = !asking;
+  const offering = mode === 'offer';
+  document.body.classList.toggle('refreshing', offering);
+  $('offerQ').hidden = !offering;
+  $('title').textContent = offering ? 'Refresh download address' : 'Download file info';
+  document.title = `${$('title').textContent} — reIDM`;
+  document.querySelector('.ask').hidden = offering || !(asking || next === 'sending');
+  $('offer').hidden = !offering || !(asking || next === 'sending');
+  $('noAskLabel').hidden = !asking || offering;
+  for (const b of ['start', 'later', 'all', 'cancel', 'offerRefresh', 'offerNew', 'offerCancel']) $(b).disabled = !asking;
   $('close').hidden = asking || next === 'sending';
   $('close').textContent = next === 'result' && waiting ? 'Next' : 'Close';
   $('all').hidden = !asking || !waiting;
@@ -43,6 +57,12 @@ function showWaiting(n) {
   $('waiting').textContent = `${waiting} more waiting`;
   $('all').textContent = `Start all (${waiting + 1})`;
   $('all').hidden = state !== 'asking' || !waiting;
+}
+
+/** Focus what Enter should do: the name field in the form, *Refresh* in the offer. */
+function focusFirst() {
+  if (mode === 'offer') $('offerRefresh').focus();
+  else selectBaseName();
 }
 
 /** Select the name without its extension, as IDM does: the part one usually changes. */
@@ -68,9 +88,12 @@ port.onMessage.addListener((m) => {
     $('size').textContent = human(m.size) || (m.probing ? 'checking…' : m.sizeNote || 'unknown');
     $('program').hidden = !m.program;
     $('err').textContent = '';
+    mode = m.refresh ? 'offer' : 'form';
+    askNew = m.ask !== false;
+    $('offerName').textContent = (m.refresh && m.refresh.name) || '';
     showWaiting(m.waiting);
     setState('asking');
-    selectBaseName();
+    focusFirst();
   } else if (m.type === 'size' && m.id === current) {
     $('size').textContent = human(m.size) || m.note || 'unknown';
     if (m.filename && !$('name').dataset.edited) {
@@ -120,7 +143,7 @@ function answer(action) {
   $('err').textContent = '';
   const filename = $('name').value.trim();
   if (action === 'all') port.postMessage({ type: 'answer-all', filename });
-  else port.postMessage({ type: 'answer', id: current, action, filename, noAsk: $('noAsk').checked });
+  else port.postMessage({ type: 'answer', id: current, action, filename, noAsk: mode === 'form' && $('noAsk').checked });
   // Cancel moves straight on; Start and Later wait for reIDM's answer, which brings the next
   // download, a refusal to show, or the window's close.
   setState(action === 'cancel' ? 'idle' : 'sending');
@@ -130,6 +153,15 @@ $('start').addEventListener('click', () => answer('start'));
 $('later').addEventListener('click', () => answer('later'));
 $('all').addEventListener('click', () => answer('all'));
 $('cancel').addEventListener('click', () => answer('cancel'));
+$('offerRefresh').addEventListener('click', () => answer('refresh'));
+$('offerCancel').addEventListener('click', () => answer('cancel'));
+$('offerNew').addEventListener('click', () => {
+  if (state !== 'asking') return;
+  if (!askNew) return answer('start');
+  mode = 'form';
+  setState('asking');
+  focusFirst();
+});
 $('close').addEventListener('click', () => {
   if (state === 'result') {
     port.postMessage({ type: 'ack', id: current });
@@ -141,7 +173,7 @@ document.addEventListener('keydown', (e) => {
   // must do what that button says, which the browser already does by clicking it.
   if (e.key === 'Enter' && (e.target === $('name') || e.target === document.body)) {
     e.preventDefault();
-    if (state === 'asking') answer('start');
+    if (state === 'asking') answer(mode === 'offer' ? 'refresh' : 'start');
     else if (!$('close').hidden) $('close').click();
   } else if (e.key === 'Escape') {
     e.preventDefault();

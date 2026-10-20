@@ -33,20 +33,27 @@
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button:disabled { opacity: .5; cursor: default; }
   .ask { display: flex; gap: 8px; }
+  .offer { grid-column: 1 / -1; margin: 0 0 2px; padding: 9px 11px; border-radius: 8px; background: var(--soft); }
+  .offer b { overflow-wrap: anywhere; }
+  .offer .sub { display: block; color: var(--mut); font-size: 12px; margin-top: 3px; }
+  /* Offering a refresh: the name and folder are the waiting download's own, so not asked. */
+  body.refreshing .nr { display: none; }
 </style>
 </head>
 <body>
 <header>
   <img src="icons/48.png" alt="">
-  <span class="name">Download file info</span>
+  <span class="name" id="title">Download file info</span>
   <span class="waiting" id="waiting" hidden></span>
 </header>
 <main>
+  <p class="offer" id="offerQ" hidden>Use this link to refresh <b id="offerName"></b>?
+    <span class="sub">reIDM checks that it is the same file, then carries on from where it stopped. <i>New download</i> adds it as a download of its own.</span></p>
   <span class="k">Address</span><span class="v" id="url">—</span>
   <span class="k" id="fromK" hidden>From</span><span class="v" id="from" hidden></span>
-  <span class="k">Save as</span><input type="text" id="name" spellcheck="false" autocomplete="off">
-  <span class="k">Folder</span><span class="v" id="dir">reIDM's download folder</span>
-  <span class="hint">Change it in reIDM's Options.</span>
+  <span class="k nr">Save as</span><input class="nr" type="text" id="name" spellcheck="false" autocomplete="off">
+  <span class="k nr">Folder</span><span class="v nr" id="dir">reIDM's download folder</span>
+  <span class="hint nr">Change it in reIDM's Options.</span>
   <span class="k">Size</span><span class="v" id="size">checking…</span>
   <span class="warn" id="program" hidden>This is a program. Run it only if you trust the site it came from.</span>
   <span class="err" id="err" role="alert"></span>
@@ -58,6 +65,11 @@
     <button id="later" title="Adds it to reIDM's queue; it starts on reIDM's schedule">Download later</button>
     <button id="all" hidden>Start all</button>
     <button id="start" class="primary">Start download</button>
+  </span>
+  <span class="ask" id="offer" hidden>
+    <button id="offerCancel">Cancel</button>
+    <button id="offerNew" title="Adds this link as a download of its own; the waiting download keeps waiting">New download</button>
+    <button id="offerRefresh" class="primary">Refresh</button>
   </span>
   <button id="close" class="primary" hidden>Close</button>
 </footer>
