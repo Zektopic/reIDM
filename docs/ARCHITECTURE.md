@@ -144,7 +144,15 @@ when it's done. When nothing unclaimed is left, a connection splits the range wi
 remaining bytes — taking its second half, if that half is at least 256 KiB — so fast
 connections keep working until the end instead of waiting for the slowest one. A server that
 answers extra connections with `429`/`503` just ends up with fewer: the refused connection hands
-its range back to the others.
+its range back to the others, and every 30 seconds the download tries to get back to its full
+number of connections. A connection that breaks off after making progress carries on from where
+it got to without using up a retry; only failures that get nowhere count towards the five.
+
+A connection collects what it receives into a 256 KiB buffer (or a second's worth, when it is
+slow) and writes that at its offset with a positional write on the blocking pool; the bytes count
+as downloaded only once the write has returned. A request that gets no answer within 30 seconds,
+or a body that goes quiet for 60, is retried, and Pause wakes a connection whatever it is waiting
+on — the server, or the speed limit.
 
 **Correctness checks.** Range requests carry `If-Range` with the strong `ETag` from the probe,
 so a server whose file has changed answers with the whole new file (`200`) instead of the range.
@@ -170,24 +178,45 @@ while asleep starts the queue on waking, unless the stop time also passed.
 
 | File (in the data folder) | Written |
 |---|---|
-| `downloads.json` | the list, including each range's progress: every 3 seconds while transferring, and on every change |
-| `settings.json` | on every settings change |
+| `downloads.json` | the list, including each range's progress: within 2 seconds of a change, at once for adds, removals and status changes (mode 0600: it holds cookies) |
+| `downloads.json.bak` | the previous copy of the list, kept by each save |
+| `settings.json` | on every settings change (mode 0600, with a `.bak` as well) |
 | `api-token` | at service start (mode 0600); removed at shutdown |
 | `browser-extension/` | synced from the bundled extension at service start |
 | `gui.json` | the window's preferences |
 
-Files are written to a temporary name and renamed, so a crash leaves the old version rather than
-half a file. The data being downloaded goes to `<id>-<file>.reidm` in the temporary folder
-(`parts/` in the data folder unless set), pre-allocated to full size when the size is known, and
-moved to its folder when complete — a rename, or a copy and delete across drives. The folder is
+The list lives in memory behind one lock (`store.rs`), its items copy-on-write. Whatever changes
+it through that lock moves the revision (`Manager::revision`, for clients polling for changes) on
+and schedules a save; one thread does the saving. It copies the list's pointers under the lock and
+serialises and writes outside it, so a list of thousands never holds up the service while it is
+written. A save goes to a temporary file, which is flushed to the disk, then renamed over the old
+one; the old one becomes `.bak` (a hard link), and the folder is flushed too. On start, a damaged
+list or settings file is kept aside as `<name>.corrupt-<time>` and its `.bak` used; with neither,
+reIDM starts empty and says so (`Manager::warnings`). A file that exists but can't be read is an
+error instead, since saving an empty list over it would destroy it. `Manager::flush` writes
+what is pending at once and waits for it, for shutting down.
+
+The data being downloaded goes to `<id>-<file>.reidm` in the temporary folder (`parts/` in the
+data folder unless set); its location is recorded in the list, so changing the temporary folder
+does not orphan it. It is given its full size when the size is known: on Linux the space is
+reserved (`fallocate`), so a disk too small for it says so at once; on Windows the file is made
+sparse first, or NTFS would fill everything below the first write with zeros before that write
+returns. When complete it is moved to its folder with a rename that refuses to replace anything:
+a file that has appeared there since (the browser's own copy, one the user saved) is kept, and the
+download takes the next free name. Across drives it is copied beside its destination under a
+temporary name first. Only *Redownload* of a finished download replaces that download's own file.
+The finished file is marked as downloaded from the internet — `Zone.Identifier` on Windows,
+`com.apple.quarantine` on macOS — as the browser would have marked it. The folder is
 its type's (`category.rs`: Compressed, Documents, Images, Music, Programs, Video, else the
 download folder), chosen from the likely name when added and again from the server's name after
 the probe. A part file already beside its final file (from before 0.6) is used where it is.
 
-On start, downloads that were running are marked paused. Before resuming one, the engine checks
-that the part file holds at least as much as the list says was written; if not — the file was
-deleted, or the list was saved after data that never reached the disk — it starts that download
-over rather than leave zeros in the middle of the file.
+On start, downloads that were running are marked paused. Progress reaches the list only through a
+checkpoint (every 3 seconds, and when a run ends), which reads the ranges, flushes the part file to
+the disk, and only then records them: every byte the list counts was written before that flush.
+So a crash, a power cut or a full disk can cost the last few seconds, never a hole in the file.
+Before resuming, the engine still checks that the part file is at least as long as the progress
+recorded; if not — the part file was deleted or truncated — it starts that download over.
 
 ## Security model
 
@@ -230,8 +259,10 @@ What this does and doesn't protect against:
 | Path | |
 |---|---|
 | `crates/reidm-proto` | the IDM wire format: message encoding and the native-messaging framing |
-| `crates/reidm-core/src/lib.rs` | the engine: `Manager`, probing, segmentation, retries, persistence |
-| `crates/reidm-core/src/limiter.rs` | the token-bucket speed limiter |
+| `crates/reidm-core/src/lib.rs` | the engine: `Manager`, probing, segmentation, retries |
+| `crates/reidm-core/src/store.rs` | the list in memory, its saver thread, and crash-safe loading and saving |
+| `crates/reidm-core/src/disk.rs` | positional writes, preallocation, the no-replace rename, Mark-of-the-Web |
+| `crates/reidm-core/src/limiter.rs` | the token-bucket speed limiter, shared by every download (videos and torrents charge their bytes to it) |
 | `crates/reidm-core/src/schedule.rs` | the scheduler's time windows |
 | `crates/reidm-core/src/lists.rs` | `.ef2` import/export, batch patterns |
 | `crates/reidm-core/src/torrent.rs` | torrents through [librqbit](https://github.com/ikatson/rqbit): one session for all, matched to the list by info hash; downloading, seeding to the share ratio, and the session's records in `torrents/` |
