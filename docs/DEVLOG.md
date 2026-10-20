@@ -9,6 +9,155 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-20 — Engine: durable progress, a crash-safe list, and the HTTP engine's failure cases (0.8.0)
+
+**Context.** The October engine review (reviews/2026-10/engine.md C1, H1–H7, M1–M4, M8, M9, M11–M13,
+L1, L2, L4–L6, L11, L12, L14) and the app review's C2, H7, H9, M4, M6, M10 and L9. The worst of them
+(C1): tokio's `File::write_all` returns before the write happens, so `segment.done` ran ahead of the
+disk, and the "is the data on disk?" length check could never fire after `set_len`. A full disk or
+a crash could leave a resumed download "complete" with zeros inside it. Next worst: `downloads.json`
+was rewritten whole (pretty-printed) under the list's lock on a runtime thread, after every add,
+with no fsync, and a damaged file either stopped the service or was silently treated as empty.
+
+**Decisions.**
+- *Count only what is written; record only what is durable.* Each connection collects 256 KiB (or
+  1 s, whichever comes first) and writes it with a positional write (`write_all_at` /
+  `seek_write`) on the blocking pool; `done` advances only after the write returns `Ok`, and a
+  failed write releases its claim. A checkpoint reads the ranges, `sync_data`s the part file, and
+  only then copies them into the list, so every counted byte was written before a flush that
+  succeeded. Batching also fixes M8: one blocking-pool hop per 256 KiB instead of per 8–16 KiB
+  network read, one plan lock per read instead of two, and one idle timer reset instead of a new
+  timeout per read. The length check stays, for a part file deleted or truncated between runs.
+  Memory: 256 KiB × connections (2 MiB for a default 8-connection download).
+- *The list: copy-on-write items, a guard that notices changes, one saver thread.* `items` holds
+  `Shared<Item>` (an `Arc` with `make_mut`), so a save copies pointers under the lock and
+  serialises (compact JSON) and writes outside it. The lock returns a `DbGuard` whose `DerefMut`
+  marks it touched; on drop it bumps the revision and asks for a save. That keeps
+  `self.0.db.lock().unwrap().items.get_mut(&id)` working unchanged in media.rs and torrent.rs, and
+  means no change can be forgotten by code that doesn't call `save()`. Saves are debounced to 2 s,
+  or immediate (`save_now`) for adds, removals and status changes; the browser hand-off
+  (`add_checked`) waits until the new download is on disk before answering, since the browser
+  drops its own copy when it hears back.
+- *Crash-safe files.* Write a temporary file with `create_new` (mode 0600 on Unix: it holds
+  cookies), `sync_all`, hard-link the current file to `.bak` (copy where links don't work), rename
+  over, fsync the folder (Unix). On load: a parse failure (including an empty file) is moved aside
+  as `.corrupt-<time>` and the `.bak` used, else start empty with a warning; a missing main file
+  with a `.bak` restores the backup; a file that exists but can't be read uses the `.bak` or
+  refuses to start with an explanation, never an empty list saved over it. Settings are the same.
+  Problems are kept for `Manager::warnings()`.
+- *An address index.* `Db` keeps `url_key → ids` (not serialised, rebuilt on load); addresses change
+  only through `Db::set_url`. `add_many_with` prepares every request first, creates each folder
+  once, then places them all under one lock with one claimed-path set, and saves once.
+- *`revision()`.* An `AtomicU64` bumped by the guard, by every progress change (`Progress::store`
+  only when the value changes), and when a connection takes or lets go of a range (the segment map
+  and connection count show that). Idle, it does not move.
+- *Cancellation that wakes.* `Cancel` = flag + `tokio::sync::Notify`. `send()`, the body read, the
+  limiter wait and retry naps all `select!` on it, so Pause works on a hung connection. Requests time
+  out after 30 s without an answer; the client has `read_timeout(60s)`, TCP keepalive and a 30 s
+  pool idle timeout. `restart`/`refresh_address` refuse ("still stopping; try again") instead of
+  carrying on while the old run is live.
+- *Retries.* A failure after progress resets the connection's retry count and carries on at once
+  (resumable downloads only — a non-resumable retry starts from 0, so its retries must stay
+  bounded). Every 30 s a run adds a connection back while it has fewer than configured and work
+  is left.
+- *Never replace at finalize.* `renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)` /
+  `MoveFileExW` without `REPLACE_EXISTING`, with a check-then-rename fallback where the file system
+  can't refuse. On `AlreadyExists` the next free name is chosen under the list lock and recorded.
+  Across drives: copy beside the destination under `.<id>.reidm-move`, fsync, then the same
+  rename. `Item.replace` (set by Redownload of a finished item) is the only way to replace. The
+  server's name is chosen and recorded under a single lock.
+- *Preallocation.* Linux: `fallocate` (reserves the space; a disk too small fails at once with a
+  clear message), falling back to `set_len` where unsupported. Windows: `FSCTL_SET_SPARSE` then
+  `set_len`, so NTFS doesn't zero-fill up to the first write of the last range. macOS: `set_len`
+  (APFS is sparse). Raw `extern "system"` declarations for the two Win32 calls rather than a new
+  dependency.
+- *Mark-of-the-Web.* After the move: `:Zone.Identifier` with `ZoneId=3`, `ReferrerUrl`, `HostUrl`
+  (credentials stripped) on Windows; `com.apple.quarantine` = `0081;<hex time>;reIDM;` via
+  `setxattr` on macOS. Failures (FAT, network shares) are logged at debug and ignored.
+- *Smaller ones.* Pause on a queued download pauses it (M1); Resume during a stop sets `requeue`
+  (M2); re-adding a finished link whose file is gone downloads it again (M3) and re-adding takes
+  fresh cookie/referer/user agent when not running (M4); Remove of a running download defers file
+  deletion to the run's exit, including a file renamed into place meanwhile (app M4, L5); the part
+  file's path is stored in the item (M9); a 206 needs `Content-Range` with the right start, 416 on
+  resume and a different `Content-Length` without ranges are `ChangedOnServer`, and without an ETag
+  a different `Last-Modified` is too (M11); `get` looks up one item (app M6); names are cut to 200
+  bytes keeping the extension (L1) and bidi controls replaced (L12); query values are re-encoded and
+  sorted by name only in `url_key` (L2); refresh before any bytes re-plans ranges for the new
+  server (L4); a limiter wait cut short refunds its time (L6); the batch pattern count is checked
+  and width capped at 20 (app M10); when the clocks go back, the scheduler keeps its mark for a step
+  back under 2 h (L14).
+- *Global limit (M5, the core half).* `Limiter::charge(n)` counts bytes paced elsewhere against the
+  bucket without waiting, debt capped at 1 s of the rate. Media and torrents use it (the merge
+  replaced their `take(n, &AtomicBool::new(true))`, which the refund would have turned into a
+  no-op).
+
+**Alternatives.**
+- A writer task per download fed by a channel: one more queue and its back-pressure, for no gain
+  over positional writes from each connection.
+- `O_DSYNC`/fsync per write: correct but throttles to the disk's flush rate; one flush per 3 s
+  checkpoint costs the same durability at a fraction.
+- SQLite/redb, or a progress file per download (the review's long-term option): a bigger change
+  and a new format; the copy-on-write snapshot removes the lock contention, and with compact JSON a
+  10,000-item list serialises in tens of milliseconds on the saver thread.
+- Serialising under the lock (only compact, off-runtime): still stalls the API for the
+  serialisation. Rejected for the snapshot.
+- `posix_fallocate`: glibc emulates it by writing zeros where unsupported — exactly what H7 is about.
+- Clearing cookies and segments of finished items (M13): the GUI's segment map reads the
+  segments, and Redownload needs the cookie. Not done.
+- `CancellationToken` from tokio-util: not a dependency; `Notify` does the same in ten lines.
+- Keeping `remove` synchronous: the daemon calls it from many places; the tombstone in `Live` gets
+  the same ordering (no deletion while writers run) without an API change.
+
+**Evidence/tests.** 77 unit tests and 31 + 15 + 3 + 1 integration tests in reidm-core; five
+consecutive runs of lib/engine/resume/compat/scale clean; clippy `-D warnings` clean for Linux,
+`x86_64-pc-windows-gnu` and `aarch64-apple-darwin`.
+- C1: `a_failed_write_never_leaves_counted_bytes_missing` (a test-only fault injector fails writes
+  like a full disk, with a short write at the boundary; every counted byte must match the source,
+  the saved list must agree, and the resumed file must be identical). Mutation-checked: counting a
+  failed write makes it fail ("range 1000000..1262144 is counted but not on disk").
+- H1/H9: store unit tests (empty file → backup, truncated without backup → empty + warning,
+  unreadable → error or backup, missing → backup, 0600) and `a_damaged_list_is_recovered_…`.
+- 0.7.0: `a_list_from_0_7_0_loads_and_its_downloads_carry_on` writes a 0.7.0-shaped
+  `downloads.json` (pretty, every 0.7.0 field) and part file, resumes, checks the bytes and that it
+  continued from the saved offsets.
+- C2/H6, measured (debug build, `tests/scale.rs`, `measure_batch_add`):
+
+  | | before | after |
+  |---|---|---|
+  | `add_many` 2,000 links into an empty list | 51.1 s | 0.115 s |
+  | 2,000 more into 2,000 | 153.7 s | 0.090 s |
+  | 10,000 into empty / 10,000 more into 10,000 | (not run: minutes) | 0.38 s / 0.43 s |
+  | `list()` of 4,000 items | 2.6 ms | 2.9 ms |
+
+  `adding_thousands_of_links_is_quick` keeps 5,000 under 20 s (debug, generous for CI).
+- The others each have an integration test in `tests/engine.rs` or `tests/compat.rs` (pause on a
+  server that never answers, connections that keep breaking, a file appearing at the destination,
+  two same-named downloads, pause queued, resume while stopping, deleted file re-added, fresh
+  cookies, remove while running, temporary folder moved, no `Content-Range`, 416, length without
+  ranges, `Last-Modified`, refresh to a no-range server, revision, 0600, move across drives via
+  `/dev/shm` where it is another file system), plus unit tests for names, `url_key`, the limiter,
+  the no-replace rename, preallocation, the Zone.Identifier/quarantine values and DST. Only the C1
+  test was mutation-checked against the old behaviour; the H3/H4 tests are written so the 0.7.0
+  code could not pass them (a 15-minute hang; a dozen breaks against five retries) but were not run
+  against it.
+- Not testable here: the Windows sparse file and Zone.Identifier stream, and the macOS xattr, are
+  compile-checked by clippy for those targets only.
+
+**Follow-ups (outside reidm-core).**
+- The daemon should call `Manager::flush()` on Ctrl-C/SIGTERM before exiting (L8); without it the
+  last ≤2 s of debounced changes (progress, notes) can be lost — never adds, removals or status
+  changes, which are written at once, and never correctness, since progress is checkpointed safely.
+- The HTTP API can use `Manager::revision()` for ETag/304, and `Manager::warnings()` for a banner
+  in `/api/status` (app H9).
+- `update_settings` now returns an error if the settings could not be saved (they still apply in
+  memory); the API should show it.
+- Media and torrent outputs could call `disk::mark_from_internet` (pub(crate)) per file (app H7).
+- Any mutable access through the list's lock counts as a change (revision bump, save within 2 s).
+  Torrent `record()` and `set_note` took `get_mut` twice a second and compared afterwards, so an
+  idle seed rewrote the list every 2 s; fixed at merge (look first, write only on a change; test
+  `repeating_a_note_is_not_a_change`). **Rule for new code: read with `get`, take `get_mut` only
+  to change something.**
+
 ## 2026-10-20 — Torrents, videos and tools after the review (0.8.0)
 
 **Context.** The engine review's torrent/video/tool findings (reviews/2026-10/engine.md M5–M7,

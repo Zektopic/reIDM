@@ -160,10 +160,24 @@ or use **Restart**.
 and 61002 are taken — almost always by another reIDM. Find it (`ss -ltnp | grep 6100`,
 `lsof -i :61002`, or on Windows `netstat -ano | findstr 6100`) and stop it, or just use that one.
 
-**The service won't start: "corrupt downloads.json".** reIDM refuses to start with an unreadable
-list rather than start with an empty one and lose your downloads. It writes the list atomically,
-so this takes something outside reIDM — a disk error, an edit by hand. Move `downloads.json` out
-of the data folder (or fix it) and start again; the files already downloaded are untouched.
+**The list came back older, or empty, with a warning about `downloads.json`.** reIDM keeps the
+previous copy of the list as `downloads.json.bak`. If the list is damaged when the service starts
+(a disk error, an edit by hand), the damaged file is kept as `downloads.json.corrupt-<time>` and
+the backup is used; with no usable backup, the service starts with an empty list and says so. The
+files already downloaded are untouched either way. `settings.json` is handled the same way.
+
+**The service won't start: "cannot read downloads.json".** The file is there but can't be read —
+usually because it belongs to another user, after reIDM was run with `sudo`. reIDM won't start
+with an empty list and save it over yours. Give the file back to your user (`sudo chown "$USER"
+<data folder>/downloads.json`) and start again.
+
+**A download failed with "the disk is full".** Free some space and resume it: what it had
+downloaded is kept. On Linux, reIDM reserves a download's full size when it starts, so a disk
+that is too small says so straight away rather than part way through.
+
+**A finished download is called `name (1).ext`.** Something else was saved under its name while
+it downloaded — often the browser's own copy. reIDM never replaces a file it did not create, so
+both are kept.
 
 **The window says it can't reach the service, but it's running.** The window authenticates with
 the token in the data folder's `api-token`, written when the service starts. If the service runs

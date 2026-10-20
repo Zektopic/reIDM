@@ -1,11 +1,13 @@
 // reIDM Integration — page-side scanner and picker.
 //
-// Runs in every frame at document_start. It does three things:
-//   * injects the MAIN-world hook (inject.js) that watches fetch/XHR, because the extension
-//     world cannot see the page's own requests and `chrome.webRequest` cannot read bodies;
-//   * reports media elements and media links it can see in the DOM;
-//   * shows a "Download with reIDM" button next to a playing video, which opens a picker
-//     listing the codecs and resolutions the player actually offers.
+// Runs in every frame at document_start, so it has to cost next to nothing on pages with no
+// video. It does three things:
+//   * takes download links on click, before the browser requests them (always, unless off);
+//   * while "Look for video and audio" is on: reports media elements and media links it sees in
+//     the DOM, and relays what the MAIN-world hook (inject.js, which the service worker
+//     registers) finds in the page's own requests;
+//   * shows a "Download with reIDM" button on a playing video, which opens a picker listing the
+//     codecs and resolutions the player actually offers.
 //
 // It never talks to reIDM itself. A content script's fetch carries the *page's* origin, so it
 // would be treated as a cross-origin page request; the service worker does the talking.
@@ -17,6 +19,7 @@
   if (window.__reidmContentLoaded) return;
   window.__reidmContentLoaded = true;
 
+  const D = globalThis.REIDM_DEFAULTS;
   const MEDIA_SEL = 'video, audio, source';
   const LINK_EXT = /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|flv|mp3|m4a|flac|ogg|opus|wav|aac|zip|rar|7z|iso|dmg|exe|msi|deb|pdf|apk|img|bin|tar\.gz|tgz)(\?|#|$)/i;
 
@@ -40,17 +43,24 @@
   // a link the page handles itself (an SPA route, a script that builds the real URL) arrives
   // here with `defaultPrevented` set and is left alone.
 
-  const CAPTURE_DEFAULTS = { capture: true, interceptClicks: true, fileTypes: '', skipHosts: [] };
-  const cap = { ...CAPTURE_DEFAULTS };
+  const KEYS = ['capture', 'interceptClicks', 'fileTypes', 'skipHosts', 'captureIncognito', 'sniffMedia'];
+  const cap = Object.fromEntries(KEYS.map((k) => [k, D[k]]));
   let reidmUp = false;
-  chrome.storage.sync.get(CAPTURE_DEFAULTS).then((s) => Object.assign(cap, s)).catch(() => {});
+  chrome.storage.sync
+    .get(Object.fromEntries(KEYS.map((k) => [k, D[k]])))
+    .then((s) => {
+      Object.assign(cap, s);
+      if (cap.sniffMedia) startMedia();
+    })
+    .catch(() => {});
   chrome.storage.local
     .get('reidm-status')
     .then((o) => (reidmUp = !!(o['reidm-status'] && o['reidm-status'].up)))
     .catch(() => {});
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'sync') {
-      for (const [k, v] of Object.entries(changes)) if (k in CAPTURE_DEFAULTS) cap[k] = v.newValue;
+      for (const [k, v] of Object.entries(changes)) if (KEYS.includes(k)) cap[k] = v.newValue ?? D[k];
+      if ('sniffMedia' in changes) (cap.sniffMedia ? startMedia : stopMedia)();
     } else if (area === 'local' && changes['reidm-status']) {
       const s = changes['reidm-status'].newValue;
       reidmUp = !!(s && s.up);
@@ -64,9 +74,7 @@
   const listed = (s) => {
     const ext = extOf(s);
     if (!ext) return false;
-    // An empty list means the extension has not stored one yet: fall back to IDM's own.
-    const raw = cap.fileTypes || '3GP 7Z AAC APK AVI BIN BZ2 DEB DMG EXE FLAC GZ ISO M4A M4V MKV MOV MP3 MP4 MPG MSI OGG PDF PKG RAR RPM TAR TGZ WAV WEBM WMA WMV XZ ZIP ZST';
-    return String(raw).toUpperCase().split(/[\s,;|]+/).some((t) => t && (t.endsWith('*') ? ext.startsWith(t.slice(0, -1)) : t === ext));
+    return String(cap.fileTypes || D.fileTypes).toUpperCase().split(/[\s,;|]+/).some((t) => t && (t.endsWith('*') ? ext.startsWith(t.slice(0, -1)) : t === ext));
   };
   const skippedHost = (href) => {
     let h = '';
@@ -96,10 +104,13 @@
       return '';
     }
   };
+  /** Whether reIDM may act in this window at all. */
+  const allowedHere = () => cap.capture && (!chrome.extension.inIncognitoContext || cap.captureIncognito);
 
-  const handedBack = new WeakSet();
-
-  /** reIDM declined, or could not be reached: do what the click would have done. */
+  /** reIDM declined, or could not be reached: do what the click would have done. The click is
+   *  replayed on the link rather than the address opened from the worker, because the replay
+   *  carries the page as referrer, which download sites often check. Our own replay is
+   *  untrusted, so the listener below lets it through. */
   function handBack(a, href) {
     chrome.runtime
       .sendMessage({ type: 'bypass', url: href })
@@ -111,7 +122,6 @@
           // `window.open` would then be blocked as a pop-up; the worker can open the tab.
           chrome.runtime.sendMessage({ type: 'open-tab', url: href }).catch(() => {});
         } else {
-          handedBack.add(a);
           a.click();
         }
       });
@@ -127,10 +137,10 @@
       // A magnet link is a torrent for reIDM — the browser has nothing to do with one but hand
       // it to some other program. Alt+click still leaves it to that program.
       if (/^magnet:/i.test(href)) {
-        if (ev.altKey || ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.shiftKey || !cap.capture) return;
+        if (ev.altKey || ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.shiftKey || !allowedHere()) return;
         ev.preventDefault();
         chrome.runtime
-          .sendMessage({ type: 'capture-link', url: href, referer: location.href })
+          .sendMessage({ type: 'capture-link', url: href })
           .then((r) => {
             if (!r || !r.ok) handBack(a, href);
           })
@@ -144,13 +154,13 @@
         return;
       }
       if (ev.defaultPrevented || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
-      if (!cap.capture || !cap.interceptClicks || !reidmUp || skippedHost(href)) return;
+      if (!allowedHere() || !cap.interceptClicks || !reidmUp || skippedHost(href)) return;
       const name = promisedName(a);
       if (!listed(href) && !listed(name)) return;
 
       ev.preventDefault();
       chrome.runtime
-        .sendMessage({ type: 'capture-link', url: href, referer: location.href, filename: a.getAttribute('download') || null })
+        .sendMessage({ type: 'capture-link', url: href, filename: a.getAttribute('download') || null })
         .then((r) => {
           if (!r || !r.ok) handBack(a, href);
         })
@@ -159,37 +169,22 @@
     false,
   );
 
-  // Our own replay of a declined click arrives untrusted and is ignored above; forget it.
-  window.addEventListener('click', (ev) => {
-    const a = !ev.isTrusted && linkOf(ev);
-    if (a && handedBack.has(a)) handedBack.delete(a);
-  }, false);
+  // ── media, only while "Look for video and audio" is on ────────────────
 
   // Two independent sources feed the picker, and neither may clobber the other:
   //   * the page hook (inject.js) sees player responses and manifests the page fetched itself;
-  //   * the worker parses manifests it saw through webRequest, which is the only way to catch
-  //     a manifest a page fetched from an inline script before the hook finished loading.
+  //   * the worker parses manifests it saw through webRequest, which catches one the hook
+  //     could not see (a player in a worker, a frame the hook does not run in).
   // They are kept apart and rendered as a union, because the hook's answer for a page is
   // often just the one <video> source, and letting it assign over the worker's list silently
   // downgrades a four-variant stream to a single progressive file.
   let hookFormats = [];
   let workerFormats = [];
   let pageMeta = { source: null, title: null, page: null };
-
-  // ── MAIN-world hook ───────────────────────────────────────────────────
-  const inject = () => {
-    try {
-      const s = document.createElement('script');
-      s.src = chrome.runtime.getURL('inject.js');
-      s.async = false;
-      (document.head || document.documentElement).appendChild(s);
-      s.remove();
-    } catch {
-      /* A strict CSP can block this; the DOM scan still works. */
-    }
-  };
-  if (document.documentElement) inject();
-  else document.addEventListener('readystatechange', inject, { once: true });
+  let mediaOn = false;
+  let observer = null;
+  /** Addresses already reported, so a busy page doesn't send the same ones over and over. */
+  const sent = new Set();
 
   const humanBytes = (n) => {
     if (!n || n <= 0) return null;
@@ -199,8 +194,8 @@
     return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
   };
 
-  // Messages from the MAIN-world hook.
-  window.addEventListener('message', (e) => {
+  /** Messages from the MAIN-world hook. */
+  function onHookMessage(e) {
     if (e.source !== window || !e.data || e.data.__reidm !== true) return;
 
     // The answer to a direct query for the current page's formats.
@@ -209,21 +204,24 @@
       return;
     }
 
-    const items = (e.data.items || []).filter((i) => isHttp(i.url));
-    if (!items.length) return;
+    const items = (Array.isArray(e.data.items) ? e.data.items : []).filter((i) => i && isHttp(i.url));
+    for (const it of items) if (it.kind === 'formats') applyHook(it);
+    report(items.filter((i) => i.kind !== 'formats').map((i) => ({ url: i.url, kind: i.kind })));
+  }
 
-    for (const it of items) {
-      if (it.kind === 'formats' && it.formats && it.formats.length) applyHook(it);
-    }
+  function report(items) {
+    const fresh = items.filter((i) => !sent.has(i.url));
+    if (!fresh.length) return;
+    for (const i of fresh) sent.add(i.url);
+    if (sent.size > 2000) sent.clear();
+    chrome.runtime.sendMessage({ type: 'media', items: fresh }).catch(() => {});
+  }
 
-    const plain = items.filter((i) => i.kind !== 'formats');
-    if (plain.length) chrome.runtime.sendMessage({ type: 'media', items: plain }).catch(() => {});
-  });
-
-  /** The page hook's view of this page. Replaces the previous hook view, not the worker's. */
+  /** The page hook's view of this page. Replaces the previous hook view, not the worker's. On
+   *  YouTube an empty list still counts: it means "this video, best quality". */
   function applyHook(p) {
-    if (!p || !p.formats || !p.formats.length) return;
-    hookFormats = p.formats;
+    if (!p || !(p.source === 'youtube' || (p.formats && p.formats.length))) return;
+    hookFormats = Array.isArray(p.formats) ? p.formats : [];
     pageMeta = {
       source: p.source || pageMeta.source,
       title: p.title || pageMeta.title || document.title || null,
@@ -241,9 +239,6 @@
     }
   };
 
-  /** Merge formats the worker parsed itself. The page hook can miss a manifest that was
-   *  fetched from an inline script before the hook finished loading, and the worker sees
-   *  every request through webRequest regardless of when the page made it. */
   /** The worker's view: every manifest it could re-fetch and parse for this tab. */
   function applyWorker(entries) {
     const seen = new Set();
@@ -269,12 +264,13 @@
       .catch(() => {});
   };
 
-  /** Hook formats first (they carry the friendlier labels), then any the worker alone has. */
+  /** Hook formats first (they carry the friendlier labels), then any the worker alone has. On
+   *  YouTube only the hook's: the worker's would be the player's own traffic. */
   function combined() {
     const out = [];
     const seen = new Set();
-    for (const f of [...hookFormats, ...workerFormats]) {
-      const k = f.url || `${f.quality}|${f.bitrate}|${f.codecs}`;
+    for (const f of pageMeta.source === 'youtube' ? hookFormats : [...hookFormats, ...workerFormats]) {
+      const k = f.url || `${f.itag}|${f.quality}|${f.bitrate}|${f.codecs}`;
       if (seen.has(k)) continue;
       seen.add(k);
       out.push(f);
@@ -284,39 +280,73 @@
 
   let lastSig = '';
 
-  /** Publish the union. The signature guard keeps the DOM from being rebuilt on every tick. */
+  /** Publish the union. The signature guard keeps the DOM from being rebuilt on every report. */
   function refresh() {
     const fs = combined();
-    if (!fs.length) return;
-    const sig = `${pageMeta.source}|${fs.length}|${fs.map((f) => f.url || f.quality).join(',')}`;
+    if (!fs.length && pageMeta.source !== 'youtube') return;
+    const sig = `${pageMeta.source}|${pageMeta.page}|${fs.length}|${fs.map((f) => f.url || f.itag || f.quality).join(',')}`;
     if (sig === lastSig) return;
     lastSig = sig;
     ensureUi();
     render(fs);
   }
 
-  // ── DOM scan ──────────────────────────────────────────────────────────
-  const scan = () => {
-    const items = [];
+  // ── DOM scan: only what changed ───────────────────────────────────────
+
+  function scanRoot(root, items) {
     const push = (url, kind) => {
       const u = absolute(url);
       if (u && isHttp(u)) items.push({ url: u, kind });
     };
-
-    for (const el of document.querySelectorAll(MEDIA_SEL)) {
+    const media = (el) => {
       const tag = el.tagName.toLowerCase();
       // A blob: URL means MSE; there is nothing useful in it and the hook has the real ones.
       if (el.src && !/^blob:/i.test(el.src)) push(el.src, tag === 'source' ? mediaKind(el) : tag);
-      const current = el.getAttribute && el.getAttribute('src');
-      if (current) push(current, tag);
-    }
-    for (const a of document.querySelectorAll('a[href]')) {
+      if (tag === 'video') noteVideo(el);
+    };
+    const link = (a) => {
       const href = a.getAttribute('href') || '';
       if (LINK_EXT.test(href)) push(href, 'link');
+    };
+    if (root.nodeType !== 1 && root !== document) return;
+    if (root.matches && root.matches(MEDIA_SEL)) media(root);
+    else if (root.matches && root.matches('a[href]')) link(root);
+    if (!root.firstElementChild && root !== document) return;
+    for (const el of root.querySelectorAll(MEDIA_SEL)) media(el);
+    for (const a of root.querySelectorAll('a[href]')) link(a);
+  }
+
+  /** Nodes added or changed since the last scan; `document` means everything. */
+  let dirty = new Set();
+  let scheduled = false;
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 200));
+  function schedule(root) {
+    dirty.add(root);
+    if (dirty.size > 500) dirty = new Set([document]);
+    if (scheduled) return;
+    scheduled = true;
+    // A busy page (a feed, a chat) mutates all the time: look at most every two seconds, and
+    // only when the browser is otherwise idle.
+    setTimeout(() => idle(() => {
+      scheduled = false;
+      if (!mediaOn) return;
+      const roots = dirty.has(document) ? [document] : [...dirty];
+      dirty = new Set();
+      const items = [];
+      for (const r of roots) if (r === document || r.isConnected) scanRoot(r, items);
+      report(items);
+    }, { timeout: 4000 }), 2000);
+  }
+
+  function onMutations(records) {
+    for (const r of records) {
+      if (r.type === 'attributes') {
+        if (r.target.matches && r.target.matches('video, audio, source, a[href]')) schedule(r.target);
+        continue;
+      }
+      for (const n of r.addedNodes) if (n.nodeType === 1) schedule(n);
     }
-    if (items.length) chrome.runtime.sendMessage({ type: 'media', items }).catch(() => {});
-    if (document.querySelector('video')) ensureUi();
-  };
+  }
 
   function mediaKind(sourceEl) {
     const t = (sourceEl.getAttribute('type') || '').toLowerCase();
@@ -326,12 +356,88 @@
     return 'media';
   }
 
+  function startMedia() {
+    if (mediaOn) return;
+    mediaOn = true;
+    window.addEventListener('message', onHookMessage);
+    document.addEventListener('playing', onPlaying, true);
+    const begin = () => {
+      if (!mediaOn) return;
+      schedule(document);
+      observer = new MutationObserver(onMutations);
+      observer.observe(document.documentElement || document, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href'] });
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', begin, { once: true });
+    else begin();
+    if (window.navigation && typeof window.navigation.addEventListener === 'function') window.navigation.addEventListener('navigatesuccess', onNavigate);
+    else navPoll = setInterval(onNavigate, 1500);
+  }
+
+  function stopMedia() {
+    if (!mediaOn) return;
+    mediaOn = false;
+    window.removeEventListener('message', onHookMessage);
+    document.removeEventListener('playing', onPlaying, true);
+    if (observer) observer.disconnect();
+    observer = null;
+    if (window.navigation && typeof window.navigation.removeEventListener === 'function') window.navigation.removeEventListener('navigatesuccess', onNavigate);
+    clearInterval(navPoll);
+    removeUi();
+  }
+
+  // SPA navigation: a new video means a new list, and the old panel is stale.
+  let navHref = location.href;
+  let navPoll = null;
+  function onNavigate() {
+    if (location.href === navHref) return;
+    navHref = location.href;
+    hookFormats = [];
+    workerFormats = [];
+    pageMeta = { source: null, title: null, page: null };
+    lastSig = '';
+    sent.clear();
+    if (panel) { panel.textContent = ''; panel.hidden = true; }
+    schedule(document);
+  }
+
   // ── the button and the picker ─────────────────────────────────────────
   //
   // Anchored to the video's own box rather than to a fixed corner, so it sits where the user
-  // is already looking. Re-positioned on scroll and resize because the box moves.
+  // is already looking. Re-positioned when something says the box may have moved — a scroll, a
+  // resize, the video starting, the pointer arriving on it — never on a timer: reading a box
+  // forces layout, and a timer would do that every second in every frame with a video.
 
-  let host = null, root = null, btn = null, panel = null, videoEl = null;
+  let host = null, root = null, btn = null, panel = null, videoEl = null, sizeWatch = null;
+
+  const MIN_BOX = { w: 120, h: 80 };
+  /** Small frames are adverts and previews; they get no button. */
+  const frameTooSmall = () => window !== window.top && (window.innerWidth < 200 || window.innerHeight < 150);
+
+  function noteVideo(v) {
+    if (frameTooSmall()) return;
+    if (v === videoEl) return;
+    const r = v.getBoundingClientRect();
+    if (r.width < MIN_BOX.w || r.height < MIN_BOX.h) return;
+    watchVideo(v);
+    ensureUi();
+  }
+
+  function onPlaying(e) {
+    if (e.target && e.target.tagName === 'VIDEO') {
+      noteVideo(e.target);
+      position();
+    }
+  }
+
+  function watchVideo(v) {
+    if (videoEl) videoEl.removeEventListener('mouseenter', position);
+    videoEl = v;
+    v.addEventListener('mouseenter', position, { passive: true });
+    if (sizeWatch) {
+      sizeWatch.disconnect();
+      sizeWatch.observe(v);
+    }
+  }
 
   const CSS = `
     :host { all: initial; }
@@ -366,8 +472,10 @@
     .empty { padding: 10px; color: #9a9aa5; }
   `;
 
+  const BUTTON_TEXT = 'Download with reIDM';
+
   function ensureUi() {
-    if (host || !document.documentElement) return;
+    if (host || !document.documentElement || frameTooSmall()) return;
     try {
       host = document.createElement('div');
       host.style.cssText = 'all:initial;position:static';
@@ -380,13 +488,17 @@
 
       btn = document.createElement('div');
       btn.className = 'btn';
-      btn.innerHTML = '<span class="dot"></span><b>Download with reIDM</b>';
+      btn.innerHTML = '<span class="dot"></span><b></b>';
+      btn.querySelector('b').textContent = BUTTON_TEXT;
       btn.addEventListener('click', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
-        queryFormats();
-        refreshFromWorker();
         panel.hidden = !panel.hidden;
+        if (!panel.hidden) {
+          // The lists can change while the page plays; ask afresh when the user looks.
+          queryFormats();
+          refreshFromWorker();
+        }
       });
 
       panel = document.createElement('div');
@@ -399,41 +511,69 @@
       document.documentElement.appendChild(host);
 
       host.__wrap = wrap;
-      position();
       window.addEventListener('scroll', position, { passive: true, capture: true });
       window.addEventListener('resize', position, { passive: true });
-      setInterval(position, 1000); // the player box moves without a scroll event too
+      sizeWatch = new ResizeObserver(() => position());
+      if (videoEl) sizeWatch.observe(videoEl);
+      if (document.body) sizeWatch.observe(document.body);
+      position();
     } catch {
       /* a page that forbids decoration should still work without us */
     }
   }
 
-  /** Keep the button in the video's top-right corner. */
-  function position() {
-    if (!host || !host.__wrap) return;
-    const v = document.querySelector('video');
-    if (v) videoEl = v;
-    if (!videoEl || !document.contains(videoEl)) {
-      host.__wrap.style.display = 'none';
-      return;
-    }
-    const r = videoEl.getBoundingClientRect();
-    if (r.width < 120 || r.height < 80) {
-      host.__wrap.style.display = 'none';
-      return;
-    }
-    host.__wrap.style.display = '';
-    // Right-aligned inside the video box; clamped so it cannot leave the viewport.
-    const right = Math.max(8, window.innerWidth - r.right + 8);
-    const top = Math.min(Math.max(8, r.top + 8), window.innerHeight - 40);
-    host.__wrap.style.right = `${right}px`;
-    host.__wrap.style.top = `${top}px`;
-    host.__wrap.style.left = 'auto';
+  function removeUi() {
+    if (!host) return;
+    window.removeEventListener('scroll', position, { capture: true });
+    window.removeEventListener('resize', position);
+    if (sizeWatch) sizeWatch.disconnect();
+    if (videoEl) videoEl.removeEventListener('mouseenter', position);
+    if (host.parentNode) host.parentNode.removeChild(host);
+    host = root = btn = panel = sizeWatch = videoEl = null;
+    lastSig = '';
   }
 
-  function close() {
-    if (host && host.parentNode) host.parentNode.removeChild(host);
-    host = root = btn = panel = null;
+  /** Keep the button in the video's top-right corner. */
+  let positionQueued = false;
+  function position() {
+    if (positionQueued || !host) return;
+    positionQueued = true;
+    requestAnimationFrame(() => {
+      positionQueued = false;
+      if (!host || !host.__wrap) return;
+      if (!videoEl || !videoEl.isConnected) {
+        const v = document.querySelector('video');
+        if (v) watchVideo(v);
+      }
+      if (!videoEl || !videoEl.isConnected) {
+        host.__wrap.style.display = 'none';
+        return;
+      }
+      const r = videoEl.getBoundingClientRect();
+      if (r.width < MIN_BOX.w || r.height < MIN_BOX.h || r.bottom < 0 || r.top > window.innerHeight) {
+        host.__wrap.style.display = 'none';
+        return;
+      }
+      host.__wrap.style.display = '';
+      // Right-aligned inside the video box; clamped so it cannot leave the viewport.
+      const right = Math.max(8, window.innerWidth - r.right + 8);
+      const top = Math.min(Math.max(8, r.top + 8), window.innerHeight - 40);
+      host.__wrap.style.right = `${right}px`;
+      host.__wrap.style.top = `${top}px`;
+      host.__wrap.style.left = 'auto';
+    });
+  }
+
+  /** After a download is handed over: fold the panel and say so on the button for a moment.
+   *  The button stays, ready for another quality. */
+  function confirmSent(text) {
+    if (!panel || !btn) return;
+    panel.hidden = true;
+    const b = btn.querySelector('b');
+    b.textContent = text;
+    setTimeout(() => {
+      if (b.isConnected) b.textContent = BUTTON_TEXT;
+    }, 2500);
   }
 
   /** Put the formats in a sensible order: best picture first, audio-only last. */
@@ -447,8 +587,45 @@
     });
   }
 
+  function choose(row, f) {
+    row.style.opacity = '.5';
+    chrome.runtime
+      .sendMessage({
+        type: 'download-format',
+        // The page URL is what a manager needs to resolve a ciphered/protected format;
+        // the direct URL is a hint for the ones that are already usable.
+        page: pageMeta.page || location.href,
+        title: pageMeta.title || document.title || null,
+        source: pageMeta.source || null,
+        url: (f && f.url) || null,
+        format: f
+          ? {
+            itag: f.itag ?? null, quality: f.quality ?? null, kind: f.kind ?? null,
+            videoCodec: f.videoCodec ?? null, audioCodec: f.audioCodec ?? null,
+            mime: f.mime ?? null, bitrate: f.bitrate ?? null,
+            height: f.height ?? null, audioOnly: !!f.audioOnly, hasAudio: !!f.hasAudio,
+            // The whole file's size only when the format already has its sound.
+            size: f.audioOnly || f.hasAudio ? f.size ?? null : null,
+          }
+          : null,
+      })
+      .then((r) => {
+        row.style.opacity = '';
+        if (r && r.cancelled) return;
+        if (!r || !r.ok) {
+          const n = document.createElement('div');
+          n.className = 'note';
+          n.textContent = `reIDM could not take it: ${(r && r.error) || 'unknown error'}`;
+          panel.appendChild(n);
+        } else {
+          confirmSent('Sent to reIDM ✓');
+        }
+      })
+      .catch(() => { row.style.opacity = ''; });
+  }
+
   function render(fs) {
-    if (!panel || !fs || !fs.length) return;
+    if (!panel) return;
 
     panel.textContent = '';
     const hd = document.createElement('div');
@@ -463,17 +640,40 @@
     const viaReidm = pageMeta.source === 'youtube';
     const anyUnusable = !viaReidm && fs.some((f) => !f.url);
 
-    for (const f of sortFormats(fs)) {
+    const rowFor = (label, metaText, sizeText, f, unusable) => {
       const row = document.createElement('div');
-      const unusable = !f.url && !viaReidm;
       row.className = unusable ? 'row no' : 'row';
-
       const q = document.createElement('span');
       q.className = 'q';
-      q.textContent = f.quality || (f.audioOnly ? 'audio' : '?');
-
+      q.textContent = label;
       const meta = document.createElement('span');
       meta.className = 'meta';
+      meta.textContent = metaText;
+      const sz = document.createElement('span');
+      sz.className = 'sz';
+      sz.textContent = sizeText || '';
+      row.append(q, meta, sz);
+      if (f && f.audioOnly) {
+        const t = document.createElement('span');
+        t.className = 'tag';
+        t.textContent = 'audio';
+        row.appendChild(t);
+      }
+      if (!unusable) {
+        row.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          choose(row, f);
+        });
+      }
+      panel.appendChild(row);
+    };
+
+    // yt-dlp's own choice of the best, which needs no format list at all — and is all there is
+    // when the page has not yet shown the player response for this video.
+    if (viaReidm) rowFor('Best', 'best picture and sound, joined by reIDM', '', null, false);
+
+    for (const f of sortFormats(fs)) {
       const bits = [];
       if (f.videoCodec) bits.push(f.videoCodec);
       if (f.audioCodec) bits.push(f.audioCodec);
@@ -483,59 +683,7 @@
       if (f.bitrate) bits.push(`${Math.round(f.bitrate / 1000)} kbps`);
       if (f.mime) bits.push(f.mime.replace(/^video\/|^audio\//, ''));
       else if (f.kind) bits.push(String(f.kind).replace(/-/g, ' '));
-      meta.textContent = bits.join(' · ') || '—';
-
-      const sz = document.createElement('span');
-      sz.className = 'sz';
-      sz.textContent = humanBytes(f.size) || '';
-
-      row.append(q, meta, sz);
-
-      if (f.audioOnly) {
-        const t = document.createElement('span');
-        t.className = 'tag';
-        t.textContent = 'audio';
-        row.appendChild(t);
-      }
-
-      if (!unusable) {
-        row.addEventListener('click', (ev) => {
-          ev.preventDefault();
-          ev.stopPropagation();
-          row.style.opacity = '.5';
-          chrome.runtime
-            .sendMessage({
-              type: 'download-format',
-              // The page URL is what a manager needs to resolve a ciphered/protected format;
-              // the direct URL is a hint for the ones that are already usable.
-              page: pageMeta.page || location.href,
-              title: pageMeta.title || document.title || null,
-              source: pageMeta.source || null,
-              url: f.url || null,
-              format: {
-                itag: f.itag ?? null, quality: f.quality ?? null,
-                videoCodec: f.videoCodec ?? null, audioCodec: f.audioCodec ?? null,
-                mime: f.mime ?? null, bitrate: f.bitrate ?? null,
-                height: f.height ?? null, audioOnly: !!f.audioOnly, hasAudio: !!f.hasAudio,
-                // The whole file's size only when the format already has its sound.
-                size: f.audioOnly || f.hasAudio ? f.size ?? null : null,
-              },
-            })
-            .then((r) => {
-              row.style.opacity = '';
-              if (!r || !r.ok) {
-                const n = document.createElement('div');
-                n.className = 'note';
-                n.textContent = `reIDM could not take it: ${(r && r.error) || 'unknown error'}`;
-                panel.appendChild(n);
-              } else {
-                close();
-              }
-            })
-            .catch(() => { row.style.opacity = ''; });
-        });
-      }
-      panel.appendChild(row);
+      rowFor(f.quality || (f.audioOnly ? 'audio' : '?'), bits.join(' · ') || '—', humanBytes(f.size), f, !f.url && !viaReidm);
     }
 
     if (anyUnusable) {
@@ -551,43 +699,4 @@
       panel.appendChild(n);
     }
   }
-
-  // The page may build its player long after document_start.
-  let timer = null;
-  const schedule = () => {
-    if (timer) return;
-    timer = setTimeout(() => {
-      timer = null;
-      scan();
-      queryFormats();
-      refreshFromWorker();
-    }, 700);
-  };
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', schedule, { once: true });
-  } else {
-    schedule();
-  }
-  new MutationObserver(schedule).observe(document.documentElement || document, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: ['src', 'href', 'type'],
-  });
-  window.addEventListener('load', schedule, { once: true });
-
-  // SPA navigation: a new video means a new list, and the old panel is stale.
-  let navHref = location.href;
-  setInterval(() => {
-    if (location.href !== navHref) {
-      navHref = location.href;
-      hookFormats = [];
-      workerFormats = [];
-      pageMeta = { source: null, title: null, page: null };
-      lastSig = '';
-      if (panel) { panel.textContent = ''; panel.hidden = true; }
-      schedule();
-    }
-  }, 1500);
 })();

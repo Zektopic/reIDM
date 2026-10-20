@@ -1216,7 +1216,7 @@ impl Manager {
             // What yt-dlp fetched counts against the global limit, so reIDM's own connections
             // leave it room: they wait as if they had fetched it themselves.
             if fresh > 0 {
-                self.0.limiter.take(fresh, &AtomicBool::new(true)).await;
+                self.0.limiter.charge(fresh);
             }
             // The last piece in: what follows is ffmpeg joining the two.
             if complete && parts.len() >= 2 && parts.values().all(|(_, d, t)| t.is_some_and(|t| *d >= t)) {
