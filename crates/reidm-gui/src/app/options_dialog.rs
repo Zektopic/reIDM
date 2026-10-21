@@ -135,7 +135,7 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         let mut asked = Asked::default();
-        window("Options").open(&mut open).show(ctx, |ui| {
+        window("Options").open(&mut open).max_width(680.0).show(ctx, |ui| {
             ui.set_width(640.0);
             ui.horizontal(|ui| {
                 for (t, name) in &tabs {
@@ -160,7 +160,10 @@ impl App {
                     ui.label(RichText::new("Loading the service's settings… they can be saved once they have loaded.").color(p.warn));
                 });
             }
+            // On a line of its own (in the row of buttons a long reason widened the window), and
+            // always there, empty or not, so the dialog doesn't jump when one appears.
             let problem = self.options.form.problem();
+            ui.label(RichText::new(problem.unwrap_or(" ")).color(p.err));
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.prefs.advanced_settings, "Advanced settings").on_hover_text("Adds a tab with every setting, for fine-tuning");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -171,9 +174,6 @@ impl App {
                     // and could only write the defaults shown over the user's own.
                     if ui.add_enabled(loaded && problem.is_none(), egui::Button::new(RichText::new("Save").strong()).min_size(Vec2::new(90.0, 28.0))).clicked() {
                         save = true;
-                    }
-                    if let Some(why) = problem {
-                        ui.label(RichText::new(why).color(p.err));
                     }
                 });
             });
@@ -214,6 +214,10 @@ impl App {
         let o = &mut self.options;
         o.open = false;
         o.prefs_before = None;
+        // The address as it will be used, even if its field still has the keyboard.
+        if let Some(px) = &mut o.form.proxy {
+            px.tidy_host();
+        }
         if let (Some(on), true) = (o.autostart, o.autostart != o.autostart_before) {
             if let Err(e) = crate::autostart::set(on) {
                 self.toast(format!("Could not change starting at sign-in: {e}"));

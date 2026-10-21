@@ -40,7 +40,8 @@ impl App {
                 egui::Grid::new("props-grid").num_columns(2).spacing([14.0, 6.0]).show(ui, |ui| {
                     let row = |ui: &mut egui::Ui, k: &str, v: String| {
                         label(ui, p, k);
-                        ui.add(egui::Label::new(RichText::new(v).color(p.text)).truncate());
+                        // Long values (an error, a path) are cut to fit; all of it on hover.
+                        ui.add(egui::Label::new(RichText::new(&v).color(p.text)).truncate()).on_hover_text(v);
                         ui.end_row();
                     };
                     label(ui, p, "Address");

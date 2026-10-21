@@ -129,17 +129,20 @@ impl ProxyForm {
         self.bypass.split(['\n', ',']).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect()
     }
 
-    /// What stops this proxy from being saved, in words for the user.
+    /// What stops this proxy from being saved, in words for the user. The address is judged as
+    /// Save will send it, after `tidy_host`, so a pasted `socks5://host:1080` isn't an error.
     pub fn problem(&self) -> Option<&'static str> {
         if self.mode != ProxyMode::Manual {
             return None;
         }
-        let host = self.host.trim();
+        let mut tidy = self.clone();
+        tidy.tidy_host();
+        let host = tidy.host.trim();
         if host.is_empty() {
             Some("Enter the proxy's address, or choose another proxy setting.")
         } else if !host.chars().all(|c| c.is_ascii_alphanumeric() || ".-_:[]".contains(c)) {
             Some("The proxy's address is a name or an IP address only, like proxy.example.com, without a path or spaces.")
-        } else if self.port == 0 {
+        } else if tidy.port == 0 {
             Some("Enter the proxy's port.")
         } else {
             None
@@ -732,6 +735,8 @@ mod tests {
         assert_eq!(f.problem(), None);
         f.proxy.as_mut().unwrap().host = "proxy.lan/path".into();
         assert!(f.problem().is_some(), "the service refuses anything but a name or an address");
+        f.proxy.as_mut().unwrap().host = "socks5://127.0.0.1:1080".into();
+        assert_eq!(f.problem(), None, "a whole proxy address, as pasted, is taken apart on Save");
         let p = f.proxy.as_mut().unwrap();
         p.host.clear();
         assert!(f.problem().is_some());
