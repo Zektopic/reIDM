@@ -55,7 +55,7 @@ impl App {
             close = true;
         }
         if never {
-            self.prefs.notify_complete = false;
+            self.prefs.on_finish = Some(crate::notify::OnFinish::Nothing);
             self.prefs.save();
             self.completed.clear();
             self.toast("Turn it back on in Options › General");

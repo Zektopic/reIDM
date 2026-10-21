@@ -50,6 +50,23 @@ delete the file.
 (*Browser: Chrome 153*; click it to set the extension up), the speed limit (click to change it),
 and the total transfer rate.
 
+**The notification area.** reIDM puts an icon there (the system tray on Windows, the menu bar on
+macOS, the panel on Linux desktops that show such icons). Closing the window hides it there —
+downloads carry on — and clicking the icon brings it back; the first time, reIDM says so. The
+icon's menu has Show reIDM, Add URL…, Pause all, Resume all, the speed limiter, *When done*, and
+**Quit reIDM**, which stops the service too (it asks first if anything is downloading). Its
+tooltip says how many downloads are running and how fast. Options › General turns the icon, and
+closing into it, off; Advanced settings can make minimising hide the window there too. On a Linux
+desktop with nowhere to show the icon (GNOME without the AppIndicator extension), there is none,
+and closing the window closes it. *Tasks › Exit* always closes the window; the service keeps
+downloading.
+
+**When everything is done** (Downloads › *When done*, or the icon's menu): do nothing, exit reIDM,
+sleep, hibernate or shut down the computer once nothing is downloading or waiting (paused, failed
+and sharing torrents don't count). A 60-second countdown with **Cancel** comes up first, and the
+window comes to the front for it. The choice lasts until reIDM exits, so nobody's computer shuts
+down unexpectedly next week.
+
 ## Adding downloads
 
 **Add URL** (toolbar, Tasks menu, Ctrl+N, Insert, or just Ctrl+V with links on the clipboard).
@@ -127,8 +144,13 @@ splicing two versions together. Use **Restart** to fetch the new version.
 **Retrying.** A connection that drops is retried five times, waiting a little longer each time.
 A server that stops sending entirely for 60 seconds counts as a dropped connection.
 
-**Download complete.** When a download finishes, a small window offers *Open*, *Open folder* or
-*Close*. *Don't show again* turns it off; it's back in Options › General.
+**When a download finishes** reIDM shows a desktop notification (where there is a notification
+area) or IDM's small *Download complete* window, with *Open*, *Open folder* and *Close* — Options
+› General chooses, or nothing at all. When many finish at once, one notification counts them.
+Where notifications can't be shown (Windows can switch them off for every program, and a Linux
+desktop may have no notification service), the *Download complete* window shows instead. A
+download that fails is reported the same way (Advanced settings can turn that off). *Don't show
+again* in the *Download complete* window turns it off.
 
 ## Expired links: refreshing the address
 

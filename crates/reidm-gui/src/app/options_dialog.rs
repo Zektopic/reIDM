@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::model::{Performance, ProxyKind, ProxyMode};
+use crate::notify::OnFinish;
 use crate::options::{AdvValue, Kind, ADVANCED};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -240,10 +241,36 @@ impl App {
             ui.checkbox(on, "Keep the computer awake while downloading");
             caption(ui, p, "The computer doesn't go to sleep until downloads finish. It can still be put to sleep by hand.");
         }
+        if self.tray_available == Some(true) {
+            ui.checkbox(&mut self.prefs.tray, "Show reIDM's icon in the notification area");
+            caption(ui, p, "Its menu adds links, pauses or resumes everything, and says what to do when the downloads are done.");
+            ui.add_enabled_ui(self.prefs.tray, |ui| {
+                ui.checkbox(&mut self.prefs.close_to_tray, "Closing the window keeps reIDM in the notification area");
+                caption(ui, p, "Downloads carry on either way; the icon brings the window back.");
+            });
+        }
+
+        section(ui, "When a download finishes");
+        let tray = self.prefs.tray && self.tray_available == Some(true);
+        let current = self.prefs.on_finish(tray);
+        for (choice, text) in [
+            (OnFinish::Notification, "Show a notification"),
+            (OnFinish::Dialog, "Show the Download complete window"),
+            (OnFinish::Nothing, "Nothing"),
+        ] {
+            if ui.radio(current == choice, text).clicked() {
+                self.prefs.on_finish = Some(choice);
+            }
+        }
+        caption(ui, p, match current {
+            OnFinish::Notification => "A notification from the desktop. Where they are switched off, the Download complete window shows instead.",
+            OnFinish::Dialog => "IDM's small window, with buttons to open the file or its folder.",
+            OnFinish::Nothing => "The list still shows it as complete.",
+        });
+
+        section(ui, "Look");
         ui.checkbox(&mut self.prefs.dark, "Dark theme");
         caption(ui, p, "Light text on a dark background.");
-        ui.checkbox(&mut self.prefs.notify_complete, "Show a window when a download completes");
-        caption(ui, p, "With buttons to open the file or its folder.");
         ui.checkbox(&mut self.prefs.clipboard, "Fill Add URL with links from the clipboard");
         caption(ui, p, "Links you copied are already in Add URL when it opens.");
 
@@ -470,6 +497,13 @@ impl App {
                 ui.end_row();
             }
         });
+        section(ui, "This window");
+        if self.tray_available == Some(true) {
+            ui.add_enabled_ui(self.prefs.tray, |ui| {
+                ui.checkbox(&mut self.prefs.minimize_to_tray, "Minimising the window hides it in the notification area too");
+            });
+        }
+        ui.checkbox(&mut self.prefs.notify_failures, "Say so when a download fails, as when one finishes");
         section(ui, "Temporary folder");
         let temp_default = reidm_core::default_data_dir().join("parts").to_string_lossy().into_owned();
         ui.horizontal(|ui| {

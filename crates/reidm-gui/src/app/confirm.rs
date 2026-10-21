@@ -26,10 +26,20 @@ impl App {
                 ("Restart", format!("Start {} again from the beginning?", name(ids)), d)
             }
             Confirm::ClearCompleted(ids) => ("Remove completed", format!("Remove all {} completed downloads from the list?", ids.len()), "The files stay where they are; only the list entries go. This can't be undone.".to_string()),
-            Confirm::Close => (
+            Confirm::Close { tray: true } => (
+                "reIDM keeps downloading",
+                "reIDM is still running in the notification area.".to_string(),
+                "Downloads carry on, and the browser keeps handing them to reIDM. Click reIDM's icon to open this window again, or right-click it to quit.".to_string(),
+            ),
+            Confirm::Close { tray: false } => (
                 "reIDM keeps downloading",
                 "Downloads carry on in the background when this window is closed.".to_string(),
                 "The browser keeps handing downloads to reIDM, and opening reIDM again shows them. To stop everything, choose Quit reIDM completely (also in the File menu).".to_string(),
+            ),
+            Confirm::Quit(n) => (
+                "Quit reIDM",
+                format!("Quit reIDM while {} running?", if *n == 1 { "a download is".to_string() } else { format!("{n} downloads are") }),
+                "They stop now, and carry on from where they were the next time reIDM starts. Downloads from the browser won't be caught until then.".to_string(),
             ),
         };
         let (esc, enter) = ctx.input(|i| (i.key_pressed(egui::Key::Escape), i.key_pressed(egui::Key::Enter)));
@@ -64,11 +74,16 @@ impl App {
                             choice = Some("clear");
                         }
                     }
-                    Confirm::Close => {
-                        if ui.button(RichText::new("Keep downloading in the background").strong()).clicked() || enter {
+                    Confirm::Close { tray } => {
+                        if ui.button(RichText::new(if *tray { "OK" } else { "Keep downloading in the background" }).strong()).clicked() || enter {
                             choice = Some("close");
                         }
                         if ui.add(danger("Quit reIDM completely")).clicked() {
+                            choice = Some("quit");
+                        }
+                    }
+                    Confirm::Quit(_) => {
+                        if ui.add(danger("Quit")).clicked() {
                             choice = Some("quit");
                         }
                     }
@@ -93,12 +108,8 @@ impl App {
                 }
                 self.bulk(ids, "remove", |n| format!("Removed {n} completed download(s) from the list"));
             }
-            (Confirm::Close, "close") => {
-                self.prefs.close_explained = true;
-                self.prefs.save();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            (Confirm::Close, "quit") => self.quit_completely(ctx),
+            (Confirm::Close { tray }, "close") => self.closed_explained(ctx, tray),
+            (Confirm::Close { .. } | Confirm::Quit(_), "quit") => self.quit_completely(ctx),
             _ => {}
         }
     }

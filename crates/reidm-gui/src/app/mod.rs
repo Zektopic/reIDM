@@ -13,6 +13,7 @@ mod complete;
 mod confirm;
 mod grabber;
 mod integration;
+mod lifecycle;
 mod menu;
 mod options_dialog;
 mod props;
@@ -23,6 +24,7 @@ mod state;
 mod status_bar;
 mod table;
 mod toolbar;
+mod when_done;
 mod widgets;
 
 use crate::api::{open_external, BatchResult, Client, Pace, Poller, Snapshot};
@@ -35,7 +37,7 @@ use crate::view::{SortKey, ViewModel};
 use crate::worker::{Reply, Worker};
 use egui::{Align, Layout, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use state::*;
@@ -54,8 +56,11 @@ enum Confirm {
     Restart(Vec<u64>),
     /// Remove every finished download from the list.
     ClearCompleted(Vec<u64>),
-    /// The window is closing for the first time: say that downloads carry on.
-    Close,
+    /// The window is closing for the first time: say that downloads carry on, in the tray or
+    /// without the window.
+    Close { tray: bool },
+    /// Quit everything while this many downloads are running.
+    Quit(usize),
 }
 
 struct Toast {
@@ -96,12 +101,30 @@ pub struct App {
     props: Option<PropsState>,
     show_integration: bool,
 
+    ctx: egui::Context,
     // "Download complete" windows, oldest first, and what each download was last seen doing.
     completed: Vec<u64>,
-    last_status: HashMap<u64, Status>,
-    primed: bool,
+    watch: crate::notify::Watch,
+    /// Notifications on their way, with what to show instead if they can't be.
+    notifying: Vec<(crate::notify::Message, Receiver<Result<(), String>>)>,
     /// The snapshot `note_completions` last looked at.
     noted_rev: u64,
+
+    // the tray
+    tray: Option<crate::tray::Tray>,
+    /// Looking for somewhere to show a tray icon; then whether there is.
+    tray_probe: Option<Receiver<bool>>,
+    tray_available: Option<bool>,
+    /// The icon couldn't be made: don't try every frame.
+    tray_failed: bool,
+    /// Hidden in the tray.
+    hidden: bool,
+    /// Closing for real, not into the tray.
+    quitting: bool,
+    /// The *When done* countdown the user cancelled, and the one last brought to the front
+    /// (by when each ends).
+    countdown_cancelled: Option<u64>,
+    countdown_seen: Option<u64>,
 
     // updates
     update: Option<UpdateOffer>,
@@ -166,10 +189,19 @@ impl App {
             limiter: LimiterEdit::default(),
             props: None,
             show_integration: false,
+            ctx: cc.egui_ctx.clone(),
             completed: Vec::new(),
-            last_status: HashMap::new(),
-            primed: false,
+            watch: Default::default(),
+            notifying: Vec::new(),
             noted_rev: 0,
+            tray: None,
+            tray_probe: Some(crate::tray::probe(&cc.egui_ctx)),
+            tray_available: None,
+            tray_failed: false,
+            hidden: false,
+            quitting: false,
+            countdown_cancelled: None,
+            countdown_seen: None,
             update: None,
             update_rx: None,
             cats_open: true,
@@ -276,36 +308,13 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.run_logic(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if let Some(s) = self.poller.rx.try_iter().last() {
-            self.snap = s;
-            self.note_completions();
-        }
-        for r in self.cmd.replies() {
-            r(self);
-        }
-        self.vm.update(&self.snap, self.view, &self.search, self.sort, self.desc);
-        self.poll_update();
-        self.poll_grab();
-        self.poll_refresh();
         self.refresh_props();
-        // One check shortly after launch, so a new release is noticed without the user going
-        // looking. It is a single GET to api.github.com and reports nothing back to us.
-        if !self.checked_on_start && self.snap.connected {
-            self.checked_on_start = true;
-            self.check_for_updates();
-        }
-        // The first time the window is closed, say that downloads carry on without it.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.prefs.close_explained && self.snap.connected {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm = Some(Confirm::Close);
-        }
-        // Poll as often as what is on screen deserves.
-        let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
-        let busy = self.vm.counts.running > 0 || self.snap.total_rate > 0.0;
-        self.poller.pace.set(Pace::for_window(busy, focused, minimized));
-
         if self.applied_theme != Some(self.prefs.dark) {
             theme::apply(&ctx, self.prefs.dark);
             if self.applied_theme.is_some() {
@@ -347,6 +356,7 @@ impl eframe::App for App {
         self.limiter_window(&ctx, &p);
         self.integration_window(&ctx, &p);
         self.complete_window(&ctx, &p);
+        self.countdown_window(&ctx, &p);
 
         // Draw again only when something will have changed. A new snapshot and a command's
         // answer each ask for a frame themselves; what is left is time passing.

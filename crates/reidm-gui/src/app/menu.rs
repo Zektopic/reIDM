@@ -48,8 +48,8 @@ impl App {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Exit").clicked() {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        if ui.button("Exit").on_hover_text("Close the window; downloads carry on in the background").clicked() {
+                            self.close_window(ui.ctx());
                         }
                     });
                     ui.menu_button("File", |ui| {
@@ -78,7 +78,7 @@ impl App {
                         }
                         ui.separator();
                         if ui.button("Quit reIDM completely (stops downloads)").clicked() {
-                            self.quit_completely(ui.ctx());
+                            self.ask_quit(ui.ctx());
                             ui.close();
                         }
                     });
@@ -124,6 +124,7 @@ impl App {
                             self.open_scheduler();
                             ui.close();
                         }
+                        self.when_done_menu(ui);
                         ui.separator();
                         let on = self.snap.service.settings.as_ref().is_some_and(|s| s.limit_enabled);
                         if ui.button(if on { "Speed limiter: turn off" } else { "Speed limiter: turn on" }).clicked() {

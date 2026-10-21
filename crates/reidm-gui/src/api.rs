@@ -70,6 +70,14 @@ pub struct Service {
     pub extension_dir: Option<String>,
     /// Problems with the download list's storage the user should know about.
     pub warnings: Vec<String>,
+    /// Free space on the download and temporary folders' disks; `None` from a service that
+    /// doesn't report it.
+    pub free_space: Option<Vec<crate::model::FreeSpace>>,
+    /// What happens when everything is done, and the countdown to it; `None` from a service
+    /// that can't do it.
+    pub when_done: Option<crate::when_done::WhenDone>,
+    /// The service is stopping (*When done › Exit*): the window closes too.
+    pub exiting: bool,
 }
 
 /// One line of a batch add's reply.
@@ -318,6 +326,9 @@ impl Client {
             refresh_armed: v["refresh_armed"].as_u64(),
             extension_dir: v["extension_dir"].as_str().map(str::to_string),
             warnings: v["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect(),
+            free_space: serde_json::from_value(v["free_space"].clone()).ok(),
+            when_done: serde_json::from_value(v["when_done"].clone()).ok(),
+            exiting: v["exiting"].as_bool().unwrap_or(false),
             settings: self.settings().ok(),
         })
     }

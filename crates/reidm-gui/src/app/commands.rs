@@ -63,28 +63,6 @@ impl App {
         }
     }
 
-    /// Notice downloads that have just finished, for IDM's "Download complete" window. The first
-    /// snapshot only records state: downloads that finished before the window opened are old news.
-    pub(super) fn note_completions(&mut self) {
-        if !self.snap.connected || self.snap.rev == self.noted_rev {
-            return;
-        }
-        self.noted_rev = self.snap.rev;
-        let mut ids = HashSet::with_capacity(self.snap.items.len());
-        for it in self.snap.items.iter() {
-            ids.insert(it.id);
-            let before = self.last_status.insert(it.id, it.status.clone());
-            let finished_now = it.status == Status::Done && before.is_some_and(|b| b != Status::Done);
-            if self.primed && finished_now && self.prefs.notify_complete && !self.completed.contains(&it.id) {
-                self.completed.push(it.id);
-            }
-        }
-        self.last_status.retain(|id, _| ids.contains(id));
-        self.completed.retain(|id| ids.contains(id));
-        self.selected.retain(|id| ids.contains(id));
-        self.primed = true;
-    }
-
     // ── commands ─────────────────────────────────────────────────────────
     //
     // Each runs on the command thread; its result comes back as a toast.
@@ -206,7 +184,7 @@ impl App {
         self.cmd.run(move |c| {
             let r = c.post("/api/shutdown", serde_json::json!({}));
             reply(move |app: &mut App| match r {
-                Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Ok(_) => app.close_window(&ctx),
                 Err(e) => app.toast(format!("Could not stop the background service: {e}")),
             })
         });

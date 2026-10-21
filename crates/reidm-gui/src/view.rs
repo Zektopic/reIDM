@@ -43,6 +43,9 @@ pub struct Counts {
     /// One per entry of `CATEGORIES` (All first).
     pub categories: [usize; 8],
     pub unfinished: usize,
+    /// Waiting for a free slot (`Queued`).
+    pub waiting: usize,
+    pub paused: usize,
 }
 
 impl Counts {
@@ -81,7 +84,8 @@ impl ViewModel {
                 Status::Running => counts.running += 1,
                 Status::Done => counts.done += 1,
                 Status::Failed(_) => counts.failed += 1,
-                _ => {}
+                Status::Queued => counts.waiting += 1,
+                Status::Paused => counts.paused += 1,
             }
             if it.status != Status::Done {
                 counts.unfinished += 1;

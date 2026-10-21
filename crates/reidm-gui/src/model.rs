@@ -453,6 +453,15 @@ pub struct Folders {
     pub temp_custom: bool,
 }
 
+/// How much room a folder's disk has, as `/api/status` reports it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct FreeSpace {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub free: u64,
+}
+
 /// When reIDM's own browser extension last checked in.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct ExtensionSeen {
