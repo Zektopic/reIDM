@@ -969,6 +969,7 @@ async fn a_download_waits_for_space_and_carries_on_when_there_is_some() {
     assert_eq!(m.retry_waiting_for_space(), 0);
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn running_out_of_space_part_way_keeps_everything_downloaded() {
     // The temporary folder on another drive than the download folder: the finished file has to

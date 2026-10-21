@@ -9,9 +9,12 @@
 //! sent, so a poll costs nothing when nothing changed and a few hundred bytes when one download
 //! moved.
 //!
-//! The cache holds each row's serialised JSON. Whether a row changed is decided by comparing
-//! bytes, so it needs no co-operation from the engine beyond `Manager::revision`, which says
-//! when looking again is worthwhile: while it stays put, a poll does not even clone the list.
+//! The cache holds each row's serialised JSON. `Manager::revision` says when looking again is
+//! worthwhile — while it stays put, a poll does not even lock the list — and
+//! `Manager::changed_since` which downloads to look at: with a long history and one download
+//! running, that is one row to serialise, not every row. Whether a row really changed is still
+//! decided by comparing bytes, so a download named as changed that looks the same costs a
+//! comparison and is not sent.
 
 use reidm_core::{Item, Media, Status};
 use serde::Serialize;
@@ -41,6 +44,13 @@ pub struct Row<'a> {
     pub scheduled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<&'a str>,
+    /// Its place in the queue; the lowest queued download starts first.
+    pub order: u64,
+    /// Whether the finished file matched the checksum it was given; `null` when there was none.
+    pub checksum_ok: Option<bool>,
+    /// Stopped because a drive is too full; it carries on by itself when there is room.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_space: bool,
     /// Connections transferring right now, for the "Downloading (8)" status.
     pub connections: usize,
     /// How many byte ranges the download is split into.
@@ -83,6 +93,9 @@ impl<'a> Row<'a> {
             speed_limit: it.speed_limit,
             scheduled: it.scheduled,
             note: it.note.as_deref(),
+            order: it.order,
+            checksum_ok: it.checksum_ok,
+            waiting_for_space: it.waiting_for_space,
             connections: it.segments().iter().filter(|s| s.active).count(),
             parts: it.segments().len(),
             torrent: it.torrent.as_ref().map(|t| TorrentRow {
@@ -139,41 +152,75 @@ impl RowCache {
         self.rev == Some(rev)
     }
 
-    /// Bring the rows up to date with `items`, the list at revision `rev`.
+    /// The engine revision the rows were last built at, if they have been.
+    pub fn revision(&self) -> Option<u64> {
+        self.rev
+    }
+
+    /// Put `it`'s row in, as part of rebuild `next`. True when it is new or different.
+    fn put(&mut self, it: &Item, next: u64) -> bool {
+        let json = serde_json::to_vec(&Row::of(it)).unwrap_or_default();
+        match self.rows.get_mut(&it.id) {
+            Some(e) if *e.json == *json => false,
+            Some(e) => {
+                e.json = json.into_boxed_slice();
+                e.changed = next;
+                true
+            }
+            None => {
+                self.rows.insert(it.id, Entry { json: json.into_boxed_slice(), changed: next });
+                true
+            }
+        }
+    }
+
+    /// Take `id`'s row out, as part of rebuild `next`. True when there was one.
+    fn take(&mut self, id: u64, next: u64) -> bool {
+        if self.rows.remove(&id).is_none() {
+            return false;
+        }
+        self.removed.push_back((next, id));
+        while self.removed.len() > REMOVED_KEPT {
+            if let Some((s, _)) = self.removed.pop_front() {
+                self.forgotten = s;
+            }
+        }
+        true
+    }
+
+    /// Bring the rows up to date with `items`, the whole list at revision `rev`.
     pub fn refresh(&mut self, rev: u64, items: &[Item]) {
         let next = self.seq + 1;
         let mut changed = false;
         let mut seen = std::collections::HashSet::with_capacity(items.len());
         for it in items {
             seen.insert(it.id);
-            let json = serde_json::to_vec(&Row::of(it)).unwrap_or_default();
-            match self.rows.get_mut(&it.id) {
-                Some(e) if *e.json == *json => {}
-                Some(e) => {
-                    e.json = json.into_boxed_slice();
-                    e.changed = next;
-                    changed = true;
-                }
-                None => {
-                    self.rows.insert(it.id, Entry { json: json.into_boxed_slice(), changed: next });
-                    changed = true;
-                }
-            }
+            changed |= self.put(it, next);
         }
         if self.rows.len() > seen.len() {
             let gone: Vec<u64> = self.rows.keys().copied().filter(|id| !seen.contains(id)).collect();
             for id in gone {
-                self.rows.remove(&id);
-                self.removed.push_back((next, id));
-                changed = true;
-            }
-            while self.removed.len() > REMOVED_KEPT {
-                if let Some((s, _)) = self.removed.pop_front() {
-                    self.forgotten = s;
-                }
+                changed |= self.take(id, next);
             }
         }
         if changed {
+            self.seq = next;
+        }
+        self.rev = Some(rev);
+    }
+
+    /// Bring the rows up to date at revision `rev` from only the downloads that changed since
+    /// the last rebuild: each as it is now, or `None` when it has been removed.
+    pub fn update(&mut self, rev: u64, changed: &[(u64, Option<Item>)]) {
+        let next = self.seq + 1;
+        let mut any = false;
+        for (id, it) in changed {
+            any |= match it {
+                Some(it) => self.put(it, next),
+                None => self.take(*id, next),
+            };
+        }
+        if any {
             self.seq = next;
         }
         self.rev = Some(rev);
@@ -301,6 +348,33 @@ mod tests {
         c.refresh(3, &[]);
         assert_eq!(body(c.answer(Some(&cur)))["full"], true, "removals it never heard of can't be sent as a delta");
         assert_eq!(c.answer(Some(&c.cursor())), Answer::NotModified);
+    }
+
+    #[test]
+    fn only_the_changed_downloads_are_looked_at() {
+        let mut c = RowCache::new(3);
+        c.refresh(1, &[item(1, 0), item(2, 0), item(3, 0)]);
+        let cur = c.cursor();
+        assert_eq!(c.revision(), Some(1));
+        // Download 2 moved, 3 was removed, and 1 was named but looks the same.
+        c.update(2, &[(1, Some(item(1, 0))), (2, Some(item(2, 70))), (3, None)]);
+        let d = body(c.answer(Some(&cur)));
+        assert_eq!(d["full"], false);
+        let rows = d["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "an unchanged row is not sent: {d}");
+        assert_eq!(rows[0]["downloaded"], 70);
+        assert_eq!(d["removed"], serde_json::json!([3]));
+        // Nothing that looks different: the caller is up to date.
+        let cur = c.cursor();
+        c.update(3, &[(2, Some(item(2, 70))), (9, None)]);
+        assert_eq!(c.answer(Some(&cur)), Answer::NotModified);
+        assert!(c.is_current(3));
+        // A new download appears as a row.
+        c.update(4, &[(4, Some(item(4, 0)))]);
+        let d = body(c.answer(Some(&cur)));
+        assert_eq!(d["rows"][0]["id"], 4);
+        let all = body(c.answer(None));
+        assert_eq!(all["rows"].as_array().unwrap().len(), 3);
     }
 
     #[test]

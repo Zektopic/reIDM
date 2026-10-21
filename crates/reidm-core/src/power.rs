@@ -5,7 +5,9 @@
 //! decisions — when to hold, when to let go, when a countdown starts and ends — are tested
 //! without ever putting the machine that runs the tests to sleep.
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
+#[cfg(not(windows))]
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::Instant;

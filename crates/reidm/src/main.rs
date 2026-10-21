@@ -71,6 +71,17 @@ enum Cmd {
         /// FORMAT is a yt-dlp format selector; without one, the best video with its sound.
         #[arg(long, value_name = "FORMAT", num_args = 0..=1, default_missing_value = "bestvideo*+bestaudio/best")]
         video: Option<String>,
+        /// The checksum the finished file should have, like `sha256:9f86d0…` (md5, sha1, sha256
+        /// or sha512). Checked once it is downloaded; a file that differs is kept, and the
+        /// download fails saying so. A single address only.
+        #[arg(long, value_name = "ALGO:HEX")]
+        checksum: Option<String>,
+    },
+    /// What to do once every download is done: `none`, `exit`, `sleep`, `hibernate` or
+    /// `shutdown`. Without one, says what is set. Lasts until reIDM stops; there is a minute's
+    /// countdown to cancel it (`reidm when-done none`).
+    WhenDone {
+        action: Option<String>,
     },
     /// Queue a numbered or lettered series: `reidm batch 'https://x/img*.jpg' --from 1 --to 50 --width 3`.
     Batch {
@@ -201,6 +212,11 @@ enum Cmd {
         /// Where to write the patched copy (a new folder).
         dst: PathBuf,
     },
+}
+
+/// The time now, as unix seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn human(n: u64) -> String {
@@ -494,7 +510,16 @@ async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool)
 
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let stop = std::sync::Arc::new(stop);
-    let mut web = tokio::spawn(web::serve(ui, web::App::new(mgr.clone(), ui_port, idm_port, stop.clone())));
+    let app = web::App::new(mgr.clone(), ui_port, idm_port, stop.clone());
+    // Keep the computer awake while downloads run, and do the when-done action; *exit* stops
+    // the service the way the window's Quit does, after telling the window.
+    let exit_app = app.clone();
+    mgr.spawn_power(
+        std::sync::Arc::new(reidm_core::power::SystemInhibitor),
+        std::sync::Arc::new(reidm_core::power::SystemPower),
+        std::sync::Arc::new(move || exit_app.begin_exit()),
+    );
+    let mut web = tokio::spawn(web::serve(ui, app));
     let mut socket = tokio::spawn(ws::serve(local, mgr.clone()));
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -546,7 +571,30 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Cmd::Add { urls, referer, output, later, video: Some(format) } => {
+        Cmd::Add { checksum: Some(_), video: Some(_), .. } => bail!("--checksum is for files; a video's file is made by yt-dlp, and has no published checksum to check"),
+        Cmd::Add { urls, referer, output, later, video: None, checksum: Some(sum) } => {
+            let [url] = urls.as_slice() else { bail!("--checksum makes sense for a single address only") };
+            let sum = reidm_core::Checksum::parse(&sum)?;
+            let body = serde_json::json!({ "url": url, "referer": referer, "filename": output, "later": later, "checksum": sum });
+            let v = api_post("/api/downloads", body).await?;
+            report_batch(&serde_json::json!({ "results": [{ "url": url, "outcome": v["outcome"] }] }));
+        }
+        Cmd::WhenDone { action } => {
+            let v: serde_json::Value = match action {
+                None => serde_json::from_str(&api_get("/api/when-done").await?)?,
+                Some(a) => {
+                    let Some(a) = reidm_core::WhenDone::from_name(&a) else { bail!("use none, exit, sleep, hibernate or shutdown") };
+                    api_post("/api/when-done", serde_json::json!({ "action": a })).await?
+                }
+            };
+            let action = v["action"].as_str().unwrap_or("none");
+            match v["fires_at"].as_u64() {
+                _ if action == "none" => println!("when everything is done: nothing"),
+                Some(t) => println!("when everything is done: {action}, in {}s (cancel with `reidm when-done none`)", t.saturating_sub(unix_now())),
+                None => println!("when everything is done: {action}"),
+            }
+        }
+        Cmd::Add { urls, referer, output, later, video: Some(format), checksum: None } => {
             if output.is_some() && urls.len() > 1 {
                 bail!("--output only makes sense for a single URL");
             }
@@ -564,7 +612,7 @@ async fn main() -> Result<()> {
             }
             report_batch(&serde_json::json!({ "results": results }));
         }
-        Cmd::Add { urls, referer, output, later, video: None } => {
+        Cmd::Add { urls, referer, output, later, video: None, checksum: None } => {
             if output.is_some() && urls.len() > 1 {
                 bail!("--output only makes sense for a single URL");
             }
@@ -900,7 +948,22 @@ fn patch_extension(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_data_dir, parse_rate, single_instance};
+    use super::{get_data_dir, parse_rate, single_instance, Cli, Cmd};
+    use clap::Parser;
+
+    #[test]
+    fn checksums_and_when_done_are_read_from_the_command_line() {
+        let sum = format!("sha256:{}", "a".repeat(64));
+        match Cli::try_parse_from(["reidm", "add", "--checksum", &sum, "https://example.com/f.iso"]).unwrap().cmd {
+            Cmd::Add { checksum: Some(c), urls, .. } => {
+                assert_eq!(urls, ["https://example.com/f.iso"]);
+                assert_eq!(reidm_core::Checksum::parse(&c).unwrap().value, "a".repeat(64));
+            }
+            _ => panic!("not an add with a checksum"),
+        }
+        assert!(matches!(Cli::try_parse_from(["reidm", "when-done", "shutdown"]).unwrap().cmd, Cmd::WhenDone { action: Some(a) } if a == "shutdown"));
+        assert!(matches!(Cli::try_parse_from(["reidm", "when-done"]).unwrap().cmd, Cmd::WhenDone { action: None }));
+    }
 
     #[test]
     fn a_second_service_for_the_same_folder_is_refused() {

@@ -10,9 +10,13 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use reidm_core::{AddOptions, Category, Manager, Media, Performance, Proxy, Request, SettingsPatch};
+use reidm_core::checksum::Algo;
+use reidm_core::{AddOptions, Category, Checksum, Manager, Media, Move, Performance, Proxy, Request, SettingsPatch, WhenDone};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// The port the API is served on, unless `REIDM_UI_PORT` says otherwise. The override exists so
 /// a second, throw-away service (a test, a measurement) can run beside the real one; the browser
@@ -30,6 +34,19 @@ const TORRENT_BODY: usize = reidm_core::torrent::MAX_TORRENT_FILE / 3 * 4 + 1024
 const BATCH_BODY: usize = 8 * 1024 * 1024;
 /// The most downloads one batch or bulk request may name.
 const MAX_BATCH: usize = 10_000;
+/// How long an `/ext/add` answer is remembered for a repeat of the same `request_id`.
+const REQUEST_ID_KEPT: Duration = Duration::from_secs(600);
+/// The longest `request_id` accepted.
+const MAX_REQUEST_ID: usize = 64;
+/// How many answers are remembered at most: a caller sending endless new ids can't make the
+/// service hold endless answers.
+const MAX_REQUEST_IDS: usize = 4096;
+/// After *exit when done*, how long the service answers `exiting: true` before it stops, so a
+/// window polling its status (every few seconds at most) learns to close too.
+const EXIT_GRACE: Duration = Duration::from_secs(6);
+
+/// An `/ext/add` answer, shared by every request with the same `request_id`.
+type Answer1 = Arc<tokio::sync::OnceCell<(StatusCode, serde_json::Value)>>;
 
 pub fn ui_port() -> u16 {
     port_from_env("REIDM_UI_PORT", DEFAULT_UI_PORT)
@@ -59,6 +76,12 @@ pub struct App {
     rows: Arc<Mutex<RowCache>>,
     /// Set to `true` to stop the service (`POST /api/shutdown`).
     shutdown: Arc<tokio::sync::watch::Sender<bool>>,
+    /// The service is about to stop because everything is done (`exiting` in the status).
+    exiting: Arc<AtomicBool>,
+    exit_grace: Duration,
+    /// Answers to `/ext/add` by `request_id`, so a repeat (the extension retrying after a
+    /// timeout) gets the first answer instead of a second download.
+    ext_answers: Arc<Mutex<HashMap<String, (Instant, Answer1)>>>,
 }
 
 impl App {
@@ -75,7 +98,23 @@ impl App {
             ext: Default::default(),
             rows: Arc::new(Mutex::new(RowCache::new(boot))),
             shutdown,
+            exiting: Arc::default(),
+            exit_grace: EXIT_GRACE,
+            ext_answers: Arc::default(),
         }
+    }
+
+    /// Stop the service because everything is done: the status says `exiting` for a moment (a
+    /// window then quits too), then it stops as `POST /api/shutdown` would.
+    pub fn begin_exit(&self) {
+        if self.exiting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (stop, grace) = (self.shutdown.clone(), self.exit_grace);
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let _ = stop.send(true);
+        });
     }
 }
 
@@ -251,10 +290,14 @@ async fn rows(State(app): State<App>, h: HeaderMap, Query(q): Query<RowsQuery>) 
     let since = q.since.or_else(|| h.get(header::IF_NONE_MATCH).and_then(|v| v.to_str().ok()).map(str::to_string));
     let (mgr, cache) = (app.mgr.clone(), app.rows.clone());
     let (cursor, answer) = blocking(move || {
+        // The revision first: what changed is then looked up as of then or later, never earlier.
         let rev = mgr.revision();
         let mut c = cache.lock().unwrap_or_else(|p| p.into_inner());
         if !c.is_current(rev) {
-            c.refresh(rev, &mgr.list());
+            match c.revision().and_then(|was| mgr.changed_since(was)) {
+                Some(ids) => c.update(rev, &mgr.get_many(&ids)),
+                None => c.refresh(rev, &mgr.list()),
+            }
         }
         (c.cursor(), c.answer(since.as_deref()))
     })
@@ -305,6 +348,9 @@ struct AddBody {
     /// `.torrent` file itself in `data`.
     #[serde(default)]
     torrent: Option<TorrentBody>,
+    /// The checksum the finished file should have.
+    #[serde(default)]
+    checksum: Option<Checksum>,
 }
 
 #[derive(Deserialize)]
@@ -347,7 +393,7 @@ async fn add(State(app): State<App>, h: HeaderMap, Json(b): Json<AddBody>) -> Re
         dir: b.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from),
         media: b.media,
         torrent: b.torrent.as_ref().map(|t| reidm_core::TorrentRequest { files: t.files.clone(), ..Default::default() }),
-        checksum: None,
+        checksum: b.checksum,
     };
     let (mgr, later) = (app.mgr.clone(), b.later);
     match blocking(move || mgr.add_with(req, AddOptions { later, ..Default::default() })).await {
@@ -421,9 +467,66 @@ async fn act_on(mgr: &Manager, id: u64, what: &str) -> Result<(), String> {
 }
 
 #[derive(Deserialize)]
+struct MoveBody {
+    /// `top`, `up`, `down` or `bottom`.
+    to: String,
+}
+
+fn parse_move(to: &str) -> Result<Move, String> {
+    Move::from_name(to).ok_or_else(|| format!("cannot move a download {to:?}: use top, up, down or bottom"))
+}
+
+/// Move a download in the queue.
+async fn move_one(State(app): State<App>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<MoveBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let to = match parse_move(&b.to) {
+        Ok(t) => t,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+    if !exists(&app.mgr, id).await {
+        return not_found(id);
+    }
+    let mgr = app.mgr.clone();
+    match blocking(move || mgr.move_in_queue(&[id], to)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct VerifyBody {
+    /// `md5`, `sha1`, `sha256` (when left out) or `sha512`.
+    #[serde(default)]
+    algo: Option<String>,
+}
+
+/// A finished download's checksum, worked out now: Properties' *Integrity* row.
+async fn verify(State(app): State<App>, h: HeaderMap, Path(id): Path<u64>, Json(b): Json<VerifyBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let name = b.algo.unwrap_or_else(|| "sha256".into());
+    let Some(algo) = Algo::from_name(&name) else {
+        return (StatusCode::BAD_REQUEST, format!("{name:?} is not a checksum reIDM knows: use md5, sha1, sha256 or sha512")).into_response();
+    };
+    if !exists(&app.mgr, id).await {
+        return not_found(id);
+    }
+    match app.mgr.checksum_of(id, algo).await {
+        Ok(value) => Json(serde_json::json!({ "algo": algo, "value": value })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
 struct BulkBody {
     ids: Vec<u64>,
     action: String,
+    /// For `move`: where to.
+    #[serde(default)]
+    to: Option<String>,
 }
 
 /// One action on many downloads, in one request: *Delete completed*, *Start all*, a selection of
@@ -433,14 +536,36 @@ async fn bulk(State(app): State<App>, h: HeaderMap, Json(b): Json<BulkBody>) -> 
         return c.into_response();
     }
     let action = b.action.as_str();
-    if !(ACTIONS.contains(&action) || matches!(action, "remove" | "purge")) || matches!(action, "open" | "folder" | "refresh-capture") {
-        return (StatusCode::BAD_REQUEST, format!("unknown bulk action {action:?}: use pause, resume, restart, remove, purge, schedule, unschedule, seed or stop-seeding")).into_response();
+    if !(ACTIONS.contains(&action) || matches!(action, "remove" | "purge" | "move")) || matches!(action, "open" | "folder" | "refresh-capture") {
+        return (StatusCode::BAD_REQUEST, format!("unknown bulk action {action:?}: use pause, resume, restart, remove, purge, schedule, unschedule, seed, stop-seeding or move")).into_response();
     }
     if b.ids.len() > MAX_BATCH {
         return (StatusCode::BAD_REQUEST, format!("{} downloads is more than one request may name ({MAX_BATCH}); send them in parts", b.ids.len())).into_response();
     }
     let mgr = app.mgr.clone();
-    let known: std::collections::HashSet<u64> = blocking(move || mgr.list().into_iter().map(|i| i.id).collect()).await;
+    let ids = b.ids.clone();
+    let known: std::collections::HashSet<u64> = blocking(move || mgr.get_many(&ids).into_iter().filter(|(_, it)| it.is_some()).map(|(id, _)| id).collect()).await;
+    if action == "move" {
+        // One move of the whole selection, so a block keeps its order.
+        let to = match parse_move(b.to.as_deref().unwrap_or("")) {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        };
+        let present: Vec<u64> = b.ids.iter().copied().filter(|id| known.contains(id)).collect();
+        let mgr = app.mgr.clone();
+        let moved = blocking(move || mgr.move_in_queue(&present, to)).await.map_err(|e| format!("{e:#}"));
+        let results: Vec<serde_json::Value> = b
+            .ids
+            .iter()
+            .map(|id| match (&moved, known.contains(id)) {
+                (_, false) => serde_json::json!({ "id": id, "error": format!("there is no download #{id}") }),
+                (Ok(()), true) => serde_json::json!({ "id": id }),
+                (Err(e), true) => serde_json::json!({ "id": id, "error": e }),
+            })
+            .collect();
+        let ok = results.iter().filter(|r| r.get("error").is_none()).count();
+        return Json(serde_json::json!({ "ok": ok, "failed": results.len() - ok, "results": results })).into_response();
+    }
     let (mut ok, mut results) = (0usize, Vec::with_capacity(b.ids.len()));
     for id in b.ids {
         let r = if known.contains(&id) { act_on(&app.mgr, id, action).await } else { Err(format!("there is no download #{id}")) };
@@ -664,9 +789,19 @@ async fn ext_ping(State(app): State<App>, h: HeaderMap, Query(q): Query<PingQuer
         });
     }
     let s = app.mgr.settings();
+    // A download waiting for its new address, for the extension to say which one a click
+    // would refresh.
+    let mgr = app.mgr.clone();
+    let armed = blocking(move || {
+        let id = mgr.refresh_armed()?;
+        let name = mgr.get(id)?.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        Some(serde_json::json!({ "id": id, "name": name }))
+    })
+    .await;
     Json(serde_json::json!({
         "app": "reIDM",
         "version": env!("CARGO_PKG_VERSION"),
+        "refresh_armed": armed,
         "default_dir": s.default_dir.to_string_lossy(),
         "connections": s.connections,
         "max_concurrent": s.max_concurrent,
@@ -712,16 +847,67 @@ struct ExtAdd {
     /// A video the extension found on the page `url`, for yt-dlp to fetch in this format.
     #[serde(default)]
     media: Option<Media>,
+    /// The checksum the finished file should have.
+    #[serde(default)]
+    checksum: Option<Checksum>,
+    /// Makes the request safe to send again: a repeat with the same id (within ten minutes)
+    /// gets the first one's answer — waiting for it, if the first is still being checked —
+    /// instead of adding the download a second time.
+    #[serde(default)]
+    request_id: Option<String>,
+    /// This link is the new address of exactly this download (*Refresh download address*):
+    /// refused, never added as a new download, when it isn't the same file or that download
+    /// is no longer waiting for one.
+    #[serde(default)]
+    refresh_id: Option<u64>,
+    /// This link is a new download: don't try it against a download waiting for a new
+    /// address, which stays waiting.
+    #[serde(default)]
+    no_refresh: bool,
 }
 
 fn ext_error(e: anyhow::Error) -> Response {
-    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "ok": false, "error": format!("{e:#}") }))).into_response()
+    let (code, v) = ext_refusal(e);
+    (code, Json(v)).into_response()
+}
+
+fn ext_refusal(e: anyhow::Error) -> (StatusCode, serde_json::Value) {
+    (StatusCode::BAD_REQUEST, serde_json::json!({ "ok": false, "error": format!("{e:#}") }))
 }
 
 async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) -> Response {
     if let Err(c) = extension_caller(&app, &h) {
         return c.into_response();
     }
+    let Some(rid) = b.request_id.clone() else {
+        let (code, v) = ext_add_answer(&app, b).await;
+        return (code, Json(v)).into_response();
+    };
+    if rid.is_empty() || rid.len() > MAX_REQUEST_ID {
+        return ext_error(anyhow::anyhow!("a request_id is 1 to {MAX_REQUEST_ID} characters"));
+    }
+    let cell = {
+        let mut seen = app.ext_answers.lock().unwrap_or_else(|p| p.into_inner());
+        seen.retain(|_, (at, _)| at.elapsed() < REQUEST_ID_KEPT);
+        if seen.len() >= MAX_REQUEST_IDS && !seen.contains_key(&rid) {
+            // Full of recent answers: the oldest go. Anything repeating that late has long
+            // been answered.
+            let mut by_age: Vec<(Instant, String)> = seen.iter().map(|(k, (at, _))| (*at, k.clone())).collect();
+            by_age.sort_unstable();
+            for (_, k) in by_age.into_iter().take(seen.len() + 1 - MAX_REQUEST_IDS) {
+                seen.remove(&k);
+            }
+        }
+        seen.entry(rid).or_insert_with(|| (Instant::now(), Answer1::default())).1.clone()
+    };
+    // The first request with this id does the work; a repeat waits for its answer. If the first
+    // is dropped half way (its caller went away), the next one does the work instead.
+    let (code, v) = cell.get_or_init(|| ext_add_answer(&app, b)).await.clone();
+    (code, Json(v)).into_response()
+}
+
+/// What `/ext/add` answers to `b`.
+async fn ext_add_answer(app: &App, b: ExtAdd) -> (StatusCode, serde_json::Value) {
     let req = Request {
         url: b.url.trim().to_string(),
         filename: b.filename.filter(|f| !f.trim().is_empty()),
@@ -731,16 +917,36 @@ async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) ->
         dir: None,
         media: b.media,
         torrent: None,
-        checksum: None,
+        checksum: b.checksum,
     };
+    let refreshed = |id: u64| (StatusCode::OK, serde_json::json!({ "ok": true, "id": id, "outcome": "refreshed" }));
+
+    // The link the user clicked to give one download its new address: that, or nothing. Adding
+    // it as a new download instead would take a held browser download away from the browser
+    // for something the user didn't ask for.
+    if let Some(id) = b.refresh_id {
+        if app.mgr.refresh_armed() != Some(id) {
+            return ext_refusal(anyhow::anyhow!(
+                "download #{id} is no longer waiting for a new address (its three minutes ran out, or it was cancelled); choose Refresh download address in reIDM again"
+            ));
+        }
+        return match app.mgr.refresh_address(id, req).await {
+            Ok(()) => {
+                app.mgr.disarm_refresh();
+                tracing::info!("download #{id} continues from a new address");
+                refreshed(id)
+            }
+            Err(e) => ext_refusal(e.context(format!("this link can't be the new address of download #{id}"))),
+        };
+    }
 
     // A download waiting for a fresh address takes the next link that is the same file.
-    if let Some(id) = app.mgr.refresh_armed().filter(|_| req.media.is_none()) {
+    if let Some(id) = app.mgr.refresh_armed().filter(|_| req.media.is_none() && !b.no_refresh) {
         match app.mgr.refresh_address(id, req.clone()).await {
             Ok(()) => {
                 app.mgr.disarm_refresh();
                 tracing::info!("download #{id} continues from a new address");
-                return Json(serde_json::json!({ "ok": true, "id": id, "outcome": "refreshed" })).into_response();
+                return refreshed(id);
             }
             // Some other file: treat it as the ordinary new download it is, and keep waiting.
             Err(e) => tracing::info!("browser link is not the download being refreshed: {e:#}"),
@@ -755,8 +961,8 @@ async fn ext_add(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtAdd>) ->
         blocking(move || mgr.add_with(req, opts)).await
     };
     match r {
-        Ok(o) => Json(serde_json::json!({ "ok": true, "id": o.id, "outcome": o.outcome })).into_response(),
-        Err(e) => ext_error(e),
+        Ok(o) => (StatusCode::OK, serde_json::json!({ "ok": true, "id": o.id, "outcome": o.outcome })),
+        Err(e) => ext_refusal(e),
     }
 }
 
@@ -1043,6 +1249,13 @@ async fn status(State(app): State<App>, h: HeaderMap) -> Response {
             "browser": e.browser,
         })
     });
+    // Asks the file system: off the async workers, in case a drive is slow to answer.
+    let mgr = app.mgr.clone();
+    let free: Vec<serde_json::Value> = blocking(move || mgr.free_space())
+        .await
+        .into_iter()
+        .map(|(path, free)| serde_json::json!({ "path": path.to_string_lossy(), "free": free }))
+        .collect();
     Json(serde_json::json!({
         "idm_port": app.idm_port.load(std::sync::atomic::Ordering::Relaxed),
         "idm_port_number": crate::ws::IDM_PORT,
@@ -1056,8 +1269,53 @@ async fn status(State(app): State<App>, h: HeaderMap) -> Response {
         // What the user should know about the list's storage: a damaged file restored from its
         // backup, saves that are failing.
         "warnings": app.mgr.warnings(),
+        // For the status bar: the download folder's drive and the temporary folder's.
+        "free_space": free,
+        "when_done": when_done_json(&app.mgr),
+        // The service is stopping because everything is done: a window should quit too.
+        "exiting": app.exiting.load(Ordering::SeqCst),
     }))
     .into_response()
+}
+
+fn when_done_json(mgr: &Manager) -> serde_json::Value {
+    let (action, fires_at) = mgr.when_done();
+    serde_json::json!({ "action": action, "fires_at": fires_at })
+}
+
+/// What happens when every download is done, and the countdown to it.
+async fn when_done(State(app): State<App>, h: HeaderMap) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    Json(when_done_json(&app.mgr)).into_response()
+}
+
+#[derive(Deserialize)]
+struct WhenDoneBody {
+    action: String,
+}
+
+/// Choose what happens when every download is done (`none` for nothing). Not saved: it lasts
+/// until the service stops.
+async fn set_when_done(State(app): State<App>, h: HeaderMap, Json(b): Json<WhenDoneBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    let Some(action) = WhenDone::from_name(&b.action) else {
+        return (StatusCode::BAD_REQUEST, format!("{:?} is not something reIDM can do when downloads are done: use none, exit, sleep, hibernate or shutdown", b.action)).into_response();
+    };
+    app.mgr.set_when_done(action);
+    Json(when_done_json(&app.mgr)).into_response()
+}
+
+/// Cancel the countdown, and the action with it.
+async fn cancel_when_done(State(app): State<App>, h: HeaderMap) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
+        return c.into_response();
+    }
+    app.mgr.set_when_done(WhenDone::None);
+    Json(when_done_json(&app.mgr)).into_response()
 }
 
 async fn settings(State(app): State<App>, h: HeaderMap) -> Response {
@@ -1225,6 +1483,8 @@ pub fn router(app: App) -> Router {
         .route("/api/downloads/batch", post(add_batch).layer(big(BATCH_BODY)))
         .route("/api/downloads/:id", get(get_one).delete(remove))
         .route("/api/downloads/:id/refresh", post(refresh))
+        .route("/api/downloads/:id/move", post(move_one))
+        .route("/api/downloads/:id/verify", post(verify))
         .route("/api/downloads/:id/limit", post(set_limit))
         .route("/api/downloads/:id/:what", post(act))
         .route("/api/queue/:what", post(queue))
@@ -1233,6 +1493,8 @@ pub fn router(app: App) -> Router {
         .route("/api/settings", get(settings).post(set_settings))
         .route("/api/status", get(status))
         .route("/api/shutdown", post(shutdown))
+        .route("/api/when-done", get(when_done).post(set_when_done))
+        .route("/api/when-done/cancel", post(cancel_when_done))
         .route("/api/media/playlist", post(media_playlist))
         .route("/api/media/info", post(media_info))
         .route("/api/torrent/inspect", post(torrent_inspect).layer(big(TORRENT_BODY)))
@@ -1291,6 +1553,7 @@ mod tests {
         stop: Arc<tokio::sync::watch::Sender<bool>>,
         dir: std::path::PathBuf,
         mgr: Manager,
+        app: App,
     }
 
     impl Drop for Server {
@@ -1331,9 +1594,10 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let (stop, _) = tokio::sync::watch::channel(false);
         let stop = Arc::new(stop);
-        let app = App::new(mgr.clone(), port, Default::default(), stop.clone());
+        let mut app = App::new(mgr.clone(), port, Default::default(), stop.clone());
+        app.exit_grace = Duration::from_millis(300);
         let token = app.token.to_string();
-        tokio::spawn(serve(l, app));
+        tokio::spawn(serve(l, app.clone()));
         // `serve` writes the token file first; wait until it answers.
         for _ in 0..100 {
             if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
@@ -1341,7 +1605,7 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        Server { base: format!("http://127.0.0.1:{port}"), port, token, stop, dir, mgr }
+        Server { base: format!("http://127.0.0.1:{port}"), port, token, stop, dir, mgr, app }
     }
 
     impl Server {
@@ -1509,6 +1773,242 @@ mod tests {
         let s = server_with("damaged", 0, Some(b"{ this is not json")).await;
         let v: serde_json::Value = s.get("/api/status").send().await.unwrap().json().await.unwrap();
         assert!(!v["warnings"].as_array().unwrap().is_empty(), "a damaged list is reported: {v}");
+    }
+
+    /// A file server for the extension's tests: `/a.bin` and `/b.bin` (different sizes), with
+    /// ranges, answering the first byte after `delay`. Counts the requests it gets.
+    fn files(delay: Duration) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { break };
+                let h = h.clone();
+                std::thread::spawn(move || {
+                    let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let mut range = None;
+                    loop {
+                        let mut l = String::new();
+                        if r.read_line(&mut l).unwrap_or(0) == 0 || l.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(v) = l.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                            range = v.trim().split_once('-').and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok())));
+                        }
+                    }
+                    h.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(delay);
+                    let len = if line.contains("/b.bin") { 200_000 } else { 100_000 };
+                    let (a, b) = range.map(|(a, b)| (a, b.unwrap_or(len - 1).min(len - 1))).unwrap_or((0, len - 1));
+                    let head = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{len}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b + 1 - a);
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(&vec![7u8; b + 1 - a]);
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    fn ext(s: &Server, body: serde_json::Value) -> reqwest::RequestBuilder {
+        reqwest::Client::new().post(format!("{}/ext/add", s.base)).json(&body)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_proxy_password_is_kept_but_never_shown() {
+        let s = server("proxy", 0).await;
+        let proxy = serde_json::json!({ "mode": "manual", "kind": "socks5", "host": "proxy.lan", "port": 1080, "username": "me", "password": "secret" });
+        assert_eq!(s.post("/api/settings", serde_json::json!({ "proxy": proxy, "performance": "light" })).send().await.unwrap().status(), 204);
+        let v: serde_json::Value = s.get("/api/settings").send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["proxy"]["password_set"], true);
+        assert!(v["proxy"].get("password").is_none(), "{v}");
+        assert_eq!(v["proxy"]["host"], "proxy.lan");
+        assert_eq!((v["performance"].as_str(), v["connections"].as_u64(), v["max_concurrent"].as_u64()), (Some("light"), Some(4), Some(2)));
+        assert_eq!(v["profiles"]["maximum"]["connections"], 16);
+        // The window sends back what it was shown: the password stays.
+        let mut shown = v["proxy"].clone();
+        shown.as_object_mut().unwrap().remove("password_set");
+        assert_eq!(s.post("/api/settings", serde_json::json!({ "proxy": shown, "connections": 5 })).send().await.unwrap().status(), 204);
+        assert_eq!(s.mgr.settings().proxy.password.as_deref(), Some("secret"));
+        assert_eq!(s.mgr.settings().performance, reidm_core::Performance::Custom, "a number set by hand");
+        // A proxy that can't work is refused with a reason.
+        let r = s.post("/api/settings", serde_json::json!({ "proxy": { "mode": "manual", "host": "", "port": 1 } })).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(r.text().await.unwrap().contains("server name"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downloads_move_in_the_queue_one_or_many() {
+        let s = server("move", 0).await;
+        for n in 1..=4 {
+            s.mgr.add_with(Request { url: format!("http://127.0.0.1:9/{n}.bin"), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap();
+        }
+        assert_eq!(s.post("/api/downloads/4/move", serde_json::json!({ "to": "top" })).send().await.unwrap().status(), 204);
+        let v: serde_json::Value = s.post("/api/downloads/bulk", serde_json::json!({ "action": "move", "to": "bottom", "ids": [1, 2, 99] })).send().await.unwrap().json().await.unwrap();
+        assert_eq!((v["ok"].as_u64(), v["failed"].as_u64()), (Some(2), Some(1)), "{v}");
+        assert_eq!(s.mgr.queue_order(), [4, 3, 1, 2], "a block keeps its own order");
+        let r = s.post("/api/downloads/1/move", serde_json::json!({ "to": "sideways" })).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert_eq!(s.post("/api/downloads/77/move", serde_json::json!({ "to": "up" })).send().await.unwrap().status(), 404);
+        // Rows carry the order, so the window can sort by it.
+        let rows: serde_json::Value = s.get("/api/downloads/rows").send().await.unwrap().json().await.unwrap();
+        let order = |id: u64| rows["rows"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap()["order"].as_u64().unwrap();
+        assert!(order(4) < order(3) && order(3) < order(1) && order(1) < order(2));
+        assert!(rows["rows"][0]["checksum_ok"].is_null());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_downloads_checksum_is_worked_out_on_demand() {
+        let dir = std::env::temp_dir().join(format!("reidm-web-verify-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("abc.txt");
+        std::fs::write(&f, b"abc").unwrap();
+        let list = serde_json::json!({ "next_id": 2, "items": { "1": {
+            "id": 1, "request": { "url": "https://example.com/abc.txt", "referer": null, "cookie": null, "user_agent": null, "filename": null, "dir": null },
+            "path": f, "size": 3, "downloaded": 3, "status": { "state": "Done" }, "segments": [], "resumable": true } } });
+        let s = server_with("verify", 0, Some(&serde_json::to_vec(&list).unwrap())).await;
+        let v: serde_json::Value = s.post("/api/downloads/1/verify", serde_json::json!({ "algo": "sha1" })).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v, serde_json::json!({ "algo": "sha1", "value": "a9993e364706816aba3e25717850c26c9cd0d89d" }));
+        let v: serde_json::Value = s.post("/api/downloads/1/verify", serde_json::json!({})).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["algo"], "sha256", "the default");
+        assert_eq!(s.post("/api/downloads/1/verify", serde_json::json!({ "algo": "crc" })).send().await.unwrap().status(), 400);
+        assert_eq!(s.post("/api/downloads/5/verify", serde_json::json!({})).send().await.unwrap().status(), 404);
+        // Added with a checksum: kept, checked as given.
+        let sum = serde_json::json!({ "algo": "md5", "value": "900150983CD24FB0D6963F7D28E17F72" });
+        let r = s.post("/api/downloads", serde_json::json!({ "url": "http://127.0.0.1:9/x.bin", "later": true, "checksum": sum })).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let id = r.json::<serde_json::Value>().await.unwrap()["id"].as_u64().unwrap();
+        assert_eq!(s.mgr.get(id).unwrap().request.checksum.unwrap().value, "900150983cd24fb0d6963f7d28e17f72");
+        let bad = s.post("/api/downloads", serde_json::json!({ "url": "http://127.0.0.1:9/y.bin", "checksum": { "algo": "md5", "value": "12" } })).send().await.unwrap();
+        assert_eq!(bad.status(), 400);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refresh_aimed_at_one_download_refreshes_it_or_is_refused() {
+        let s = server("refresh-id", 0).await;
+        let (port, _) = files(Duration::ZERO);
+        // Checked, so its size is known; not started.
+        let id = s.mgr.add_checked(Request { url: format!("http://127.0.0.1:{port}/a.bin?old"), ..Default::default() }, AddOptions { later: true, ..Default::default() }).await.unwrap().id;
+        let ping = || async { reqwest::get(format!("{}/ext/ping", s.base)).await.unwrap().json::<serde_json::Value>().await.unwrap() };
+        assert!(ping().await["refresh_armed"].is_null());
+
+        // Not armed: refused, and nothing is added.
+        let r = ext(&s, serde_json::json!({ "url": format!("http://127.0.0.1:{port}/a.bin"), "refresh_id": id, "verify": true })).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"].as_str().unwrap().contains("no longer waiting"));
+        assert_eq!(s.mgr.list().len(), 1, "never added as a new download");
+
+        s.mgr.arm_refresh(id).unwrap();
+        let armed = ping().await["refresh_armed"].clone();
+        assert_eq!(armed["id"], id);
+        assert_eq!(armed["name"], "a.bin");
+        // Another file: refused, nothing added, and still waiting for the right one.
+        let r = ext(&s, serde_json::json!({ "url": format!("http://127.0.0.1:{port}/b.bin"), "refresh_id": id, "verify": true })).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"].as_str().unwrap().contains("different file"));
+        assert_eq!(s.mgr.list().len(), 1);
+        assert_eq!(s.mgr.refresh_armed(), Some(id));
+        // The same file: refreshed.
+        let v: serde_json::Value = ext(&s, serde_json::json!({ "url": format!("http://127.0.0.1:{port}/a.bin?new"), "refresh_id": id })).send().await.unwrap().json().await.unwrap();
+        assert_eq!((v["outcome"].as_str(), v["id"].as_u64()), (Some("refreshed"), Some(id)), "{v}");
+        assert!(s.mgr.get(id).unwrap().request.url.ends_with("?new"));
+        assert_eq!(s.mgr.refresh_armed(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_download_can_say_it_is_not_a_refresh() {
+        let s = server("no-refresh", 0).await;
+        let (port, _) = files(Duration::ZERO);
+        // Never checked: its size is unknown, so any link would pass for it.
+        let id = s.mgr.add_with(Request { url: "http://127.0.0.1:9/old.bin".into(), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap().id;
+        s.mgr.arm_refresh(id).unwrap();
+        let v: serde_json::Value = ext(&s, serde_json::json!({ "url": format!("http://127.0.0.1:{port}/a.bin"), "no_refresh": true, "later": true })).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["outcome"], "new", "{v}");
+        assert_eq!(s.mgr.refresh_armed(), Some(id), "still waiting");
+        assert!(s.mgr.get(id).unwrap().request.url.ends_with("/old.bin"));
+        // Without it (an older extension), the link goes to the armed download as before.
+        let v: serde_json::Value = ext(&s, serde_json::json!({ "url": format!("http://127.0.0.1:{port}/b.bin"), "later": true })).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["outcome"], "refreshed", "{v}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repeated_request_id_gets_the_first_answer_even_while_it_is_still_being_checked() {
+        let s = server("request-id", 0).await;
+        let (port, hits) = files(Duration::from_millis(600));
+        let body = serde_json::json!({ "url": format!("http://127.0.0.1:{port}/a.bin"), "verify": true, "later": true, "request_id": "dl-41" });
+        // The extension gave up waiting on the first and sent it again while it was checked.
+        let (a, b) = tokio::join!(ext(&s, body.clone()).send(), async {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            ext(&s, body.clone()).send().await
+        });
+        let (a, b): (serde_json::Value, serde_json::Value) = (a.unwrap().json().await.unwrap(), b.unwrap().json().await.unwrap());
+        assert_eq!(a, b);
+        assert_eq!(a["outcome"], "new");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "checked once, not twice");
+        assert_eq!(s.mgr.list().len(), 1);
+        // Later repeats too.
+        let c: serde_json::Value = ext(&s, body.clone()).send().await.unwrap().json().await.unwrap();
+        assert_eq!(c, a);
+        // A refusal is an answer, repeated as such.
+        let bad = serde_json::json!({ "url": "ftp://nowhere/x", "request_id": "dl-42" });
+        let r1 = ext(&s, bad.clone()).send().await.unwrap();
+        assert_eq!(r1.status(), 400);
+        let r1 = r1.text().await.unwrap();
+        let r2 = ext(&s, bad).send().await.unwrap();
+        assert_eq!((r2.status().as_u16(), r2.text().await.unwrap()), (400, r1));
+        // A new id is a new request; a silly one is refused.
+        let other: serde_json::Value = ext(&s, serde_json::json!({ "url": format!("http://127.0.0.1:{port}/b.bin"), "later": true, "request_id": "dl-43" })).send().await.unwrap().json().await.unwrap();
+        assert_eq!(other["outcome"], "new");
+        assert_eq!(ext(&s, serde_json::json!({ "url": "http://x/y", "request_id": "x".repeat(65) })).send().await.unwrap().status(), 400);
+        // The cache stays bounded.
+        {
+            let mut m = s.app.ext_answers.lock().unwrap();
+            for i in 0..MAX_REQUEST_IDS {
+                m.insert(format!("old-{i}"), (Instant::now(), Answer1::default()));
+            }
+        }
+        ext(&s, serde_json::json!({ "url": "ftp://x/y", "request_id": "newest" })).send().await.unwrap();
+        assert!(s.app.ext_answers.lock().unwrap().len() <= MAX_REQUEST_IDS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn when_done_is_set_shown_and_cancelled() {
+        let s = server("when-done", 0).await;
+        let v: serde_json::Value = s.get("/api/when-done").send().await.unwrap().json().await.unwrap();
+        assert_eq!(v, serde_json::json!({ "action": "none", "fires_at": null }));
+        let v: serde_json::Value = s.post("/api/when-done", serde_json::json!({ "action": "hibernate" })).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["action"], "hibernate");
+        let st: serde_json::Value = s.get("/api/status").send().await.unwrap().json().await.unwrap();
+        assert_eq!(st["when_done"]["action"], "hibernate");
+        assert_eq!(st["exiting"], false);
+        let free = st["free_space"].as_array().unwrap();
+        assert_eq!(free.len(), 2, "the download folder and the temporary folder: {st}");
+        assert!(free.iter().all(|f| f["free"].as_u64().is_some_and(|n| n > 0)));
+        assert_eq!(s.post("/api/when-done", serde_json::json!({ "action": "reboot" })).send().await.unwrap().status(), 400);
+        let v: serde_json::Value = s.post("/api/when-done/cancel", serde_json::json!({})).send().await.unwrap().json().await.unwrap();
+        assert_eq!(v["action"], "none");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_when_done_tells_the_window_then_stops() {
+        let s = server("exit", 0).await;
+        s.app.begin_exit();
+        let st: serde_json::Value = s.get("/api/status").send().await.unwrap().json().await.unwrap();
+        assert_eq!(st["exiting"], true);
+        for _ in 0..100 {
+            if !s.dir.join("api-token").exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the service did not stop");
     }
 
     #[test]
