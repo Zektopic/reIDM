@@ -9,6 +9,44 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-21 — Measured on imitated machines (0.8.0)
+
+**Context.** The request was for reIDM to be right on "potatoes" and on high-end PCs.
+`tools/profile-test.mjs` runs a release-build service in a `systemd-run --user --scope` with CPU and
+memory limits, downloads from a local server whose content is a function of name and offset, and
+checks every file byte for byte; one download is killed with SIGKILL part way and must resume
+intact. Each imitated machine uses the preset its owner would pick. Development machine: 12 CPUs,
+13 GiB, NVMe; nothing else building.
+
+| | potato (half a core, 256 MB) | laptop (two cores, 1 GB) | desktop (no limits) |
+|---|---|---|---|
+| settings | preset light | preset balanced | preset maximum |
+| big 1024 MiB: MiB/s | 427 | 288 | 332 |
+| big: CPU s per GiB | 0.8 | 1.0 | 2.2 |
+| big: peak memory (resident) MiB | 16.7 | 26.4 | 59.9 |
+| crash 512 MiB: transfer lost to SIGKILL, seconds | 2.4 | 4.2 | 3.7 |
+| crash: file intact after resume | true | true | true |
+| small 300×2 MiB: files/s | 73.2 | 89.5 | 115 |
+| small: peak memory (resident) MiB | 23.0 | 35.9 | 88.9 |
+| list 20000: seconds to add | 0.9 | 0.4 | 0.4 |
+| list: idle CPU % | 0.0 | 0.0 | 0.1 |
+| list: memory (resident) MiB | 69.4 | 86.8 | 135 |
+| list: one full rows fetch, ms | 55.0 | 54.0 | 67.0 |
+
+**Reading it.**
+- *Every crash left an intact file*, and cost 2–4 s of transfer: progress is recorded every 3 s,
+  and what arrived after the last record is fetched again.
+- *Light on half a core outran Maximum on loopback.* With no real network, more connections only
+  add disk writes and CPU (Maximum: 2.2 CPU-s per GiB, 16 connections × 1 MiB buffers; Light: 0.8).
+  The presets pay off against real servers that cap each connection, which a local server does
+  not imitate; this measures cost, not the gain. So the default stays Balanced.
+- *Memory* follows the preset: 17 MB (Light) to 60 MB (Maximum) for one large download; a
+  20,000-item list adds 50–75 MB, and costs 0.0–0.1% CPU while idle.
+- *Many small files*: 73 (Light) to 115 (Maximum) files a second — downloads at once matter more
+  than connections for small files.
+**Follow-ups.** A run against a throttled-per-connection server would show what the presets buy;
+a run on a spinning disk would show whether 16 interleaved connections need a larger buffer there.
+
 ## 2026-10-21 — Phase 2 merged: what the merge itself found (0.8.0)
 
 **Keep awake outside a desktop session.** logind's polkit policy lets only a process in a local
