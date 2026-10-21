@@ -309,10 +309,21 @@ impl Inhibitor for SystemInhibitor {
     fn hold(&self, why: &str) -> Result<Hold> {
         #[cfg(target_os = "linux")]
         {
-            // logind's sleep lock, held for as long as `cat` reads reIDM's pipe.
+            // logind's lock, held for as long as `cat` reads reIDM's pipe. logind's policy lets
+            // only a process in a local session block *sleep*; a service started outside one —
+            // a systemd user unit, or over SSH — is refused ("Access denied"). Any process may
+            // block *idle*, which still stops the system suspending for lack of activity (the
+            // usual reason an overnight download is cut short), so fall back to that.
             let why = format!("--why={why}");
-            let h = ChildHold::spawn("systemd-inhibit", &["--what=sleep", "--who=reIDM", &why, "--mode=block", "cat"])
-                .context("cannot ask the system to stay awake (systemd-inhibit)")?;
+            let inhibit = |what: &str| ChildHold::spawn("systemd-inhibit", &[what, "--who=reIDM", &why, "--mode=block", "cat"]);
+            let h = match inhibit("--what=sleep:idle") {
+                Ok(h) => h,
+                Err(e) => {
+                    let h = inhibit("--what=idle").with_context(|| format!("cannot ask the system to stay awake (systemd-inhibit): {e}"))?;
+                    tracing::info!("keeping the computer from idling into sleep, but not from being put to sleep: {e}");
+                    h
+                }
+            };
             Ok(Hold::new(h))
         }
         #[cfg(target_os = "macos")]
