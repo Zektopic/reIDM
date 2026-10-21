@@ -9,6 +9,557 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-21 — Phase 2 merged: what the merge itself found (0.8.0)
+
+**Keep awake outside a desktop session.** logind's polkit policy lets only a process in a local
+session block *sleep* (`inhibit-block-sleep`: `allow_any=no`); a service started as a systemd
+user unit, or over SSH, gets "Access denied" — which is what the engine stream saw and took for a
+sandbox quirk. Any process may block *idle* (`allow_any=yes`), and idle is what lets a machine
+suspend itself overnight. The service now asks for `sleep:idle`, then `idle`, and logs which.
+Checked on the development machine from an SSH session: an idle lock is listed by
+`systemd-inhibit --list` while a download runs and is gone after the service stops.
+
+**Download folder.** With no `user-dirs.dirs` (a minimal Linux install) the system names no
+Downloads folder and reIDM fell back to the working directory — `/` for a login item; the new
+welcome screen said "Downloads go to .". It now falls back to `~/Downloads`.
+
+**Options, looked at.** Screenshots of the new Options showed the downloads-at-once slider's
+rail drawn in nearly the panel's colour, with 2–8 squeezed into the first tenth of a 1–64 rail,
+and the General tab's last caption cut with no scroll bar visible (egui's floating bars show only
+on hover; a solid bar uses the widgets' fill, also nearly invisible). Fixed: a filled,
+logarithmic slider; Options takes the main window's spare height; a solid bar in the text colour.
+
+**Browser suite against the merged service.** The 7 refresh checks that had been skipped now run
+and pass. Two checks were racy, not wrong: "the browser kept nothing" looked before the worker
+had let go of the browser's copy (it does so when reIDM's answer arrives), and the image-page
+check counted the worker's own ping to reIDM (tab −1), which 1.7.0 sends more often. The second
+now counts only requests from tabs and records the last ones it saw. 100/100, 48/48 and 20/20,
+three runs in a row.
+
+## 2026-10-21 — Phase 2, the window: simple Options, tray, when done, notifications, drag and drop, accessibility (0.8.0)
+
+### Splitting app.rs
+
+**Context.** `crates/reidm-gui/src/app.rs` was 3,275 lines in five `impl App` blocks (review
+service-and-window §6.1). Every later change in this stream touches it.
+
+**Decision.** A mechanical split into `app/` with one file per part of the window (`mod.rs` keeps
+the `App` struct and the frame loop; `menu`, `toolbar`, `sidebar`, `status_bar`, `table`,
+`banners`, one file per dialog, `commands` for what is sent to the service, `state` for the
+dialogs' state). Done by a script over line ranges that checked every line landed exactly once;
+methods used across files became `pub(super)`, nothing else changed. Its own commit, so later
+diffs read as changes, not moves.
+
+**Alternatives.** The review's deeper tree (`ui/`, `dialogs/…`) with a `Dialog` trait per window:
+more churn in the same commit, and `pub(super)` across two levels of modules gets awkward; the
+flat `app/` keeps every part one `use super::*` away from the `App` it draws.
+
+**Evidence.** `cargo test -p reidm-gui` 13/13 and clippy `-D warnings` unchanged after the split.
+
+### New dependencies
+
+**Context.** The tray, OS notifications, screen-reader support and non-blocking file pickers each
+need a crate. The `.deb` and CI builds avoid GTK (rfd uses the portal backend for that reason).
+
+**Decision.** `tray-icon` 0.26 with `default-features = false, features = ["ksni"]`: one API on
+all three systems, and on Linux it speaks StatusNotifierItem over D-Bus (pure Rust, zbus) instead
+of libappindicator/GTK, so the build needs no GTK. `notify-rust` 4.18 (zbus on Linux,
+WinRT toasts on Windows, `mac-notification-sys` on macOS). eframe's `accesskit` feature.
+`pollster` to wait on `rfd::AsyncFileDialog` from a thread. `zbus` (Linux) and `windows`
+(Windows) were already in the tree through those; they are direct dependencies only for two
+questions — is there a tray host, and will Windows show a notification at all — and the
+sign-in Run key.
+
+**Alternatives.** `ksni` directly on Linux plus `tray-icon` elsewhere: two code paths for the same
+menu. `tray-icon`'s default libappindicator backend: needs GTK 3 dev packages at build time and a
+GTK main loop at run time. Hand-rolled D-Bus notifications: notify-rust is small and covers the
+other two systems.
+
+**Evidence.** Licences of the 60 crates the lockfile gained: MIT, Apache-2.0, MIT OR Apache-2.0,
+and Unlicense (ksni). `cargo check -p reidm-gui --target x86_64-pc-windows-gnu` and
+`--target aarch64-apple-darwin` (with `CC/AR=true`) both build the new dependencies.
+
+### Options: simple tabs and Advanced settings
+
+**Context.** Phase 2 adds a dozen service settings (presets, retries, timeouts, proxy, keep-awake,
+free-space floor). Shown all at once they would bury the five options most people touch. The
+competitor review (§3) recommends qBittorrent's split; the spec fixes the tabs.
+
+**Decision.**
+- Tabs General / Folders / Downloads / Network / Torrents, a caption under every option, and an
+  *Advanced settings* checkbox at the bottom left (in `gui.json`, kept even on Cancel, since it
+  is a choice of view) that adds an Advanced tab: a grid of name | value | unit | Default, with
+  "requires restart" in the name. The grid is data (`options::ADVANCED`: key, label, unit, hint,
+  range/default, getter/setter, and when the row applies), so the dialog draws it in a loop and
+  the tests check every row's range and default. Labels have a fixed column (≤ 52 characters,
+  tested); the long explanation is the hover text.
+- Performance: the window derives the preset from the knobs (`Performance::detect`), so editing a
+  knob in Advanced shows *Custom* at once, and putting it back shows the preset again. Choosing a
+  preset writes its knobs into the form, so the Advanced tab shows what it means. The patch
+  carries `performance` plus whichever knobs changed (harmless duplicates of what the service
+  would write).
+- Every phase-2 field is `Option` in `model::Settings`; `None` hides the option and its row, and
+  `changes()` never sends a `None`. Unknown enum values from a newer service (`performance:
+  "eco"`, proxy `mode: "pac"`) deserialize to `Custom` / `System` instead of failing the whole
+  settings load (`#[serde(other)]`).
+- Proxy password is write-only: the field starts empty; empty = keep (key omitted); typing sends
+  it; *Forget it* sends `"password": ""`. A pasted `socks5://host:1080` fills type, host and port.
+  Save is disabled with a reason while a manual proxy has no host or port.
+- Speed limit moves into Downloads as a switch and a rate. Turning it on sends both
+  `limit_enabled` and `speed_limit`, because the shown rate may be the suggested 1 MB/s rather
+  than the service's 0 (a limit of 0 limits nothing).
+- *Start reIDM when you sign in* (General) is the window's own job: HKCU `…\Run` value `reIDM`
+  on Windows (the value `packaging/windows/reidm.iss` writes, so installer and checkbox agree),
+  `~/.config/autostart/reidm.desktop` on Linux, `~/Library/LaunchAgents/com.zektopic.reidm.plist`
+  on macOS; each runs `reidm-gui --background`.
+- Port, DHT, connections and the temporary folder moved to Advanced; the download folder moved to
+  Folders. "Ask before each download" has no service field: Downloads says it is in the
+  extension's options instead of showing a control that can't work. The language "placeholder"
+  is a line of text, not a dead combo box.
+- Cancel now restores the window's preferences (the theme applies live, so Cancel used to leave
+  it changed).
+
+**Alternatives.** One scrolling page (FDM): harder to scan with five areas. Hiding the
+Advanced grid's unsupported rows vs. greying them: hidden, since a 0.7 service can't take them
+at all.
+
+**Needs from the service (spec gaps found).**
+- Proxy password: the spec says write-only but not what an absent `password` means. The window
+  assumes **absent = keep the saved one, `""` = forget it**.
+- The window sends the whole `proxy` object on any change (the service "replaces it whole" was
+  assumed, as for `category_dirs`).
+
+**Evidence.** 11 new unit tests in `options.rs` (unchanged → empty patch for 0.7 and 0.8 settings;
+an older service is sent nothing it doesn't know and shows only 3 Advanced rows; presets ↔
+Custom; unknown values load; limiter sends rate; password write-only; manual proxy needs an
+address; pasted proxy address; Advanced rows' defaults/ranges/reset; labels fit). 3 tests in
+`autostart.rs` (desktop-entry quoting per the XDG spec, plist escaping, idempotent removal).
+End to end against a stand-in 0.8 service: choosing *Light* and Save posted exactly
+`{"connections":4,"max_concurrent":2,"performance":"light","write_buffer_kib":64}`.
+
+### Tray, close to tray, notifications, When done
+
+**Context.** Competitor review §2 items 1, 2 and 10. Closing the window used to leave a service
+running with nothing on screen to show for it. The window must keep reacting (tray menu,
+completions, a shutdown countdown) while hidden.
+
+**Decision.**
+- *Where the work runs.* eframe 0.36 runs `App::logic` for hidden windows whenever something
+  requests a repaint (it paints invisible windows directly every ≥100 ms on request, because
+  Windows sends no `RedrawRequested` to them — `eframe/src/native/run.rs`, egui #5229). So
+  everything that must go on while hidden — draining the poller, notifications, tray commands,
+  When done, close handling, the poll pace — moved from `ui()` to `logic()` (`app/lifecycle.rs`);
+  `ui()` only draws. `ViewModel::update` moved too (the tooltip needs counts while hidden); it is a
+  key comparison when nothing changed.
+- *Tray.* `tray-icon` with the ksni backend. On Linux the window first asks D-Bus whether
+  `org.kde.StatusNotifierWatcher` reports `IsStatusNotifierHostRegistered` (on a thread; tray-icon
+  itself registers with `assume_sni_available(true)`, so it never fails and a hidden window would
+  be unfindable on GNOME without the AppIndicator extension). No host → no tray, normal close,
+  and the *Download complete* window stays the default. The icon is created on the window's
+  thread (macOS requires it). Menu and click events reach the window through a channel plus
+  `request_repaint`; hover/move events are dropped without waking it. Tooltip and menu state are
+  pushed only when they change (each change is a D-Bus message on Linux).
+- *Closing.* With a tray and *close to tray* on: the window hides (`Visible(false)`); the first
+  time, a one-time dialog says reIDM is still in the notification area (`tray_notified`), instead
+  of an OS notification that might not show. *Tasks › Exit* closes the window even with a tray
+  (the service keeps running, as before); *Quit reIDM* (tray, File) stops the service and asks
+  first when downloads are running or waiting. Minimise-to-tray is an Advanced window option.
+- *When done.* Downloads › When done and the tray submenu (radio), disabled when `/api/status`
+  has no `when_done`. While `fires_at` is set, a countdown dialog with a focused Cancel (Esc
+  too) shows, repainting once a second, and the window comes to the front for it even from the
+  tray. `exiting: true` closes the window for real.
+- *Notifications.* `notify::Watch` (pure) turns snapshots into Finished/Failed events (first look
+  primes; a download already done when first seen is not news; each new failure once).
+  `notify::messages` (pure) groups more than three at once into one notification. Sending runs on
+  a thread (D-Bus/WinRT round trip); an error falls back to the *Download complete* window
+  (failures: a message in the window). On Windows, `ToastNotifier::Setting()` is checked first
+  for the same AUMID notify-rust uses, because toasts switched off globally "succeed" silently
+  (AGENTS.md trap). `on_finish` is `None` until chosen: notification with a tray, dialog without.
+  A 0.7 `gui.json` with `notify_complete: false` reads as *Nothing*.
+
+**Alternatives.** Keeping logic in `ui()` and un-hiding via platform calls: eframe already solves
+it. An OS notification for the "still in the tray" note: may not show (Windows, no server).
+Actions on notifications (*Open*, *Show in folder*): on Linux they need a thread waiting per
+notification until it is closed, and some servers never close them; left out.
+
+**Evidence.** Unit tests: `when_done` (countdown text, wire values, unknown action loads),
+`notify` (events, grouping), `tray` (menu ids round-trip, tooltip), `prefs` (0.7 migration).
+End to end on a private D-Bus session (`dbus-run-session`, a Python stand-in watcher + host +
+notification server, `scratchpad/p2gui/sni_host.py`, `drive.py --dbus`): the icon registered as
+`org.kde.StatusNotifierItem-<pid>-1`; finishing and failing a download produced
+`Download complete | holiday-video-1080p.mp4` and `Download failed | report-2026.pdf / HTTP 404`;
+the tray's *When done › Shut down the computer* posted `{"action":"shutdown"}`, the countdown
+showed "The computer shuts down in 55 seconds." and Cancel posted `/api/when-done/cancel`; tray
+*Quit* with a queued download brought up the confirmation. With `--no-host --no-notifications`:
+no icon registered and the *Download complete* window showed.
+
+### Drag and drop, and watching the clipboard
+
+**Context.** Competitor review §2 items 8 and 9.
+
+**Decision.**
+- *Drops.* winit delivers dropped **files** only (X11 XDND `text/uri-list` entries that aren't
+  `file://` are discarded; Windows accepts only `CF_HDROP`), so "URLs/text → Add URL" is served
+  by: a dropped item whose path is itself a link (some platforms), and shortcut files holding a
+  link — `.url` (Windows; what dragging a link to the desktop makes), `.webloc` (macOS),
+  `.desktop` `Type=Link` (Linux), read only if under 64 KiB. `.torrent` → Add torrent (the first;
+  more than one is refused with a message, as the dialog holds one); `.txt`/`.list`/`.ef2` →
+  the existing import. `dropped::classify` is pure and tested.
+- *Clipboard.* A thread owns one `arboard::Clipboard`, reads text once a second while enabled
+  and blocks on a channel while disabled (no polling at all when off, the default), and sends
+  the text to the window only when it changed. The window decides (`dropped::ClipboardSeen`,
+  pure): the first text after switching on is primed, not offered; a link is offered once per
+  session; text the window copied itself (`App::copy_text`, used by Copy address / Copy path) is
+  never offered. Only one-token links whose path ends in an extension from
+  `reidm_core::grabber::COMMON_TYPES`, or magnet links with `xt=urn:`, qualify. Download/Later
+  post to `/api/downloads`; a magnet opens Add torrent. A hidden window is shown without
+  `Focus`, so typing elsewhere isn't interrupted.
+
+**Alternatives.** Polling `arboard` in `ui()`: an X11 round trip every frame and a repaint loop
+to keep polling. A change-count API (`GetClipboardSequenceNumber`, `NSPasteboard.changeCount`):
+cheaper per tick, but per-OS code for a once-a-second read.
+
+**Evidence.** 4 unit tests (classification incl. shortcuts of all three systems; which copied
+text qualifies; once-per-session and own copies). End to end under Xvfb with a GTK program
+owning the clipboard: copying `https://example.com/pub/new-release.iso` showed the prompt within
+2 s, *Download* posted `{"url":…,"later":false}`; two copies in a row showed the first with "and
+1 more copied".
+
+### Queue order, checksums, free space
+
+**Context.** Competitor review §2 items 12, 15 and 16; spec "Downloads".
+
+**Decision.**
+- *Which downloads take part in moves.* Only unfinished ones (`queue::queue`: not `Done`, by
+  `order`). Moving past a finished download changes nothing anyone can see, so "Move up" over a
+  finished neighbour would look broken. The window sends the selected unfinished ids in queue
+  order to `POST /api/downloads/bulk {"action":"move","to",…}`, always the bulk form.
+- *Semantics.* Top/bottom move the selection as a block in its own order; up/down move each
+  selected download one place past its unselected neighbour (qBittorrent's queue up/down), which
+  for a contiguous block is "the block moves one place" and for a selection already at the end
+  is a no-op. `queue::can_move` greys out moves that change nothing.
+  **For the service:** the spec says "moving a block keeps its internal order" but not what a
+  non-contiguous selection does, nor whether finished downloads count as neighbours; the window
+  assumes the above. The mock service used for testing does the same.
+- *Feature detection.* `Item.order: Option<u64>` and `Item.checksum_ok: Option<Option<bool>>`
+  (a custom deserializer tells *absent* — an older service — from `null` — no checksum given).
+  The view model records whether any row has them; the move entries, the # column, *More
+  options › Expected checksum* and the *Integrity* row appear only then. Limitation: with an
+  empty list nothing can be detected, so the checksum field is hidden until the list has a row.
+  **Suggestion for the service:** a `features` list in `/api/status` would remove that guess.
+- *Checksum input.* `checksum::parse` accepts `algo:hex`, `ALGO hex`, `algo=hex` or bare hex
+  (length → algorithm) and explains mistakes while typing. *Verify* runs on its own thread with a
+  one-hour timeout (a large file on a slow disk), not the command thread, so it doesn't hold up
+  Pause/Resume queued behind it.
+- *Free space.* The download folder's entry from `free_space` (matched by path to
+  `default_dir`, else the first), all entries in the tooltip, orange under 1 GB.
+
+**Evidence.** Tests: `queue` (3), `checksum` (3), `model::free_space_line`. Against the mock:
+Ctrl+↑ on the 3rd queued download posted the move and the # column showed it 2nd; the status bar
+showed "123.5 GB free"; Properties of a finished download showed "Matches the checksum it was
+added with", and Verify posted `{"algo":"sha256"}` and showed the value.
+
+### Accessibility (review M11, §5.5)
+
+**Context.** Painted widgets were invisible to screen readers and had no focus indication; three
+colours failed WCAG AA; text went down to 10 pt; a Linux portal picker froze the window.
+
+**Decision.**
+- eframe `accesskit`. Painted widgets get `Response::widget_info` with a role and a name, and a
+  2 px `accent_fg` outline when focused (`app/widgets.rs::accessible`). Rows speak
+  "name, state, 36%".
+- Colours: a WCAG contrast test over every (text colour × background) pair in both themes, which
+  found two more failures than the review (light *ok* on the window background at 4.4:1, and
+  white on the dark accent fill — the primary button — at 3.8:1). Fixed by darkening light warn
+  and ok, and splitting the dark accent into a fill (#2272CC) and a text colour (#5AA2F0). The
+  dark fill is 2.8:1 against the panel, under WCAG's 3:1 for components; acceptable because the
+  primary button is identified by its label and position, not its fill.
+- 12 pt minimum everywhere (the review's figure). The toolbar became 10 px taller (two caption
+  lines of 12 pt) and its padding and search box narrower so it still fits 1080 px.
+- Keyboard: list navigation with per-event modifiers (`egui::Event::Key { modifiers }`), because
+  `InputState::modifiers` is the state when the frame runs — a Ctrl+↑ pressed and released
+  between two frames arrives as a plain ↑ (found with XTest, but also possible with fast
+  typists on a busy frame). Clicking a row calls `surrender_focus`, else egui keeps focus on the
+  cell and treats the arrows as moves between widgets. Esc closes the topmost dialog in a fixed
+  order (the confirmation and countdown handle their own). Shift+F10 / Menu for the context menu
+  is left out: the menu opens at the pointer and has no row rectangle to anchor to from the
+  keyboard handler.
+- Pickers: `picker::Picker<T>` opens `rfd::AsyncFileDialog` on a thread and waits with
+  `pollster`; the answer returns with the purpose (`PickFor`) and a repaint. One at a time.
+
+**Evidence.** `theme::tests::text_is_readable_on_every_background`; `view::step` tests. Under Xvfb:
+↓ moved the selection, Shift+↓ extended it, Ctrl+↑ posted
+`{"action":"move","ids":[2,6],"to":"up"}`, Ctrl+N opened Add URL and Esc closed it.
+(The harness needed `XSetInputFocus` on the window: without a window manager nothing gets the
+keyboard; right-button XTest clicks don't register either, before or after these changes.)
+
+### First-run welcome
+
+**Decision.** One small window, not a three-step wizard (the brief: "keep it light"): where
+downloads go with *Change…* (saved to the service at once), whether the extension is connected
+with *Set up the extension…* (turns green live), and *Get started*. `welcomed` defaults to
+`true` when a `gui.json` exists without it (a 0.7 user has used reIDM) and `false` only when
+there is no `gui.json`. Help › *Welcome…* shows it again. The review's optional test download is
+left out.
+
+### Following the merged service (b2bb4a4)
+
+**Context.** The engine/service stream landed with corrections to the spec.
+
+**Decision.**
+- *Presets.* The window drops its copy of the preset table and reads `profiles` from
+  `GET /api/settings`; presets show only when the service sends both `performance` and all three
+  profiles. Because "a knob given in the same patch as a preset wins", a chosen preset is now sent
+  **alone**; the owned knobs (`connections`, `max_concurrent`, `write_buffer_kib`) are sent only
+  when the result is `custom`. The form keeps `performance` as loaded and as chosen, and
+  `knob_changed()` (called by the slider and the Advanced rows that own knobs) works it out
+  again — so a service that reports `custom` for numbers that happen to match a preset is shown
+  as it reports, until the user changes something.
+- *Proxy host* validated like the service (letters, digits, `.-_:[]`), with the reason, before
+  Save — the service refuses the whole change otherwise.
+- `free_space[].free` may be `null`: `Option<u64>`, skipped (a hard `u64` made the whole list fail
+  to parse and the status bar lose its line).
+- Rows: `waiting_for_space` → "Waiting for disk space" with the note on hover; a `Failed` whose
+  error starts with `checksum mismatch` → "Checksum mismatch". *Verify* is offered for
+  `checksum_ok == false` too (the service computes it for those).
+- `exiting`, the when-done endpoints, moves and verify matched what the window already did.
+  "Countdown only after something has run" needs nothing from the window but words in the guide.
+
+### Measurements
+
+Release builds (`lto`, `opt-level = "s"`), throw-away service on 61101/61102 with a fake HOME
+(`scratchpad/bench/measure.sh`, and `p2gui/measure2.sh` which also writes a `gui.json`), 10,000
+finished downloads, 20 s to load then 30 s sampled, Xvfb. Session D-Bus hidden from the window
+(`env -u DBUS_SESSION_BUS_ADDRESS`) so nothing touches the real desktop, except the tray run,
+which used `dbus-run-session` with the stand-in host.
+
+| | window CPU | window RSS |
+|---|---|---|
+| before (feature/parity-and-polish 42197c4 + split), idle | 0.1 % | 138 MB |
+| before, one download at 1 MiB/s | 0.9 % | 96 MB |
+| after (p2/gui), idle, no tray host | 0.1 % | 132 MB |
+| after, one download at 1 MiB/s | 1.0 % | 90 MB |
+| after, idle, watching the clipboard | 0.1 % | 135 MB |
+| after, idle, tray icon shown (stand-in SNI host) | 0.2 % | 82 MB |
+
+(Service CPU: 0.0–0.1 % idle, 16–17 % with the 1 MiB/s download, both before and after; the
+service binary was the same debug build for both runs.)
+
+### Against the real merged service
+
+**Context.** End-to-end runs of the window against the service built from `p2/gui` after merging
+b2bb4a4/27b9b3e: throw-away data folder and HOME, ports 61101/61102, a local web server with
+sparse files (`scratchpad/p2gui/drive.py --real=…`).
+
+**Evidence.**
+- Limit 1 MiB/s, one at a time, four downloads: rows carried `order` from 2³²; Ctrl+↑ on the
+  third waiting download made the service's order `big, third, other, small` (it was `big, other,
+  third, small`).
+- Options › Downloads › *Light* while the service said `custom` (after `max_concurrent: 1` by
+  API): the service ended at `performance: "light"`, connections 4, at once 2, buffer 64.
+- A wrong SHA-256: the row read *Checksum mismatch* (red); Properties showed the Integrity row
+  with what Resume and Restart do, and Verify. `min_free_space_mib: 1000000`: the new download
+  read *Waiting for disk space* with the service's note ("not enough space on …/parts: needs 1 B
+  more, 33.7 GiB free (reIDM keeps 976.6 GiB free; …)") on hover.
+- Manual proxy: pasting `socks5://127.0.0.1:1080`, user `me`, password `s3cret`, Save → the
+  service stored kind `socks5`, host `127.0.0.1`, port 1080, `password_set: true`; reopening
+  showed "saved; type to replace it" with *Forget it*; a second Save changing only the host kept
+  `password_set: true`.
+- *When done › Exit* with a 1 GB download: `fires_at` appeared when it finished, the countdown
+  showed, and the window process had exited 80 s later (`exiting`).
+- Status bar: `36.2 GB free` from `free_space`.
+
+**Found and fixed.** Typing a proxy address, Save's "why not" text sat in the row of buttons; a
+long one (the address check) stretched Options to the full screen width, where it stayed — and the
+Save button moved out from under the pointer. The reason now has its own line, always reserved (so
+the dialog doesn't jump 10 px when one appears), the dialog has a maximum width, and the address is
+judged as Save will send it (after taking apart `scheme://host:port`).
+
+**Found, not mine (for the engine stream).** `reidm_core::default_download_dir()` falls back to
+`"."` when `directories` finds no Downloads folder (no `user-dirs.dirs`, as on minimal Linux
+installs and in this test's fake HOME), so the service saves into whatever directory it was started
+from — for a service the window starts, the window's working directory. Suggest falling back to
+`$HOME/Downloads` (creating it) before `"."`.
+
+## 2026-10-21 — Phase 2, engine and service: presets, proxy, queue order, checksums, space, power (0.8.0)
+
+Branch `p2/engine` (commits e9dc348, a3eaa12, d775a3a, 674b5b5).
+Spec: docs/design/0.8-phase2.md, corrected in the same branch where building it showed a gap.
+
+### 1. Settings: presets, the old constants, the proxy
+
+**Context.** Phase 2's settings table (presets, write buffer, retries, retry wait, idle and connect
+time limits, proxy, keep-awake, space to keep free). The time limits and retries were constants;
+the proxy did not exist; `reqwest::Client` was built once.
+
+**Decision.**
+- `Settings`/`SettingsPatch` move to `settings.rs`, with `Settings::apply(patch)` doing the whole
+  change on a copy (validated first; the client rebuilt if the proxy or a time limit changed) and
+  `normalize()` clamping and naming the preset. A preset writes its three knobs; a knob in the
+  same patch wins (and so makes it `custom`); a knob changed later makes it `custom`; `custom`
+  chosen explicitly stays. Old files read as the preset their numbers match, else `custom`.
+  `custom`'s torrent peers are balanced's (100). `GET /api/settings` returns `profiles`.
+- The client lives in an `RwLock<reqwest::Client>`; every request takes a clone (an `Arc`), so a
+  running download uses the new proxy from its next connection. A proxy reqwest can't use is
+  refused with nothing changed; one that fails at load falls back to the system's with a warning
+  instead of refusing to start.
+- Each run snapshots the settings (`RunCtx.opts`): retries (0 = for ever), the doubling wait
+  (first wait, ×2, capped at 60 s or the first wait if longer), the two time limits, the buffer.
+- Password: stored in `settings.json` (0600, like the list), never returned (`password_set`);
+  a `proxy` without `password` keeps it, `""` removes it. yt-dlp gets `--proxy` through a
+  `--config-locations` file written 0600 and deleted after the run — not on the command line,
+  which other local users can read. Torrents: SOCKS5 only (librqbit's `ConnectionOptions`),
+  next session. Page scans (`/api/grab`) use it too.
+
+**Alternatives.** Passing the proxy to yt-dlp in its environment (`HTTPS_PROXY`): yt-dlp's
+handlers don't all honour it for SOCKS. `--proxy` on the command line: leaks the password to `ps`.
+Rejecting a bad proxy at load: a typo would stop the service.
+
+**Evidence.** `settings::tests::*` (presets, ranges, retry waits, password kept/removed/never
+shown, refused proxies, every proxy mode builds a client, a phase-1 file), engine
+`downloads_go_through_the_proxy_when_one_is_set` (the test server answers proxy-form requests: a
+file only reachable through it downloads; with `none` it can't), `retries_follow_the_settings`,
+`media::tests::the_proxy_reaches_yt_dlp_in_a_private_file…` (content, 0600, removed),
+`web::tests::the_proxy_password_is_kept_but_never_shown`.
+
+### 2. Changed ids, and what a long list costs
+
+**Context.** Phase 1's follow-up: with 50,000 downloads and one running, the row cache cloned and
+re-serialised the whole list at every revision. Measured again here: 25–27% of a core.
+
+**Decision.**
+- `store::Items` wraps the map; `get_mut`, `values_mut`, `insert` and `remove` record ids. The
+  guard's drop bumps the revision and appends `(rev, ids)` to a change log *under one mutex*, so a
+  reader never sees a revision whose ids aren't recorded yet. The log keeps 65,536 ids; older →
+  `None` (look at everything). Progress of running downloads moves the revision without a record,
+  so `Manager::changed_since` adds the live ids. `start_queue`/`stop_queue` now find ids first and
+  take only those (a `values_mut` over 50k would have marked all of them).
+- `RowCache::update(rev, get_many(changed))`; the byte comparison stays, so a named-but-unchanged
+  row is not sent.
+- What remained was the saver: every 3 s checkpoint scheduled a save of the whole 50k list (~7% of a
+  core). Debounced saves now wait up to 25× the last save's duration (2 s minimum, 30 s cap) —
+  about 4% of a core at most; urgent saves (adds, removals, status, flush) never wait. Progress is
+  still checkpointed durably; a crash can cost up to that much recorded progress (bytes on disk are
+  re-fetched, never trusted).
+
+**Alternatives.** A per-item revision in `Item` (makes every row carry engine bookkeeping, and the
+cache still scans 50k to compare); a progress file per download (a new format; a bigger change
+than this phase); keeping the 2 s debounce (the service then spends its time rewriting the list).
+
+**Evidence.** Release builds (LTO off, 16 codegen units), a throw-away service on 61201/61202, one
+download held to 1 MiB/s, a client polling `/api/downloads/rows?since=` every 500 ms
+(`scratchpad/p2e-bench/measure.sh`), service CPU over 30 s:
+
+| | before (42197c4) | after |
+|---|---|---|
+| 50k, one running, polled 2/s | 25.3%, 26.6% | 1.7%, 2.8% |
+| 50k, one running, nobody polling | 7.4% | 2.8% |
+| 5k, one running, polled 2/s | 2.8% | 1.0% |
+
+With the row change alone (before the save change): 7.7% polled and 7.7% unpolled — i.e. the rows
+went from ~18% to ~0, and the rest was saving. Tests: `store::tests::the_record_of_changes…`,
+engine `the_list_says_which_downloads_changed`, `rows::tests::only_the_changed_downloads…`, and
+the existing 50k web test.
+
+### 3. Queue order
+
+**Decision.** `Item.order` (serde default 0 → assigned on load in id order, from 2³²); new items
+get `next_order`. `pump` sorts the waiting ones by `(order, id)`. `queue.rs`: top/bottom place the
+selection (in its order) before/after every download; up/down swap positions within the
+unfinished downloads plus the chosen ones (finished downloads never wait, so stepping over them is
+what the user sees), a block moving together. Positions keep their numbers; only downloads whose
+order changes are written (so a move is a few changed rows). Out of room below (after ~4 billion
+*top*s) it renumbers.
+
+**Evidence.** `queue::tests::a_block_moves_together…`, engine
+`the_queue_starts_the_first_in_its_order_and_downloads_can_be_moved` (max_concurrent 1: the moved
+one starts first), web `downloads_move_in_the_queue_one_or_many`, compat
+`files_from_0_8_phase_1_load_with_the_new_defaults` (ids 7, 2, 5 → order 2, 5, 7; kept across a
+restart).
+
+### 4. Checksums
+
+**Decision.** `Request.checksum {algo, value}` (md5/sha1/sha256/sha512 via `md-5`, `sha1`, `sha2`;
+the only new crate is `md-5`, `sha1` was already in the lock file through librqbit). Validated and
+lower-cased on add; refused for videos and torrents. Hashed on the blocking pool after
+`finalize`; a mismatch sets `checksum_ok = false` and fails the download, **keeping the file**.
+Resume of such a download re-hashes instead of downloading (the expected value may have been the
+mistake); Restart replaces its own file (`replace` now also covers a checksum failure). `POST
+/api/downloads/{id}/verify`.
+
+**Evidence.** engine `a_checksum_is_checked_and_a_mismatch_keeps_the_file` (no new range requests
+on resume), `checksum::tests`, web `a_finished_downloads_checksum_is_worked_out_on_demand`.
+
+### 5. Not enough space
+
+**Decision.** `space.rs`: per drive, what is still to be written — the part file's size minus
+what is *allocated* (Unix `st_blocks`, so Linux's `fallocate` reservation counts as written;
+Windows: minus what is written), plus the whole file on the download folder's drive when it is
+another drive (the final copy). Unknown size = 1 byte. Short = still needs > 0 and free < need +
+keep. Checked at start, after the probe, and in the checkpoint ticker (HTTP, 3 s); videos and
+torrents every 10 s. A shortage stops the run like a Pause (`Live::stop_for_space`), so everything
+written is kept and recorded; `launch` turns it into `Paused` + `waiting_for_space` + note. A
+30 s task restarts those that fit, in queue order, subtracting each one's need from its drive.
+Pause clears the flag (wait for the user); Resume clears it (check now).
+
+**Alternatives.** Pausing whenever free < keep even with nothing left to write: pointless for a
+reserved download and confusing ("why did it stop?"). Failing instead of pausing: violates "never
+lose a download" in spirit (it would need the user).
+
+**Evidence.** engine `a_download_waits_for_space_and_carries_on_when_there_is_some` and
+`running_out_of_space_part_way_keeps_everything_downloaded` (temp on /dev/shm: every counted byte
+is in the part file, the resumed file is identical); `disk::tests::free_space_…`.
+
+### 6. Keep-awake and when-done
+
+**Decision.** `power.rs`, behind `Inhibitor` and `PowerActions` traits; the daemon passes the
+system ones. One task, once a second (O(1) unless an answer needs the list): hold while anything
+transfers (and seeds, if asked), release 30 s after. Linux: `systemd-inhibit --what=sleep
+--mode=block … cat` — `cat` reads reIDM's pipe, so if reIDM dies the pipe closes and the lock is
+gone; release closes the pipe, waits ≤ 1 s, then kills and reaps (no zombie). macOS: `caffeinate
+-i -w <pid>`. Windows: a thread holding `SetThreadExecutionState` (it belongs to the thread). A
+refusal is logged once per busy period. Hold/release run on the blocking pool.
+When-done: `Countdown` state machine; starts only after something ran since the action was chosen
+(spec changed: choosing shut-down with an empty queue must not shut down a minute later), 60 s,
+flush, then act once. Exit: the service answers `exiting: true` for 6 s, then shuts down.
+Windows actions enable `SeShutdownPrivilege` first; macOS hibernate = `pmset sleepnow`.
+
+**Evidence.** `power::tests` — the state machines; a paused-time test of the whole watcher with a
+fake inhibitor and fake actions (held during a transfer, still held 2 s after, released after 30,
+sleep fires once after 60, keep_awake off → no hold, exit calls the callback); the child
+lifecycle with `cat` standing in for `systemd-inhibit` (alive while held, gone and reaped after,
+an immediately failing helper is an error). Nothing ever calls the real power manager in tests.
+web `when_done_is_set_shown_and_cancelled`, `exit_when_done_tells_the_window_then_stops`.
+
+### 7. Extension contract (1.7.0)
+
+- `/ext/ping` `refresh_armed: {id, name} | null`.
+- `refresh_address` probes and checks before stopping; after stopping it checks again (first bytes
+  may have arrived) and resumes the download if that fails.
+- `/ext/add`: `refresh_id` refreshes exactly that download or refuses (never adds; the refresh
+  stays armed); `no_refresh` skips the armed download (stays armed); `request_id` (≤ 64): a
+  `tokio::sync::OnceCell` per id, so a repeat during the first check waits for its answer — the
+  answer, refusals included, is kept 10 minutes, at most 4,096 (oldest evicted).
+- Without these fields, behaviour is unchanged.
+
+**Evidence.** web `a_refresh_aimed_at_one_download_refreshes_it_or_is_refused`,
+`a_new_download_can_say_it_is_not_a_refresh`,
+`a_repeated_request_id_gets_the_first_answer_even_while_it_is_still_being_checked` (two
+concurrent requests, one probe at the server, same answer; refusals repeated; bound), engine
+`a_new_address_is_checked_before_the_download_is_stopped` (still running, still moving).
+
+### 8. Mark-of-the-Web for videos and torrents
+
+yt-dlp's final file (its `after_move` path) and each selected file of a finished torrent are marked
+like HTTP downloads (`disk::mark_from_internet`, on the blocking pool). Compile-checked for Windows
+and macOS only (no-op on Linux).
+
+### Not done / follow-ups
+- The update check's blocking client ignores the proxy.
+- A video keeps the space check every 10 s only while yt-dlp runs; its size before the first
+  progress line is unknown (counted as one byte).
+- Hibernate on macOS is sleep (the system decides).
+
 ## 2026-10-21 — Extension 1.7.0: "Use this link to refresh …?", idempotent hand-offs (0.8.0)
 
 Source: docs/design/0.8-phase2.md ("Refresh address (extension M14)", "Idempotent /ext/add

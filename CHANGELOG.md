@@ -2,6 +2,44 @@
 
 ## 0.8.0 (unreleased)
 
+### New
+
+* **Simpler Options.** Five plain tabs — General, Folders, Downloads, Network, Torrents — with a
+  line under each option saying what it does. Everything else is behind **Advanced settings**: a
+  table of each setting, its unit and a *Default* button.
+* **Performance: Light, Balanced or Maximum.** One choice sets connections, downloads at once, the
+  disk-write buffer and torrent peers together — Light for an old laptop, Maximum for a desktop on
+  a fast line. Changing any of them by hand makes it *Custom*.
+* **A notification-area icon.** Closing the window keeps reIDM running there; its menu adds a link,
+  pauses or resumes everything, switches the speed limiter, or quits. (On Linux it needs a desktop
+  that shows tray icons; without one, closing works as before.)
+* **When done: exit, sleep, hibernate or shut down** once the downloads finish, after a one-minute
+  countdown you can cancel. Chosen per session, never remembered — so nobody's computer shuts down
+  unexpectedly next week. Also `reidm when-done`.
+* **Keeps the computer awake** while downloads run (on by default), and lets it sleep again 30 s
+  after the last one.
+* **Never fills the disk.** A download pauses, keeping everything, before a drive would drop below
+  200 MiB free, and carries on by itself when there is room. The status bar shows free space.
+* **Proxy:** the system's (default), none, or an HTTP, HTTPS or SOCKS5 proxy with user name,
+  password (never shown again) and exceptions. Videos use it too; torrents through SOCKS5 if asked.
+* **Queue order:** move downloads to the top, up, down or to the bottom (right-click, Ctrl+↑/↓);
+  the queue starts them in that order. An optional *#* column shows it.
+* **Checksums:** give a download its published MD5, SHA-1, SHA-256 or SHA-512 (Add URL › More
+  options, or `reidm add --checksum sha256:…`); a mismatch is reported and the file kept.
+  Properties › *Integrity* works out a finished file's checksum.
+* **Notifications** when a download finishes or fails — or the *Download complete* window, or
+  nothing. Where the system has notifications switched off, the window shows instead.
+* **Drag and drop** a `.torrent`, a `.txt` or IDM `.ef2` list, or a link onto the window.
+* **Watch the clipboard** for download links (off by default): a copied link to a file, or a
+  magnet link, offers *Download / Later / Dismiss*, once.
+* **Start reIDM when you sign in** (Options › General).
+* **Settable retries and time limits** (Advanced): retries per connection (0 = for ever), the wait
+  between them, how long a silent connection or server is given.
+* **Screen readers** can read the window; every colour meets WCAG AA contrast in both themes; text
+  is at least 12 points; the list works from the keyboard (arrows, Page Up/Down, Home/End, Shift to
+  select, Space, F2 for Properties, Esc to close a dialog).
+* A short **welcome** on the first run: where downloads go, and connecting the browser.
+
 ### Fixed
 
 * **A download could be left with a hole in it after a crash, power cut or full disk**: progress
@@ -100,6 +138,12 @@
 
 ### Improved
 
+* A long list costs far less while something downloads: with 50,000 downloads and one running, the
+  service uses about 2–3% of a core instead of about 26%.
+* *Refresh download address* checks the new link before stopping the download.
+* Without a Downloads folder named by the system (a minimal Linux install), downloads go to
+  `~/Downloads` instead of wherever reIDM was started.
+* File and folder pickers no longer freeze the window while they are open.
 * Adding thousands of links at once takes a moment instead of minutes (2,000 links: 51 s → 0.1 s),
   and the service stays responsive while the list is saved.
 * Files taken from the browser are marked as downloaded from the internet (Windows SmartScreen,
