@@ -21,6 +21,7 @@ reidm <command> [options]
 | [`refresh`](#refresh) | yes | give a download a new address |
 | [`limit`](#limit) | yes | show or set the speed limit |
 | [`queue`](#queue) | yes | start or stop the scheduled queue |
+| [`when-done`](#when-done) | yes | sleep, hibernate, shut down or quit once every download is done |
 | [`grab`](#grab) | only with `--add` | find the files a web page links to |
 | [`extension`](#extension) | no | print the browser extension's folder |
 | [`ui`](#ui) | starts it | open the web view |
@@ -95,7 +96,7 @@ reidm get 'https://example.com/report?id=7' -o report.pdf --cookie 'session=abc'
 ### `add`
 
 ```text
-reidm add URL... [--referer URL] [-o NAME] [--later] [--video [FORMAT]]
+reidm add URL... [--referer URL] [-o NAME] [--later] [--video [FORMAT]] [--checksum ALGO:HEX]
 ```
 
 Queues one or more addresses in the service — web links, **magnet links**, and **`.torrent`
@@ -126,6 +127,17 @@ summary line says which happened:
 $ reidm add https://example.com/a.zip https://example.com/b.zip
   already have: https://example.com/a.zip
 1 queued, 0 resumed, 1 already complete, 0 failed
+```
+
+`--checksum` gives the checksum the finished file should have, as download pages publish them:
+`sha256:9f86d0…` (or `md5:`, `sha1:`, `sha512:`; a bare value is recognised by its length). It is
+checked once the file is in place; a file that differs is kept, and the download fails saying
+what was expected and what it got — `reidm resume` checks it again, `reidm restart` downloads it
+again. A single web address only (not a video or a torrent):
+
+```text
+$ reidm add --checksum sha256:5c4e…1f0a https://cdimage.example.org/debian.iso
+1 queued, 0 resumed, 0 already complete, 0 failed
 ```
 
 ### `batch`
@@ -236,9 +248,10 @@ reidm refresh ID NEW-URL
 
 IDM's *Refresh download address*: points an unfinished download at a new address — an expired
 signed link replaced by a fresh one, or a mirror — and carries on from where it was. reIDM first
-checks the new address: it must serve a file of the same size and, if part of the download is
-already done, serve byte ranges so it can continue. An address that fails either check is
-refused and the download is left as it was.
+checks the new address, while the download carries on: it must serve a file of the same size
+and, if part of the download is already done, serve byte ranges so it can continue. An address
+that fails either check is refused and the download is left as it was — still running, if it
+was.
 
 ```text
 $ reidm refresh 7 'https://cdn.example.com/file.bin?expires=…&sig=…'
@@ -275,6 +288,26 @@ Starts or stops every download in the scheduled queue (those added with `--later
 in the window), and prints how many — `1 download(s) started`. No more than *downloads at the same time* run at once; the
 rest wait their turn. The times and days the queue starts by itself are set in the window's
 *Scheduler*, or through [`/api/settings`](API.md#settings).
+
+### `when-done`
+
+```text
+reidm when-done                 # say what is set
+reidm when-done ACTION          # none, exit, sleep, hibernate or shutdown
+```
+
+What happens once every download is done: `sleep`, `hibernate` or `shutdown` the computer, or
+`exit` (stop reIDM — the service, and the window with it). Once something has run and nothing is
+left running or queued (paused, failed and seeding downloads don't count), there is a minute's
+countdown; anything starting again stops it. `reidm when-done none` cancels. The list is saved
+first. The choice is not saved: it lasts until the service stops.
+
+```text
+$ reidm when-done shutdown
+when everything is done: shutdown
+$ reidm when-done
+when everything is done: shutdown, in 54s (cancel with `reidm when-done none`)
+```
 
 ## Finding files on a page
 

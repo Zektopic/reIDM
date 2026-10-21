@@ -1157,11 +1157,12 @@ async fn media_info(State(app): State<App>, h: HeaderMap, Json(b): Json<UrlBody>
     }
 }
 
-async fn grab(State(_app): State<App>, h: HeaderMap, Json(b): Json<GrabBody>) -> Response {
-    if let Err(c) = guard(&_app, &h, true) {
+async fn grab(State(app): State<App>, h: HeaderMap, Json(b): Json<GrabBody>) -> Response {
+    if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    match reidm_core::grabber::grab_page(&b.url, &b.options).await {
+    // Through the proxy the downloads use: a network that needs one for them needs it here.
+    match reidm_core::grabber::grab_through(&b.url, &b.options, &app.mgr.settings().proxy).await {
         Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }

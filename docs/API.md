@@ -113,6 +113,10 @@ Every download, in the order they were added. Cookies are never included.
 | `etag`, `last_modified` | the validators reIDM checks when it resumes |
 | `speed_limit` | this download's own cap in bytes per second, or `null` |
 | `scheduled` | in the scheduled queue (*Download Later*) |
+| `order` | its place in the queue: of the downloads waiting, the lowest starts first (see [Queue order](#queue-order)) |
+| `checksum_ok` | `true`/`false` once the finished file has been checked against `request.checksum`; left out when there was none |
+| `waiting_for_space` | stopped because a drive is too full; it carries on by itself when there is room (see [Not enough space](#not-enough-space)). Left out when not |
+| `note` | what a running download is busy with ("looking up the video"), or why one is waiting for space |
 
 The transfer rate isn't a field: take two readings of `downloaded` a few seconds apart.
 
@@ -136,7 +140,7 @@ item, and a poll while one download moves carries one row.
       "path": "/home/me/Downloads/big.iso", "size": 40000000, "downloaded": 4849664,
       "status": { "state": "Running" }, "added": 1792019963, "last_try": 1792019963,
       "finished_at": null, "resumable": true, "speed_limit": null, "scheduled": false,
-      "connections": 2, "parts": 2
+      "order": 4294967303, "checksum_ok": null, "connections": 2, "parts": 2
     }
   ],
   "removed": []
@@ -152,6 +156,11 @@ Ask again with `?since=<cursor>` (or `If-None-Match: "<cursor>"`). The answer is
 while nothing changed, or `"full": false` with only the rows that changed in `rows` and the ids
 of downloads removed since in `removed`. When the cursor is too old, or from before the service
 restarted, the answer is the whole list again with `"full": true`: replace what you had.
+
+Rows carry `order`, `checksum_ok` (`null` when there is no checksum to check) and, when set,
+`waiting_for_space`. The service rebuilds only the rows of the downloads that changed since the
+last request (`Manager::changed_since`), so with 50,000 downloads and one running a poll costs
+about what it does with five.
 
 ### `GET /api/downloads/{id}`
 
@@ -176,6 +185,12 @@ files. `404` if there is no such download.
 
 Only `url` is required. `filename` overrides the server's name; `dir` the download folder;
 `later: true` puts it in the scheduled queue without starting it.
+
+`"checksum": { "algo": "sha256", "value": "9f86d0…" }` (`md5`, `sha1`, `sha256` or `sha512`; hex,
+any case) is checked once the file is in place. A file that differs is **kept** and the download
+fails with `checksum mismatch: expected sha256 …, got …` and where the file is; resuming it
+checks the file again (for when the expected value was the wrong one), restarting it downloads
+it again. A video or a torrent can't be given one (`400`).
 
 With `"media": { "format": "137+bestaudio/best[height<=1080]" }`, `url` is a page with a video
 and reIDM fetches it through yt-dlp in that format (a
@@ -254,11 +269,51 @@ The same actions for many downloads in one request — *Delete completed*, *Star
 ```
 
 `action` is `pause`, `resume`, `restart`, `remove`, `purge` (remove and delete the files),
-`schedule`, `unschedule`, `seed` or `stop-seeding`. Up to 10,000 ids. The answer is per download:
+`schedule`, `unschedule`, `seed`, `stop-seeding` or `move` (with `"to"`, see
+[Queue order](#queue-order)). Up to 10,000 ids. The answer is per download:
 
 ```json
 { "ok": 2, "failed": 1, "results": [ { "id": 3 }, { "id": 4 }, { "id": 9, "error": "there is no download #9" } ] }
 ```
+
+### Queue order
+
+#### `POST /api/downloads/{id}/move`
+
+```json
+{ "to": "top" }
+```
+
+`to` is `top`, `up`, `down` or `bottom`; `204`. Of the queued downloads, the one with the lowest
+`order` starts first. `up` and `down` move a download past the next one still to do (finished
+downloads never wait in the queue, so they are stepped over); `top` and `bottom` put it before or
+after every other. The bulk call's `move` moves a selection as a block, in its own order: `up`
+on downloads 3 and 4 of 1–5 gives 1, 3, 4, 2, 5. Only the downloads that change place change.
+
+### Checksums
+
+#### `POST /api/downloads/{id}/verify`
+
+```json
+{ "algo": "sha256" }
+```
+
+→ `{ "algo": "sha256", "value": "9f86d0…" }`, the finished file's checksum worked out now (for
+Properties' *Integrity* row; a large file takes a while). `algo` defaults to `sha256`. `400` when
+the download isn't finished, or is a torrent of several files.
+
+### Not enough space
+
+Before a download starts, and every few seconds while it runs, reIDM checks that what it still has
+to write fits on its drives above `min_free_space_mib`: the temporary folder's drive for what is
+not yet written (space already reserved for the part file counts as written), and the download
+folder's drive for the whole file when it is on another drive (the finished file is copied
+there). When it doesn't fit, the download stops — keeping everything it has — as `Paused` with
+`waiting_for_space: true` and a `note` such as `not enough space on /home/me/Downloads: needs
+1.2 GiB more, 900.0 MiB free (reIDM keeps 200.0 MiB free; it carries on by itself when there is
+room)`. Every 30 s reIDM looks again and starts those that now fit, first in the queue first,
+counting each one started against its drive. Pausing such a download makes it wait for the user
+instead; resuming it checks again at once.
 
 #### `POST /api/shutdown`
 
@@ -276,9 +331,11 @@ continues from where it was.
 { "url": "https://cdn.example.com/file.bin?sig=fresh", "referer": "https://example.com/", "cookie": "session=new" }
 ```
 
-reIDM stops the download, asks the new address for its size, and refuses an address that serves
-a different size, or that can't serve byte ranges when part of the file is already done. The
-new server's `ETag` is used from then on. `204` on success; `400` with the reason otherwise:
+reIDM asks the new address for its size first, while the download carries on, and refuses an
+address that serves a different size, or that can't serve byte ranges when part of the file is
+already done — leaving the download exactly as it was. Only then does it stop the download, check
+once more (it may have got its first bytes meanwhile; if the check now fails, it carries on as
+before) and switch it over. The new server's `ETag` is used from then on. `204` on success; `400` with the reason otherwise:
 
 ```text
 the new address is a different file: it is 123 bytes, the download is 50000000 bytes
@@ -337,12 +394,24 @@ still start only as slots free up (*downloads at the same time*).
     "types": { "Video": ["mp4", "mkv", "…"], "…": [] },
     "temp_dir": "/home/me/.local/share/reidm/parts",
     "temp_custom": false
-  }
+  },
+  "seed_ratio": 1.0, "upload_limit": 0, "torrent_port": 6881, "torrent_dht": true,
+  "performance": "balanced",
+  "profiles": {
+    "light": { "connections": 4, "max_concurrent": 2, "write_buffer_kib": 64, "torrent_peers": 40 },
+    "balanced": { "connections": 8, "max_concurrent": 4, "write_buffer_kib": 256, "torrent_peers": 100 },
+    "maximum": { "connections": 16, "max_concurrent": 8, "write_buffer_kib": 1024, "torrent_peers": 200 }
+  },
+  "write_buffer_kib": 256, "retries": 5, "retry_wait_secs": 3, "idle_timeout_secs": 60, "connect_timeout_secs": 30,
+  "proxy": { "mode": "manual", "kind": "socks5", "host": "proxy.lan", "port": 1080, "username": "me",
+             "bypass": ["*.lan", "10.0.0.0/8"], "remote_dns": true, "torrents": false, "videos": true, "password_set": true },
+  "keep_awake": true, "keep_awake_seeding": false, "min_free_space_mib": 200
 }
 ```
 
 `folders.dirs` is each category's folder in effect; `custom` the ones the user chose; `types` the
-extensions that make each category.
+extensions that make each category. `profiles` are the numbers each `performance` preset sets.
+The proxy's password is never sent back: `password_set` says whether there is one.
 
 #### `POST /api/settings`
 
@@ -362,6 +431,35 @@ a new speed limit included, to transfers already running.
 | `sort_by_category` | file downloads into their category's folder |
 | `category_dirs` | `{ "Video": "/full/path", … }` — replaces every choice: a category left out, or empty, goes back to its default (under the download folder). Paths must be absolute; they are created |
 | `temp_dir` | where unfinished downloads wait; `""` is the default (`parts` in the data folder) |
+| `seed_ratio`, `upload_limit`, `torrent_port`, `torrent_dht` | torrents (the port and DHT from the next time the torrent session starts) |
+| `performance` | `light`, `balanced` (the default), `maximum` or `custom`. A preset sets `connections`, `max_concurrent` and `write_buffer_kib` (and the peers per torrent, from the next torrent session) in the same change; any of those three given in the same request wins, and makes it `custom`, as does changing one later. A file from before presets whose numbers aren't a preset's reads as `custom` |
+| `write_buffer_kib` | what each connection collects before writing it, 64–4096 |
+| `retries` | tries per connection without progress, 0–99; 0 tries for ever |
+| `retry_wait_secs` | the first wait before trying again, 1–600; it doubles each time, up to a minute (or the first wait, if longer) |
+| `idle_timeout_secs` | give up on a connection that sends nothing for this long, 10–3600 |
+| `connect_timeout_secs` | give up on a server that doesn't answer within this long, 5–300 |
+| `proxy` | the whole proxy, below. A change applies from each download's next connection |
+| `keep_awake` | keep the computer from sleeping while a download transfers (not while only seeding); let go 30 s after the last one |
+| `keep_awake_seeding` | …and while a torrent seeds |
+| `min_free_space_mib` | the space to keep free on a drive; see [Not enough space](#not-enough-space) |
+
+`proxy`:
+
+```json
+{ "mode": "manual", "kind": "socks5", "host": "proxy.lan", "port": 1080,
+  "username": "me", "password": "secret", "bypass": ["*.lan", "10.0.0.0/8"],
+  "remote_dns": true, "torrents": false, "videos": true }
+```
+
+`mode` is `system` (the default: the environment's `HTTPS_PROXY` and friends, Windows' own
+setting), `none` (directly, whatever the system says) or `manual`. For `manual`: `kind` is
+`http`, `https` or `socks5`; `host` a name or address, without `http://` or a port; `bypass` the
+names (`*.lan` or `.lan`: the domain and everything under it), addresses and networks reached
+directly; `remote_dns` lets a SOCKS5 proxy look names up; `torrents` sends torrents' peer
+connections through a SOCKS5 proxy (from the next torrent session); `videos` passes it to yt-dlp
+(in a private options file, so the password is never on a command line). Leave `password` out to
+keep the one there is; `""` removes it. A proxy that can't work is refused with the reason, and
+nothing changes. Page scans (`/api/grab`) use it too.
 
 ```sh
 curl -s -H "X-Reidm-Token: $TOKEN" -H 'Content-Type: application/json' \
@@ -389,7 +487,10 @@ What the service is able to do right now.
   "extension": { "seconds_ago": 12, "version": "1.1.0", "browser": "Chrome 153" },
   "extension_dir": "C:\\Users\\me\\AppData\\Roaming\\Zektopic\\reIDM\\data\\browser-extension",
   "refresh_armed": null,
-  "warnings": []
+  "warnings": [],
+  "free_space": [ { "path": "/home/me/Downloads", "free": 41234567168 }, { "path": "/home/me/.local/share/reidm/parts", "free": 41234567168 } ],
+  "when_done": { "action": "shutdown", "fires_at": 1792020123 },
+  "exiting": false
 }
 ```
 
@@ -399,7 +500,36 @@ What the service is able to do right now.
 | `extension` | when reIDM's browser extension last checked in, its version and browser; `null` if it hasn't since the service started. It checks in once a minute |
 | `extension_dir` | the folder to load in the browser |
 | `refresh_armed` | the download waiting for a new address from the browser, if any |
-| `warnings` | problems with the download list's storage to tell the user about — the list was damaged and restored from its backup, or saving is failing. The window shows them as a banner |
+| `warnings` | problems to tell the user about — the list was damaged and restored from its backup, saving is failing, or a when-done action failed. The window shows them as a banner |
+| `free_space` | the free space (bytes, or `null` when it can't be read) on the download folder's drive and the temporary folder's, for the status bar |
+| `when_done` | as [`GET /api/when-done`](#get-apiwhen-done) |
+| `exiting` | the service is stopping because everything is done and the action was `exit`: a window should quit too. It stops a few seconds later |
+
+## When everything is done
+
+#### `GET /api/when-done`
+
+```json
+{ "action": "sleep", "fires_at": 1792020123 }
+```
+
+`action` is `none`, `exit`, `sleep`, `hibernate` or `shutdown`. Once something has run since the
+action was chosen and then nothing is running or queued (paused, failed and seeding downloads
+don't count), a 60-second countdown starts: `fires_at` is when it ends (Unix seconds), `null`
+otherwise. Anything starting again stops the countdown and keeps the action. At the end the list
+is saved and the action done, once: `exit` stops the service (status `exiting: true` first);
+`sleep`, `hibernate` and `shutdown` ask the system (Windows: `SetSuspendState`/`ExitWindowsEx`;
+macOS: `pmset sleepnow` — which hibernates when the Mac is set up to — and System Events' *shut
+down*; Linux: `systemctl suspend|hibernate|poweroff`, through logind). Not saved: it lasts until
+the service stops.
+
+#### `POST /api/when-done`
+
+`{ "action": "shutdown" }` → the new state, as above. `400` for anything else.
+
+#### `POST /api/when-done/cancel`
+
+Stops a countdown and sets the action to `none`.
 
 ## Export
 
@@ -513,8 +643,12 @@ checking in (shown in `/api/status`) — unless the browser marks it as coming f
 window report the extension connected.
 
 ```json
-{ "app": "reIDM", "version": "0.6.0", "default_dir": "/home/me/Downloads", "connections": 8, "max_concurrent": 4, "media": true, "folders": { "…": "as in GET /api/settings" } }
+{ "app": "reIDM", "version": "0.6.0", "default_dir": "/home/me/Downloads", "connections": 8, "max_concurrent": 4, "media": true,
+  "refresh_armed": { "id": 7, "name": "big.iso" }, "folders": { "…": "as in GET /api/settings" } }
 ```
+
+`refresh_armed` is the download waiting for a new address (see
+[`refresh-capture`](#post-apidownloadsidrefresh-capture)), with its file name, or `null`.
 
 `media: true` means `/ext/add` accepts `media` (from 0.5.0). An older reIDM would save a video's
 web page instead, so the extension checks this first.
@@ -549,6 +683,15 @@ is holding a browser download.
 `outcome` is `refreshed` when the address became the new address of a download waiting in
 [`refresh-capture`](#post-apidownloadsidrefresh-capture). A refusal is `400` with
 `{ "ok": false, "error": "the link answers with a web page, not a file" }`.
+
+Optional fields (an extension that sends none of them gets the behaviour above):
+
+| Field | |
+|---|---|
+| `checksum` | as in [`POST /api/downloads`](#post-apidownloads) |
+| `request_id` | a string of 1–64 characters that makes the request safe to send again. A repeat with the same id within ten minutes gets the first request's answer — refusals included — and one that arrives while the first is still being checked waits for its answer instead of checking again. At most 4,096 answers are kept |
+| `refresh_id` | this link is the new address of exactly that download. If that download is no longer waiting for one, or the link is not the same file, the answer is a refusal saying why — it is never added as a new download, so a download the extension is holding stays with the browser. The download stays waiting after a wrong link |
+| `no_refresh` | `true`: this is a new download — don't try it against a download waiting for a new address (which stays waiting). Without it, a waiting download that has never been checked (its size unknown) would take any link |
 
 #### `POST /ext/add-batch`
 
