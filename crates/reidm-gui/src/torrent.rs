@@ -1,7 +1,7 @@
 //! *Tasks › Add torrent…*: a magnet link, a `.torrent` address or a `.torrent` file, and the
 //! files in it to download.
 
-use crate::api::Api;
+use crate::api::Client;
 use crate::model::size_human;
 use crate::theme::Palette;
 use egui::{RichText, Vec2};
@@ -20,6 +20,14 @@ pub struct TorrentWindow {
     picked: Vec<bool>,
     error: Option<String>,
     sending: Option<Receiver<Result<(), String>>>,
+    picker: crate::picker::Picker<()>,
+}
+
+impl TorrentWindow {
+    /// Waiting on the service, so the window must keep drawing to notice the answer.
+    pub fn busy(&self) -> bool {
+        self.inspecting.is_some() || self.sending.is_some() || self.picker.busy()
+    }
 }
 
 impl TorrentWindow {
@@ -28,7 +36,7 @@ impl TorrentWindow {
     }
 
     /// Draw the window. Returns a message for the status bar once the torrent is added.
-    pub fn show(&mut self, ctx: &egui::Context, api: &Api, p: &Palette) -> Option<String> {
+    pub fn show(&mut self, ctx: &egui::Context, api: &Client, p: &Palette) -> Option<String> {
         if !self.open {
             return None;
         }
@@ -43,6 +51,9 @@ impl TorrentWindow {
                     Err(e) => self.error = Some(e),
                 }
             }
+        }
+        if let Some(((), path)) = self.picker.poll() {
+            self.use_file(&path, api);
         }
         let mut done = None;
         if let Some(rx) = &self.sending {
@@ -74,18 +85,7 @@ impl TorrentWindow {
                     None => {
                         ui.add(egui::TextEdit::singleline(&mut self.url).hint_text(hint).desired_width(480.0));
                         if ui.button("Browse .torrent…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().add_filter("Torrent", &["torrent"]).pick_file() {
-                                match std::fs::read(&path) {
-                                    Ok(b) => {
-                                        use base64::Engine;
-                                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                        self.file = Some((name, base64::engine::general_purpose::STANDARD.encode(b)));
-                                        self.info = None;
-                                        self.start_inspect(api);
-                                    }
-                                    Err(e) => self.error = Some(format!("cannot read {}: {e}", path.display())),
-                                }
-                            }
+                            self.picker.open(ctx, (), crate::picker::Ask::Open { title: "Add a torrent", filter: ("Torrent", &["torrent"]) });
                         }
                     }
                 }
@@ -133,9 +133,10 @@ impl TorrentWindow {
                 }
             });
             ui.separator();
-            egui::ScrollArea::vertical().max_height((ui.available_height() - 50.0).max(120.0)).auto_shrink([false, false]).show(ui, |ui| {
-                egui::Grid::new("torrent-pick").num_columns(2).striped(true).spacing(Vec2::new(10.0, 4.0)).show(ui, |ui| {
-                    for (f, on) in info.files.iter().zip(self.picked.iter_mut()) {
+            // Only the files in view are laid out: a torrent can hold tens of thousands.
+            egui::ScrollArea::vertical().max_height((ui.available_height() - 50.0).max(120.0)).auto_shrink([false, false]).show_rows(ui, 22.0, info.files.len(), |ui, range| {
+                egui::Grid::new("torrent-pick").num_columns(2).striped(true).spacing(Vec2::new(10.0, 4.0)).min_row_height(18.0).show(ui, |ui| {
+                    for (f, on) in info.files[range.clone()].iter().zip(self.picked[range].iter_mut()) {
                         ui.checkbox(on, &f.path);
                         ui.label(RichText::new(size_human(f.size)).color(p.text_dim).size(12.0));
                         ui.end_row();
@@ -168,7 +169,26 @@ impl TorrentWindow {
         done
     }
 
-    fn start_inspect(&mut self, api: &Api) {
+    /// Open on a `.torrent` file (dropped on the window), and list what it holds.
+    pub fn open_with_file(&mut self, path: &std::path::Path, api: &Client) {
+        *self = TorrentWindow { open: true, ..Default::default() };
+        self.use_file(path, api);
+    }
+
+    fn use_file(&mut self, path: &std::path::Path, api: &Client) {
+        match std::fs::read(path) {
+            Ok(b) => {
+                use base64::Engine;
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.file = Some((name, base64::engine::general_purpose::STANDARD.encode(b)));
+                self.info = None;
+                self.start_inspect(api);
+            }
+            Err(e) => self.error = Some(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+
+    fn start_inspect(&mut self, api: &Client) {
         self.error = None;
         let data = self.file.as_ref().map(|(_, d)| d.clone());
         let url = (!self.url.trim().is_empty() && data.is_none()).then(|| self.url.trim().to_string());

@@ -279,6 +279,11 @@ pub fn uninstall() -> Result<()> {
         for key in keys {
             let _ = std::process::Command::new("reg").args(["delete", &key, "/f"]).status();
         }
+        // The manifests the keys pointed at, which `install` wrote into the data folder.
+        let dir = reidm_core::default_data_dir();
+        for f in [format!("{HOST_NAME}.chromium.json"), format!("{HOST_NAME}.firefox.json"), format!("{REIDM_HOST_NAME}.json")] {
+            let _ = std::fs::remove_file(dir.join(f));
+        }
     }
     #[cfg(not(windows))]
     for t in targets() {
@@ -297,7 +302,7 @@ pub fn uninstall() -> Result<()> {
 
 /// Where the installer put reIDM's extension, if anywhere: next to the binaries on Windows,
 /// in the app bundle's resources on macOS, under `/usr/share` on Linux, or the source tree when
-/// running from a build directory.
+/// running a development build from the build directory.
 pub fn bundled_extension_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let bin = exe.parent()?.to_path_buf();
@@ -307,8 +312,12 @@ pub fn bundled_extension_dir() -> Option<PathBuf> {
         bin.join("../share/reidm/extension"),
         PathBuf::from("/usr/share/reidm/extension"),
     ];
-    // target/{debug,release}/reidm -> the repository's own copy
-    candidates.push(bin.join("../../extension"));
+    // target/debug/reidm -> the repository's own copy. Development builds only: from an
+    // installed `C:\Program Files\reIDM\reidm.exe` the same path is `C:\extension`, a folder
+    // any user can create, whose contents would then be offered as reIDM's extension.
+    if cfg!(debug_assertions) {
+        candidates.push(bin.join("../../extension"));
+    }
     candidates.into_iter().find(|d| d.join("manifest.json").is_file()).and_then(|d| d.canonicalize().ok()).map(plain_path)
 }
 

@@ -128,9 +128,10 @@ transfer.
 
 **Adding.** An address is normalised to a key (query parameters sorted, fragment dropped). A key
 already in the list resumes or reports that download rather than adding a copy. New downloads
-are `Queued`; `pump()` starts queued downloads while fewer than *downloads at the same time*
-are running, reserving the slot under the same lock that checks it, so two callers can't start
-the same download twice.
+are `Queued` and go to the back of the queue (`Item.order`); `pump()` starts queued downloads,
+lowest `order` first, while fewer than *downloads at the same time* are running, reserving the
+slot under the same lock that checks it, so two callers can't start the same download twice.
+Moving downloads in the queue (`queue.rs`) changes the `order` of only those that change place.
 
 **Probing.** The first request is `GET` with `Range: bytes=0-0`. A `206` with a total size
 means the server serves ranges; the answer also gives the file name (`Content-Disposition`), a
@@ -144,7 +145,36 @@ when it's done. When nothing unclaimed is left, a connection splits the range wi
 remaining bytes — taking its second half, if that half is at least 256 KiB — so fast
 connections keep working until the end instead of waiting for the slowest one. A server that
 answers extra connections with `429`/`503` just ends up with fewer: the refused connection hands
-its range back to the others.
+its range back to the others, and every 30 seconds the download tries to get back to its full
+number of connections. A connection that breaks off after making progress carries on from where
+it got to without using up a retry; only failures that get nowhere count towards the retries.
+
+A connection collects what it receives into a buffer (`write_buffer_kib`, 256 KiB by default, or
+a second's worth when it is slow) and writes that at its offset with a positional write on the
+blocking pool; the bytes count as downloaded only once the write has returned. A request that
+gets no answer within `connect_timeout_secs` (30), or a body that goes quiet for
+`idle_timeout_secs` (60), is retried, and Pause wakes a connection whatever it is waiting on — the
+server, or the speed limit. The performance presets (`settings.rs`, `Performance::apply`) set the
+connections, downloads at once and this buffer together.
+
+**Network.** Every request goes through one `reqwest` client built from the settings: the proxy
+(`system`, `none` or a manual HTTP/HTTPS/SOCKS5 one with a bypass list) and the two time limits.
+A change builds a new client; a running download takes it at its next connection. yt-dlp is
+given the proxy in a private options file (never on its command line), and torrents' peer
+connections go through a SOCKS5 proxy when asked, from the next torrent session.
+
+**Space.** Before a download starts, and with each checkpoint while it runs (every 10 s for videos
+and torrents, whose writes reIDM doesn't see), `space.rs` checks that what is still to be written
+fits on its drives above `min_free_space_mib` — space already reserved for the part file counts as
+written, and a download folder on another drive needs the whole file for the final copy. If not,
+the run stops like a Pause (everything written is kept and recorded), the download is `Paused`
+with `waiting_for_space` and a note saying how much it needs, and every 30 s the downloads waiting
+for space that now fit — counted against each drive's free space in queue order — are queued
+again.
+
+**Checksums.** A download given a checksum is hashed (MD5, SHA-1, SHA-256 or SHA-512) on the
+blocking pool once it is in place; a mismatch fails the download and keeps the file. Resuming it
+hashes the file again instead of downloading.
 
 **Correctness checks.** Range requests carry `If-Range` with the strong `ETag` from the probe,
 so a server whose file has changed answers with the whole new file (`200`) instead of the range.
@@ -153,8 +183,9 @@ changed on the server* rather than splicing two versions together. A response th
 different byte than the one asked for is rejected before anything is written. Responses are
 never transparently decompressed: the bytes on disk are the bytes the server stores.
 
-**Failures.** A failed connection is retried five times with growing pauses; a connection that
-delivers nothing for 60 seconds counts as failed. Errors that retrying can't fix (a changed file,
+**Failures.** A failed connection is retried `retries` times (5; 0 for ever), waiting
+`retry_wait_secs` (3) first and twice as long each time, up to a minute; a connection that
+delivers nothing for `idle_timeout_secs` counts as failed. Errors that retrying can't fix (a changed file,
 a disk error) stop the download at once.
 
 **Speed limits.** A token bucket (half a second of burst) shared by every connection of every
@@ -166,28 +197,64 @@ crossed since the last check — in local time, on the selected days — and sta
 scheduled queue. A stop time before the start time means the next morning. Missing a start
 while asleep starts the queue on waking, unless the stop time also passed.
 
+**Power.** Once a second the service looks at whether anything transfers (`power.rs`). While
+something does, and for 30 s after, it holds the system's sleep inhibitor (`keep_awake`; also
+while seeding with `keep_awake_seeding`): a `systemd-inhibit --what=sleep … cat` child on Linux and
+`caffeinate -i -w <pid>` on macOS — each ends by itself if reIDM dies, `cat` when reIDM's end of its
+input pipe closes — and a thread holding `SetThreadExecutionState(ES_SYSTEM_REQUIRED)` on Windows.
+The same look runs the when-done countdown: once something has run since an action was chosen
+and nothing is running or queued, 60 s, then the list is saved and the action done — `exit`
+through the service's shutdown, the others through the system (`PowerActions`). Both the
+inhibitor and the actions are traits, faked in the tests.
+
 ## Persistence
 
 | File (in the data folder) | Written |
 |---|---|
-| `downloads.json` | the list, including each range's progress: every 3 seconds while transferring, and on every change |
-| `settings.json` | on every settings change |
+| `downloads.json` | the list, including each range's progress: within 2 seconds of a change (longer for a list that takes long to save, up to 30 s), at once for adds, removals and status changes (mode 0600: it holds cookies) |
+| `downloads.json.bak` | the previous copy of the list, kept by each save |
+| `settings.json` | on every settings change (mode 0600, with a `.bak` as well) |
 | `api-token` | at service start (mode 0600); removed at shutdown |
 | `browser-extension/` | synced from the bundled extension at service start |
 | `gui.json` | the window's preferences |
 
-Files are written to a temporary name and renamed, so a crash leaves the old version rather than
-half a file. The data being downloaded goes to `<id>-<file>.reidm` in the temporary folder
-(`parts/` in the data folder unless set), pre-allocated to full size when the size is known, and
-moved to its folder when complete — a rename, or a copy and delete across drives. The folder is
+The list lives in memory behind one lock (`store.rs`), its items copy-on-write. Whatever changes
+it through that lock moves the revision (`Manager::revision`, for clients polling for changes) on
+and schedules a save; one thread does the saving. Taking an item for writing also records its id
+against the new revision (`Manager::changed_since`, the last 65,536 ids), so the service's row
+cache serialises only the rows that changed — with running downloads, whose progress moves the
+revision without such a record, always counted as changed. The saver waits up to 25 times as long
+as the last save took (2–30 s) for more changes, so a long list costs at most a few per cent of a
+core to keep on disk. It copies the list's pointers under the lock and
+serialises and writes outside it, so a list of thousands never holds up the service while it is
+written. A save goes to a temporary file, which is flushed to the disk, then renamed over the old
+one; the old one becomes `.bak` (a hard link), and the folder is flushed too. On start, a damaged
+list or settings file is kept aside as `<name>.corrupt-<time>` and its `.bak` used; with neither,
+reIDM starts empty and says so (`Manager::warnings`). A file that exists but can't be read is an
+error instead, since saving an empty list over it would destroy it. `Manager::flush` writes
+what is pending at once and waits for it, for shutting down.
+
+The data being downloaded goes to `<id>-<file>.reidm` in the temporary folder (`parts/` in the
+data folder unless set); its location is recorded in the list, so changing the temporary folder
+does not orphan it. It is given its full size when the size is known: on Linux the space is
+reserved (`fallocate`), so a disk too small for it says so at once; on Windows the file is made
+sparse first, or NTFS would fill everything below the first write with zeros before that write
+returns. When complete it is moved to its folder with a rename that refuses to replace anything:
+a file that has appeared there since (the browser's own copy, one the user saved) is kept, and the
+download takes the next free name. Across drives it is copied beside its destination under a
+temporary name first. Only *Redownload* of a finished download replaces that download's own file.
+The finished file is marked as downloaded from the internet — `Zone.Identifier` on Windows,
+`com.apple.quarantine` on macOS — as the browser would have marked it. The folder is
 its type's (`category.rs`: Compressed, Documents, Images, Music, Programs, Video, else the
 download folder), chosen from the likely name when added and again from the server's name after
 the probe. A part file already beside its final file (from before 0.6) is used where it is.
 
-On start, downloads that were running are marked paused. Before resuming one, the engine checks
-that the part file holds at least as much as the list says was written; if not — the file was
-deleted, or the list was saved after data that never reached the disk — it starts that download
-over rather than leave zeros in the middle of the file.
+On start, downloads that were running are marked paused. Progress reaches the list only through a
+checkpoint (every 3 seconds, and when a run ends), which reads the ranges, flushes the part file to
+the disk, and only then records them: every byte the list counts was written before that flush.
+So a crash, a power cut or a full disk can cost the last few seconds, never a hole in the file.
+Before resuming, the engine still checks that the part file is at least as long as the progress
+recorded; if not — the part file was deleted or truncated — it starts that download over.
 
 ## Security model
 
@@ -197,11 +264,11 @@ to `127.0.0.1`, so each entry point says how it tells the two apart.
 
 | Entry point | Who is let in | How |
 |---|---|---|
-| `/api/*` (port 61002) | the window, the CLI, your scripts | a random token, new at every start, in a file only your user can read, sent as `X-Reidm-Token`. The `Host` must be `127.0.0.1:61002`/`localhost:61002` (stops DNS rebinding) and any `Origin` must be the service's own. |
+| `/api/*` (port 61002) | the window, the CLI, your scripts | a random token, new at every start, in a file only your user can read, sent as `X-Reidm-Token` and compared in constant time. The `Host` must be `127.0.0.1:61002`/`localhost:61002`/`[::1]:61002` (stops DNS rebinding) and any `Origin` must be the service's own. |
 | `/` (the web view) | your browser, typing the address | served without the token check, with the token embedded in the page. `Host` and `Origin` checks as above; `frame-ancestors 'none'` so no page can frame it. |
-| `/ext/*` (port 61002) | reIDM's browser extension | an `Origin` that is a browser extension, or no `Origin` at all. Browsers set `Origin` themselves; a page can't claim an extension's origin, and can't leave its own off. CORS preflights are answered only for extension origins, so a page can't even send the JSON request. |
-| WebSocket (61001, 1001) | Tonec's extension, `reidm-host`, the CLI | the same `Origin` rule, checked during the handshake. |
-| `reidm-host` | the two extensions | each native-messaging manifest lists exactly one extension ID in `allowed_origins`; the browser refuses every other caller. |
+| `/ext/*` (port 61002) | reIDM's browser extension | the same `Host` rule as `/api/*`, and an `Origin` that is a browser extension, or no `Origin` at all. Browsers set `Origin` themselves; a page can't claim an extension's origin, and can't leave its own off. CORS preflights are answered only for extension origins, so a page can't even send the JSON request. A ping a browser marks `Sec-Fetch-Site: cross-site` (an `<img>` on a page) is answered but not counted as the extension checking in. |
+| WebSocket (61001, 1001) | Tonec's extension, `reidm-host` | the same `Origin` rule, checked during the handshake. Only the IDM protocol is spoken: nothing on it can pause, remove or delete a download. |
+| `reidm-host` | the two extensions | each native-messaging manifest lists exactly one extension ID in `allowed_origins`; the browser refuses every other caller, and the host itself refuses to relay for any caller but those two. It passes on only the IDM protocol's own message types. |
 
 What this does and doesn't protect against:
 
@@ -214,8 +281,8 @@ What this does and doesn't protect against:
 - **Other users** on the same machine can't read your token (mode 0600 on Unix; on Windows the
   data folder is in your profile), so they can't use `/api/`. They *can* reach the extension
   endpoints and the WebSocket, which can't tell a local program from the extension, and so could
-  add downloads to your list. IDM's own port has the same property. On a personal machine it
-  doesn't arise; on a shared one, bear it in mind.
+  add downloads to your list — but not pause, remove or delete any. IDM's own port has the same
+  property. On a personal machine it doesn't arise; on a shared one, bear it in mind.
 - **Cookies.** The extension reads cookies only for the address it is handing over, only when it
   hands it over. reIDM keeps them with the download so it can resume, never returns them from
   the API, and never writes them into exports.
@@ -230,8 +297,15 @@ What this does and doesn't protect against:
 | Path | |
 |---|---|
 | `crates/reidm-proto` | the IDM wire format: message encoding and the native-messaging framing |
-| `crates/reidm-core/src/lib.rs` | the engine: `Manager`, probing, segmentation, retries, persistence |
-| `crates/reidm-core/src/limiter.rs` | the token-bucket speed limiter |
+| `crates/reidm-core/src/lib.rs` | the engine: `Manager`, probing, segmentation, retries |
+| `crates/reidm-core/src/store.rs` | the list in memory, its saver thread, and crash-safe loading and saving |
+| `crates/reidm-core/src/disk.rs` | positional writes, preallocation, the no-replace rename, Mark-of-the-Web, free space |
+| `crates/reidm-core/src/settings.rs` | the settings, their patch, the performance presets and the proxy |
+| `crates/reidm-core/src/queue.rs` | the queue's order and moving downloads in it |
+| `crates/reidm-core/src/space.rs` | the not-enough-space pause and its retry |
+| `crates/reidm-core/src/checksum.rs` | expected checksums and hashing files |
+| `crates/reidm-core/src/power.rs` | the sleep inhibitor and the when-done countdown and actions |
+| `crates/reidm-core/src/limiter.rs` | the token-bucket speed limiter, shared by every download (videos and torrents charge their bytes to it) |
 | `crates/reidm-core/src/schedule.rs` | the scheduler's time windows |
 | `crates/reidm-core/src/lists.rs` | `.ef2` import/export, batch patterns |
 | `crates/reidm-core/src/torrent.rs` | torrents through [librqbit](https://github.com/ikatson/rqbit): one session for all, matched to the list by info hash; downloading, seeding to the share ratio, and the session's records in `torrents/` |

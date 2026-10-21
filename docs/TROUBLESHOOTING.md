@@ -95,12 +95,26 @@ Properties:
 | *Requested format is not available* | that format isn't offered any more; pick another quality. The list's choices fall back to the nearest quality by themselves, so this comes from a hand-written `reidm add --video` format |
 | *Sign in to confirm you're not a bot* | open the video in the browser while signed in to YouTube and start it from there: your cookies go with it |
 | *…need ffmpeg to be joined* | install ffmpeg (`sudo apt install ffmpeg`, `brew install ffmpeg`), or pick a format with sound (360p and below usually have it). On Windows reIDM fetches ffmpeg itself |
-| *could not get yt-dlp* | reIDM couldn't reach GitHub to fetch it. Check the connection, or install yt-dlp yourself and put it on the `PATH` |
+| *could not get yt-dlp* | reIDM couldn't reach GitHub to fetch it. Check the connection, or install yt-dlp yourself and put it on the `PATH`. After a failure reIDM waits two minutes before trying again, so a queue of videos doesn't each wait on the same failed connection |
 | *Video unavailable*, *Private video* | the video can't be watched from your account or country, so it can't be downloaded either |
 
 When YouTube changes something, yt-dlp usually follows within days. reIDM checks for a newer
-yt-dlp once a day; to force it, delete the `tools` folder in the
-[data folder](USER_GUIDE.md#where-reidm-keeps-things).
+yt-dlp once a day (an hour after a check that failed); to force it, delete the `tools` folder in
+the [data folder](USER_GUIDE.md#where-reidm-keeps-things).
+
+A long video download can outlive the addresses YouTube gave for it (they expire after about six
+hours), or lose its connection partway. reIDM then runs yt-dlp again by itself: it reads the
+video's page afresh for new addresses and carries on from the pieces it has. It keeps doing so as
+long as each run gets further than the last; a video refused from the start fails at once with
+yt-dlp's reason.
+
+**A torrent fails with *a file this torrent would create already exists*.** reIDM never writes
+over a file it didn't create. That happens only if something else put a file there in the moment
+between reIDM choosing the place and the torrent starting: move it away and resume.
+
+**A torrent fails with *this torrent is already in the list*.** The same torrent was added twice
+under different addresses (a magnet link and a `.torrent` from another site, say). Keep one; two
+would share one set of files, and removing either with its files would delete the other's.
 
 **A torrent stays at *Looking for peers*.** No one is sharing it right now, or none can be
 reached: a magnet link needs the DHT (Options › Torrents), and a firewall may be blocking
@@ -109,6 +123,37 @@ reIDM — allow it when Windows asks. An old torrent may simply have no seeders 
 **A torrent downloads, but uploads little.** Others can't connect to you: allow reIDM through the
 firewall, and check that the listening port (Options › Torrents) is forwarded by your router —
 reIDM asks routers that support it (UPnP).
+
+**A download is *Paused* with "not enough space on …".** Carrying on would have left that drive
+with less free space than reIDM keeps (200 MiB, *Advanced settings › Free space to keep*). Nothing
+it downloaded is lost. Free some space — or choose another download or temporary folder — and it
+carries on by itself within half a minute; *Resume* checks at once. Pausing it means it waits for
+you instead. When the download folder is on another drive than the temporary folder, that drive
+needs room for the whole file, which is copied there at the end.
+
+**"checksum mismatch: expected …, got …".** The file downloaded is not the one the checksum
+describes. It is kept where it was saved. Check that the expected value is the right one (the
+page's checksum for *this* file, and the right kind — SHA-256 is not MD5): *Resume* checks the
+file again. If the value is right, the file was damaged or replaced on the way: *Restart*
+downloads it again.
+
+**Downloads fail since a proxy was set.** Options › Network: check the server, port and kind
+(an HTTP proxy is not a SOCKS5 one), and the user name and password. Hosts in the bypass list are
+reached directly. Videos use the same proxy unless *Videos through the proxy* is off; torrents
+only through a SOCKS5 proxy, and only when asked (from the next start of the torrent engine).
+*Use the system's proxy* follows the `HTTPS_PROXY`/`HTTP_PROXY` environment variables (and
+Windows' own setting).
+
+**The computer still goes to sleep during a download.** *Keep the computer awake* (Options ›
+General) is on by default. On Linux it needs `systemd-inhibit` (systemd's logind); without it the
+service's log says *cannot keep the computer awake*. A laptop told to sleep (its lid closed, the
+power button) still sleeps: only automatic sleep is held off. While only seeding, reIDM lets the
+computer sleep unless *also while seeding* is on.
+
+**The computer slept or shut down after downloading.** Someone chose it under *When everything is
+done* (or `reidm when-done`). It waits a minute after the last download, cancellable from the
+window or with `reidm when-done none`, and is forgotten when reIDM stops. If it did *not* happen,
+the status banner says why the system refused (on Linux, logind's permission for the session).
 
 **Resume capability: No.** The server doesn't serve byte ranges. The download uses one connection,
 and stopping it means starting again. Nothing in reIDM can change that.
@@ -146,10 +191,24 @@ or use **Restart**.
 and 61002 are taken — almost always by another reIDM. Find it (`ss -ltnp | grep 6100`,
 `lsof -i :61002`, or on Windows `netstat -ano | findstr 6100`) and stop it, or just use that one.
 
-**The service won't start: "corrupt downloads.json".** reIDM refuses to start with an unreadable
-list rather than start with an empty one and lose your downloads. It writes the list atomically,
-so this takes something outside reIDM — a disk error, an edit by hand. Move `downloads.json` out
-of the data folder (or fix it) and start again; the files already downloaded are untouched.
+**The list came back older, or empty, with a warning about `downloads.json`.** reIDM keeps the
+previous copy of the list as `downloads.json.bak`. If the list is damaged when the service starts
+(a disk error, an edit by hand), the damaged file is kept as `downloads.json.corrupt-<time>` and
+the backup is used; with no usable backup, the service starts with an empty list and says so. The
+files already downloaded are untouched either way. `settings.json` is handled the same way.
+
+**The service won't start: "cannot read downloads.json".** The file is there but can't be read —
+usually because it belongs to another user, after reIDM was run with `sudo`. reIDM won't start
+with an empty list and save it over yours. Give the file back to your user (`sudo chown "$USER"
+<data folder>/downloads.json`) and start again.
+
+**A download failed with "the disk is full".** Free some space and resume it: what it had
+downloaded is kept. On Linux, reIDM reserves a download's full size when it starts, so a disk
+that is too small says so straight away rather than part way through.
+
+**A finished download is called `name (1).ext`.** Something else was saved under its name while
+it downloaded — often the browser's own copy. reIDM never replaces a file it did not create, so
+both are kept.
 
 **The window says it can't reach the service, but it's running.** The window authenticates with
 the token in the data folder's `api-token`, written when the service starts. If the service runs

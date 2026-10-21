@@ -1,37 +1,19 @@
-//! Mirrors the daemon's `downloads.json` / `/api/downloads` JSON.
+//! Mirrors the daemon's JSON: the list's rows (`/api/downloads/rows`), settings and status.
 
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Request {
     pub url: String,
-    #[serde(default)]
     pub referer: Option<String>,
-    #[serde(default)]
-    pub user_agent: Option<String>,
     /// A video fetched through yt-dlp: `url` is then the page, and this the format asked for.
-    #[serde(default)]
     pub media: Option<Media>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 pub struct Media {
     pub format: String,
-}
-
-/// One byte range of a download and how far it has got.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct Segment {
-    pub start: u64,
-    /// Inclusive; `u64::MAX` when the length is unknown.
-    pub end: u64,
-    pub done: u64,
-    #[serde(default)]
-    pub finished: bool,
-    /// A connection is working on it right now.
-    #[serde(default)]
-    pub active: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -62,40 +44,160 @@ impl Status {
     pub fn is_stopped(&self) -> bool {
         matches!(self, Status::Paused | Status::Failed(_))
     }
+
+    /// Sorting order for the Status column: what needs attention first.
+    pub fn rank(&self) -> u8 {
+        match self {
+            Status::Running => 0,
+            Status::Queued => 1,
+            Status::Paused => 2,
+            Status::Failed(_) => 3,
+            Status::Done => 4,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// A torrent's summary, as a list row carries it (the file list is only in the full item).
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
+pub struct TorrentRow {
+    #[serde(default)]
+    pub info_hash: String,
+    #[serde(default)]
+    pub name: String,
+    /// Where its files are, when known.
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
+    #[serde(default)]
+    pub uploaded: u64,
+    #[serde(default)]
+    pub peers: u32,
+    #[serde(default)]
+    pub seeding: bool,
+    #[serde(default)]
+    pub files: usize,
+    #[serde(default)]
+    pub skipped: usize,
+}
+
+/// One row of the download list.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(from = "RowWire")]
 pub struct Item {
     pub id: u64,
     pub request: Request,
     pub path: PathBuf,
-    #[serde(default)]
     pub size: Option<u64>,
-    #[serde(default)]
     pub downloaded: u64,
     pub status: Status,
-    #[serde(default)]
     pub added: u64,
-    #[serde(default)]
     pub last_try: Option<u64>,
-    #[serde(default)]
     pub finished_at: Option<u64>,
-    #[serde(default)]
-    pub segments: Vec<Segment>,
-    #[serde(default)]
     pub resumable: bool,
     /// This download's own speed cap, bytes per second.
-    #[serde(default)]
     pub speed_limit: Option<u64>,
     /// In the scheduled queue (*Download Later*).
-    #[serde(default)]
     pub scheduled: bool,
     /// What a running download is busy with ("looking up the video"), when progress can't say.
-    #[serde(default)]
     pub note: Option<String>,
-    /// A torrent's files, peers, and what it has shared.
+    /// Connections transferring right now.
+    pub connections: usize,
+    /// How many byte ranges it is split into.
+    pub parts: usize,
+    pub torrent: Option<TorrentRow>,
+    /// Its place in the queue (lowest starts first); `None` from a service that keeps no order.
+    pub order: Option<u64>,
+    /// Whether the finished file matched the checksum it was added with: `Some(None)` when it
+    /// had none, `None` from a service that doesn't check checksums.
+    pub checksum_ok: Option<Option<bool>>,
+    /// Paused because a drive is too full; it carries on by itself when there is room, and
+    /// `note` says which drive and how much.
+    pub waiting_for_space: bool,
+    // Worked out once when the row arrives, not on every frame: the list is filtered, sorted and
+    // counted by these, and with tens of thousands of rows the allocations add up.
+    name: String,
+    name_lower: String,
+    url_lower: String,
+    category: Category,
+}
+
+/// The row as the service sends it.
+#[derive(Deserialize)]
+struct RowWire {
+    id: u64,
+    url: String,
     #[serde(default)]
-    pub torrent: Option<reidm_core::TorrentStatus>,
+    referer: Option<String>,
+    #[serde(default)]
+    media: Option<Media>,
+    path: PathBuf,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    downloaded: u64,
+    status: Status,
+    #[serde(default)]
+    added: u64,
+    #[serde(default)]
+    last_try: Option<u64>,
+    #[serde(default)]
+    finished_at: Option<u64>,
+    #[serde(default)]
+    resumable: bool,
+    #[serde(default)]
+    speed_limit: Option<u64>,
+    #[serde(default)]
+    scheduled: bool,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    connections: usize,
+    #[serde(default)]
+    parts: usize,
+    #[serde(default)]
+    torrent: Option<TorrentRow>,
+    #[serde(default)]
+    order: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    checksum_ok: Option<Option<bool>>,
+    #[serde(default)]
+    waiting_for_space: bool,
+}
+
+/// A field that may be `null`: present (even as `null`) is `Some`, absent is `None`.
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
+}
+
+impl From<RowWire> for Item {
+    fn from(w: RowWire) -> Item {
+        let name = w.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| w.path.to_string_lossy().into_owned());
+        let ext = w.path.extension().map(|e| e.to_string_lossy().to_ascii_uppercase()).unwrap_or_default();
+        Item {
+            id: w.id,
+            name_lower: name.to_lowercase(),
+            url_lower: w.url.to_lowercase(),
+            category: Category::of(&ext),
+            name,
+            request: Request { url: w.url, referer: w.referer, media: w.media },
+            path: w.path,
+            size: w.size,
+            downloaded: w.downloaded,
+            status: w.status,
+            added: w.added,
+            last_try: w.last_try,
+            finished_at: w.finished_at,
+            resumable: w.resumable,
+            speed_limit: w.speed_limit,
+            scheduled: w.scheduled,
+            note: w.note,
+            connections: w.connections,
+            parts: w.parts,
+            torrent: w.torrent,
+            order: w.order,
+            checksum_ok: w.checksum_ok,
+            waiting_for_space: w.waiting_for_space,
+        }
+    }
 }
 
 impl Item {
@@ -110,24 +212,39 @@ impl Item {
     pub fn seeding(&self) -> bool {
         self.status == Status::Done && self.torrent.as_ref().is_some_and(|t| t.seeding)
     }
-}
 
-impl Item {
-    /// Connections transferring right now.
-    pub fn connections(&self) -> usize {
-        self.segments.iter().filter(|s| s.active).count()
+    pub fn file_name(&self) -> &str {
+        &self.name
     }
 
-    pub fn file_name(&self) -> String {
-        self.path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.to_string_lossy().into_owned())
+    /// The file name in lower case, for searching and sorting.
+    pub fn name_lower(&self) -> &str {
+        &self.name_lower
+    }
+
+    pub fn url_lower(&self) -> &str {
+        &self.url_lower
+    }
+
+    /// The status column's words and its tooltip: what a download is doing, said plainly where
+    /// the status alone would mislead (paused for space isn't paused by the user; a checksum
+    /// mismatch isn't a network error).
+    pub fn state_text(&self) -> (String, String) {
+        let note = self.note.clone().unwrap_or_default();
+        match &self.status {
+            Status::Paused if self.waiting_for_space => ("Waiting for disk space".into(), note),
+            Status::Failed(e) if e.starts_with("checksum mismatch") => ("Checksum mismatch".into(), e.clone()),
+            Status::Running if !note.is_empty() => {
+                let mut c = note.chars();
+                (c.next().map(|f| format!("{}{}…", f.to_uppercase(), c.as_str())).unwrap_or_default(), String::new())
+            }
+            s => (s.label().to_string(), String::new()),
+        }
     }
 
     /// 0.0..=1.0, or `None` when the server never told us a size.
     pub fn fraction(&self) -> Option<f32> {
-        match (self.size, self.status.clone()) {
+        match (self.size, &self.status) {
             (Some(_), Status::Done) => Some(1.0),
             (Some(sz), _) if sz > 0 => Some((self.downloaded as f32 / sz as f32).clamp(0.0, 1.0)),
             _ => None,
@@ -136,14 +253,13 @@ impl Item {
 
     /// The category this file belongs to, from its extension.
     pub fn category(&self) -> Category {
-        let ext = self
-            .path
-            .extension()
-            .map(|e| e.to_string_lossy().to_ascii_uppercase())
-            .unwrap_or_default();
-        Category::of(&ext)
+        self.category
     }
 }
+
+/// A download with every field, for the Properties window: its segment map and a torrent's
+/// files, which list rows leave out.
+pub type Detail = reidm_core::Item;
 
 /// IDM groups downloads into a fixed set of categories; reIDM uses the same idea and the same
 /// extension vocabulary the browser extension sends in its type-4 settings message.
@@ -249,7 +365,7 @@ pub struct Schedule {
 }
 
 /// The daemon's settings, mirrored.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct Settings {
     #[serde(default)]
     pub default_dir: String,
@@ -273,10 +389,107 @@ pub struct Settings {
     pub torrent_port: u16,
     #[serde(default)]
     pub torrent_dht: bool,
+    // What 0.8's service adds. An older one leaves them out, and the window then hides the
+    // options they hold instead of showing values it can't save.
+    #[serde(default)]
+    pub performance: Option<Performance>,
+    #[serde(default)]
+    pub write_buffer_kib: Option<u32>,
+    #[serde(default)]
+    pub retries: Option<u32>,
+    #[serde(default)]
+    pub retry_wait_secs: Option<u32>,
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u32>,
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u32>,
+    #[serde(default)]
+    pub proxy: Option<Proxy>,
+    #[serde(default)]
+    pub keep_awake: Option<bool>,
+    #[serde(default)]
+    pub keep_awake_seeding: Option<bool>,
+    #[serde(default)]
+    pub min_free_space_mib: Option<u64>,
+    /// What each preset sets (the service's table), by preset name.
+    #[serde(default)]
+    pub profiles: std::collections::BTreeMap<String, Profile>,
+}
+
+/// The knobs one performance preset sets, as `GET /api/settings` lists them.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub struct Profile {
+    #[serde(default)]
+    pub connections: usize,
+    #[serde(default)]
+    pub max_concurrent: usize,
+    #[serde(default)]
+    pub write_buffer_kib: u32,
+}
+
+/// How hard reIDM works: a preset for connections, downloads at once and write buffers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Performance {
+    Light,
+    #[default]
+    Balanced,
+    Maximum,
+    /// The knobs differ from every preset. Anything this window doesn't know reads as this too,
+    /// rather than failing to load the settings at all.
+    #[serde(other)]
+    Custom,
+}
+
+/// The proxy, as the service reports it. The password is never sent back, only whether one is
+/// set.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct Proxy {
+    #[serde(default)]
+    pub mode: ProxyMode,
+    #[serde(default)]
+    pub kind: Option<ProxyKind>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password_set: bool,
+    #[serde(default)]
+    pub bypass: Vec<String>,
+    #[serde(default)]
+    pub remote_dns: Option<bool>,
+    #[serde(default)]
+    pub torrents: Option<bool>,
+    #[serde(default)]
+    pub videos: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    None,
+    Manual,
+    /// Last, so that a mode this window doesn't know reads as the default.
+    #[default]
+    #[serde(other)]
+    System,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyKind {
+    Https,
+    Socks5,
+    #[default]
+    #[serde(other)]
+    Http,
 }
 
 /// Where each type of file goes, as the service reports it.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct Folders {
     #[serde(default)]
     pub sort: bool,
@@ -292,8 +505,27 @@ pub struct Folders {
     pub temp_custom: bool,
 }
 
+/// How much room a folder's disk has, as `/api/status` reports it.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct FreeSpace {
+    #[serde(default)]
+    pub path: String,
+    /// `None` when the service couldn't read the drive.
+    #[serde(default)]
+    pub free: Option<u64>,
+}
+
+/// The status bar's free space: the download folder's disk (or the first reported), the
+/// tooltip listing every folder, and whether it is getting low (under 1 GB).
+pub fn free_space_line(free: &[FreeSpace], download_dir: Option<&str>) -> Option<(String, String, bool)> {
+    let known: Vec<(&str, u64)> = free.iter().filter_map(|f| Some((f.path.as_str(), f.free?))).collect();
+    let main = known.iter().find(|(p, _)| Some(*p) == download_dir).or_else(|| known.first())?;
+    let tip = known.iter().map(|(p, n)| format!("{p}: {} free", size_human(*n))).collect::<Vec<_>>().join("\n");
+    Some((format!("{} free", size_human(main.1)), tip, main.1 < 1_000_000_000))
+}
+
 /// When reIDM's own browser extension last checked in.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct ExtensionSeen {
     #[serde(default)]
     pub seconds_ago: u64,
@@ -382,4 +614,40 @@ pub fn eta_human(secs: f64) -> String {
     }
     let s = secs as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_status_says_why_a_download_stopped() {
+        let row = |v: serde_json::Value| -> Item {
+            let mut base = serde_json::json!({ "id": 1, "url": "https://example.com/a.iso", "path": "/dl/a.iso", "status": { "state": "Paused" } });
+            base.as_object_mut().unwrap().extend(v.as_object().unwrap().clone());
+            serde_json::from_value(base).unwrap()
+        };
+        let waiting = row(serde_json::json!({ "waiting_for_space": true, "note": "not enough space on /dl: needs 2.0 GB more, 1.0 GB free" }));
+        assert_eq!(waiting.state_text(), ("Waiting for disk space".to_string(), "not enough space on /dl: needs 2.0 GB more, 1.0 GB free".to_string()));
+        assert_eq!(row(serde_json::json!({})).state_text().0, "Paused", "paused by the user");
+        let bad = row(serde_json::json!({ "status": { "state": "Failed", "error": "checksum mismatch: expected 00, got 11" } }));
+        assert_eq!(bad.state_text().0, "Checksum mismatch");
+        assert_eq!(row(serde_json::json!({ "status": { "state": "Running" }, "note": "looking up the video" })).state_text().0, "Looking up the video…");
+        let old = row(serde_json::json!({}));
+        assert_eq!((old.order, old.checksum_ok, old.waiting_for_space), (None, None, false), "an older service's row");
+        let new = row(serde_json::json!({ "order": 4294967296u64, "checksum_ok": null }));
+        assert_eq!((new.order, new.checksum_ok), (Some(4_294_967_296), Some(None)), "present but null is not absent");
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_download_folder_s_disk() {
+        let fs = [FreeSpace { path: "/tmp/parts".into(), free: Some(500_000_000) }, FreeSpace { path: "/home/me/Downloads".into(), free: Some(123_456_789_012) }, FreeSpace { path: "/mnt/gone".into(), free: None }];
+        let (text, tip, low) = free_space_line(&fs, Some("/home/me/Downloads")).unwrap();
+        assert_eq!(text, "123.5 GB free");
+        assert_eq!(tip, "/tmp/parts: 500.0 MB free\n/home/me/Downloads: 123.5 GB free");
+        assert!(!low);
+        assert!(free_space_line(&fs, None).unwrap().2, "the first, and it is low");
+        assert_eq!(free_space_line(&[], None), None);
+        assert_eq!(free_space_line(&fs[2..], None), None, "a drive that couldn't be read says nothing");
+    }
 }

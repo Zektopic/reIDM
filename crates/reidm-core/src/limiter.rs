@@ -4,14 +4,22 @@
 //! its own as well; a chunk is paced by both. The bucket is allowed to go into debt, which is
 //! what keeps concurrent connections honest: if eight connections each take 64 KiB at the same
 //! moment, the eighth waits for all eight chunks' worth of time, not one.
+//!
+//! Bytes that are paced elsewhere — yt-dlp's own `--limit-rate`, librqbit's own bucket — are
+//! [charged](Limiter::charge) to the global bucket after the fact, so the HTTP downloads give
+//! way to them and the global limit holds for everything together.
+//!
+//! Connections get bandwidth in proportion to how often they ask, so a download with eight
+//! connections gets more of a shared limit than one with two. That is how IDM behaves too.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// How often a long wait looks at the cancel flag, so Pause still takes effect under a very low
-/// limit.
-const TICK: Duration = Duration::from_millis(250);
+/// The most that [`Limiter::charge`] may put the bucket in debt, in seconds of the rate: enough
+/// to make the HTTP downloads give way, not so much that they stall for long after a burst.
+const MAX_CHARGED_DEBT: f64 = 1.0;
 
 pub struct Limiter {
     /// Bytes per second; 0 means unlimited.
@@ -46,21 +54,49 @@ impl Limiter {
         b.tokens = b.tokens.min(capacity(bytes_per_sec));
     }
 
-    /// Account for `n` bytes and wait as long as the limit requires. Returns early once `cancel`
-    /// is set, so a paused download does not sit out a long wait first.
-    pub async fn take(&self, n: u64, cancel: &AtomicBool) {
+    /// Account for `n` bytes and wait as long as the limit requires. Returns early once `stop`
+    /// completes, so a paused download does not sit out a long wait first — and gives back the
+    /// time it did not wait, or the debt would hold up every other download sharing the bucket.
+    pub async fn take(&self, n: u64, stop: impl Future<Output = ()>) {
         let wait = self.reserve(n);
         if wait.is_zero() {
             return;
         }
-        let deadline = Instant::now() + wait;
-        while !cancel.load(Ordering::Relaxed) {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            tokio::time::sleep(left.min(TICK)).await;
+        let deadline = tokio::time::Instant::now() + wait;
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {}
+            _ = stop => self.refund(deadline.saturating_duration_since(tokio::time::Instant::now())),
         }
+    }
+
+    /// Count `n` bytes that were transferred without waiting here — paced by another program's
+    /// own limit — so that whatever does wait here gives way to them.
+    pub fn charge(&self, n: u64) {
+        let rate = self.rate();
+        if rate == 0 {
+            return;
+        }
+        let mut b = self.refill(rate);
+        b.tokens = (b.tokens - n as f64).max(-(rate as f64) * MAX_CHARGED_DEBT);
+    }
+
+    fn refund(&self, unused: Duration) {
+        let rate = self.rate();
+        if rate == 0 || unused.is_zero() {
+            return;
+        }
+        let mut b = self.bucket.lock().unwrap();
+        b.tokens = (b.tokens + unused.as_secs_f64() * rate as f64).min(capacity(rate));
+    }
+
+    /// The bucket, topped up for the time since it was last used.
+    fn refill(&self, rate: u64) -> std::sync::MutexGuard<'_, Bucket> {
+        let mut b = self.bucket.lock().unwrap();
+        let now = Instant::now();
+        let refill = now.duration_since(b.at).as_secs_f64() * rate as f64;
+        b.tokens = (b.tokens + refill).min(capacity(rate));
+        b.at = now;
+        b
     }
 
     /// The bookkeeping half of [`Limiter::take`]: charge `n` bytes and say how long to wait.
@@ -69,11 +105,7 @@ impl Limiter {
         if rate == 0 {
             return Duration::ZERO;
         }
-        let mut b = self.bucket.lock().unwrap();
-        let now = Instant::now();
-        let refill = now.duration_since(b.at).as_secs_f64() * rate as f64;
-        b.tokens = (b.tokens + refill).min(capacity(rate));
-        b.at = now;
+        let mut b = self.refill(rate);
         b.tokens -= n as f64;
         if b.tokens >= 0.0 {
             Duration::ZERO
@@ -111,5 +143,25 @@ mod tests {
         l.set_rate(10_000);
         // Had the 5 MB burst survived, this would not wait at all.
         assert!(l.reserve(100_000) > Duration::from_secs(8));
+    }
+
+    #[tokio::test]
+    async fn a_wait_cut_short_gives_its_time_back() {
+        let l = Limiter::new(100_000);
+        l.reserve(50_000); // spend the burst
+        // Ten seconds' worth, abandoned at once (a pause): the debt must not stay behind.
+        l.take(1_000_000, async {}).await;
+        assert!(l.reserve(10_000) < Duration::from_millis(300), "the abandoned wait still holds up the next caller");
+    }
+
+    #[test]
+    fn charged_bytes_make_others_wait_but_not_for_ever() {
+        let l = Limiter::new(100_000);
+        l.charge(50_000);
+        assert!(l.reserve(50_000) > Duration::from_millis(400), "another program's bytes count against the limit");
+        // However much is charged, the debt is capped.
+        l.charge(100_000_000);
+        assert!(l.reserve(0) < Duration::from_millis(1100));
+        Limiter::new(0).charge(u64::MAX); // unlimited: nothing to account
     }
 }

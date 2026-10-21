@@ -60,7 +60,7 @@ value := <int> | <utf8-byte-length>:<bytes>
 | 13, other | ext→srv | passive request sniffing | replies `[id, 0]` (not captured) |
 | 14 | ext→srv | explicit "Download with IDM" / link list (15 announces a batch) | queues it and replies `[id, 3]` when the request was queued, `[id, 0]` when it was rejected — the extension uses this to decide whether to cancel the browser's own download, so reporting "taken" for a link we could not queue would drop it *(the reply value is reIDM's choice; the vendor's exact reply is not recovered)* |
 | 1 | both | reply `[request id, result]`; result 3 = taken over | — |
-| 1001–1003 | cli→daemon | **reIDM-only** pause/resume/remove | — |
+| 1001–1003 | — | formerly reIDM-only pause/resume/remove, used by the CLI | **ignored since 0.8**: the socket has no authentication, so any local process — another user's included — could pause downloads or remove them and delete their files. The CLI now uses the token-protected HTTP API, and `reidm-host` does not relay types ≥ 1000 |
 
 Not implemented: video/media sniffing (types 7–10, 16–25), per-site rules (keys 9, 11, 18–21), proxy auth,
 POST-body replay (key 14/19), the IDM GUI.

@@ -26,9 +26,11 @@ or open the window) for it to talk to.
 
 | Part | Does |
 |---|---|
-| `service-worker.js` | Holds each browser download in `chrome.downloads.onDeterminingFilename`, pauses it, offers it to reIDM with the cookies for that address, and only then cancels the browser's copy (or resumes it, if reIDM refused). Also: the media list, context menus, the popup's data, starting reIDM through native messaging, and a once-a-minute check that reIDM is running. |
-| `content.js` | Stops plain left clicks on links to listed file types and asks the service worker to hand them over, replaying the click for the browser when reIDM declines. Scans the page for media and answers the grabber. Injects `inject.js`. |
-| `inject.js` | Runs in the page's own JavaScript context to see its `fetch`/XHR responses — YouTube player data, HLS and DASH manifests — which `chrome.webRequest` can't read. Observes only; never changes a request. |
+| `defaults.js` | Every setting's default, loaded by the worker, the content scripts and the options page alike. |
+| `service-worker.js` | Holds each browser download in `chrome.downloads.onDeterminingFilename`, pauses it, writes it down (`storage.local`, `reidm-pending:<id>`, with the holding worker's id), offers it to reIDM with the cookies for that address from the right cookie store, and only then cancels the browser's copy (or resumes it, if reIDM refused). A worker that starts resumes whatever another worker left held. Also: the dialog queue, the media list, context menus, the popup's data, starting reIDM through native messaging, and a once-a-minute check that reIDM is running. |
+| `confirm.html`, `confirm.js` | The *Download file info* dialog: one window, a queue of requests, over a port named `confirm`. |
+| `content.js` | Stops plain left clicks on links to listed file types and asks the service worker to hand them over, replaying the click for the browser when reIDM declines. While media detection is on: reports media it sees in the DOM (only added nodes, debounced into idle time) and shows the video button and picker. |
+| `inject.js` | Registered by the service worker as a `document_start` content script in the page's own world (`chrome.scripting.registerContentScripts`, `world: "MAIN"`), only while media detection is on. Sees the page's `fetch`/XHR responses — YouTube player data (kept per video id), HLS and DASH manifests — which `chrome.webRequest` can't read. Observes only; never changes a request. It is not a web-accessible resource, so pages can't probe for it. |
 | `grabber.html`, `grabber.js` | The resource grabber: everything a page offers, from every frame, with filters, sizes, and batch hand-off. |
 | `popup.html`, `popup.js` | The toolbar popup: status, the capture switches, recent hand-offs, the media on this page. |
 | `options.html`, `options.js` | Capture rules, file types, excluded sites, the port, media detection. |
@@ -48,13 +50,25 @@ Over HTTP to `http://127.0.0.1:61002`: `GET /ext/ping`, `POST /ext/add`, `POST /
   reIDM's token file. Browsers set `Origin` themselves, a page can't forge an extension's, and
   reIDM answers CORS preflights only for extension origins.
 
+Every `/ext/add` carries a `request_id` (a random UUID), the same on the one retry after a
+timeout, so reIDM can answer a repeat with its first answer. Before each hand-off of an http(s)
+link the worker pings reIDM: if `/ext/ping` reports `refresh_armed: {id, name}`, the dialog first
+asks "Use this link to refresh *name*?", and the answer goes to `/ext/add` as `refresh_id: <id>`
+(Refresh) or `no_refresh: true` (New download). Without the field, nothing is asked or sent.
+
 To start reIDM, it sends `{"cmd":"launch"}` to the native-messaging host `com.zektopic.reidm`
 (`reidm-host`), which starts the service and replies once it answers.
 
 ### Debugging
 
 Click *service worker* on the extension's card for its console. `globalThis.reidm` exposes
-`reidm.status()`, `await reidm.ping()` and `await reidm.launchReidm()`.
+`reidm.status()`, `await reidm.ping()`, `await reidm.launchReidm()`, and `reidm.stats` — how
+often the network listeners ran, how many manifests were re-fetched, how often the status was
+written. On an idle browser all three should stand still.
+
+Messages from content scripts are limited to `media`, `formats-for-tab`, `capture-link`,
+`bypass`, `open-tab` and `download-format`, and what they carry is checked; everything else is
+accepted only from the extension's own pages.
 
 The end-to-end test, `tools/capture-test.mjs`, loads this folder into a real Chromium and checks
 the whole hand-off — see [docs/BUILDING.md](../docs/BUILDING.md#the-real-browser-tests). Run it
@@ -62,8 +76,8 @@ after any change to the capture path.
 
 ## Limits that come from the platform
 
-- **Streams aren't merged.** reIDM downloads an HLS playlist or a DASH representation as a file;
-  it doesn't mux segments into one video. DRM-protected streams (Widevine, PlayReady, FairPlay)
+- **DASH streams aren't merged.** An HLS quality goes to reIDM's yt-dlp, which joins the pieces;
+  a DASH representation is downloaded as the file it is. DRM-protected streams (Widevine, PlayReady, FairPlay)
   can't be captured by any tool — the keys never reach the page.
 - **YouTube's formats are resolved by reIDM, not here.** They carry a `signatureCipher` (or no
   address at all) that only the player's own obfuscated code unscrambles; an extension mustn't
@@ -86,6 +100,13 @@ after any change to the capture path.
 | `nativeMessaging` | start reIDM when it isn't running |
 | `webRequest` | notice media and form submissions (observation only) |
 | `contextMenus` | the right-click entries |
-| `tabs`, `scripting` | per-tab media lists, the grabber, and collecting a page's links (up to 2,000) |
-| `storage`, `alarms` | settings and recent hand-offs; the once-a-minute check that reIDM is running |
-| host access to all sites | media detection, click interception, the grabber |
+| `tabs`, `scripting` | per-tab media lists, the grabber, and registering the page hook |
+| `storage`, `alarms` | settings, held downloads and recent hand-offs; the once-a-minute check that reIDM is running |
+| `notifications` | *Downloading in reIDM*, and why reIDM couldn't take a download |
+| host access to all sites | media detection, click interception, the grabber, and (with `cookies`) the cookies of the address handed over |
+
+Host access is not made optional (`optional_host_permissions`, review L18): without it no
+cookies can be read, so a fresh install would hand reIDM signed-in downloads it then can't fetch,
+and click interception wouldn't run. Asking per site would make the first download from each
+site behave differently from the next; asking for all sites at first run is the same grant with
+an extra prompt.

@@ -12,6 +12,21 @@ fn quiet(c: &mut Command) -> &mut Command {
     c
 }
 
+/// Start a helper program (a file manager, a browser) and wait for it on a thread of its own.
+/// A child nobody waits for stays in the process table as a zombie for as long as the service
+/// runs, one per *Open*; `xdg-open` and `open` exit as soon as they have handed over, so the
+/// thread is short-lived.
+fn spawn_reaped(c: &mut Command) {
+    match c.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => tracing::warn!("could not start {:?}: {e}", c.get_program()),
+    }
+}
+
 pub fn open_url(url: &str) {
     #[cfg(windows)]
     let mut c = {
@@ -31,7 +46,7 @@ pub fn open_url(url: &str) {
         c.arg(url);
         c
     };
-    let _ = quiet(&mut c).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    spawn_reaped(quiet(&mut c).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()));
 }
 
 /// Open a downloaded file, or reveal it in the file manager.
@@ -50,18 +65,18 @@ pub fn open_path(p: &Path, reveal: bool) {
         } else {
             c.arg(p);
         }
-        let _ = c.spawn();
+        spawn_reaped(&mut c);
     }
     #[cfg(target_os = "macos")]
     {
         let mut c = Command::new("open");
         if reveal { c.arg("-R"); }
-        let _ = c.arg(p).spawn();
+        spawn_reaped(c.arg(p));
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let t = if reveal { p.parent().unwrap_or(p) } else { p };
-        let _ = Command::new("xdg-open").arg(t).spawn();
+        spawn_reaped(Command::new("xdg-open").arg(t));
     }
 }
 

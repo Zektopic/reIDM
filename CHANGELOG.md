@@ -1,5 +1,164 @@
 # Changelog
 
+## 0.8.0 (unreleased)
+
+### New
+
+* **Simpler Options.** Five plain tabs — General, Folders, Downloads, Network, Torrents — with a
+  line under each option saying what it does. Everything else is behind **Advanced settings**: a
+  table of each setting, its unit and a *Default* button.
+* **Performance: Light, Balanced or Maximum.** One choice sets connections, downloads at once, the
+  disk-write buffer and torrent peers together — Light for an old laptop, Maximum for a desktop on
+  a fast line. Changing any of them by hand makes it *Custom*.
+* **A notification-area icon.** Closing the window keeps reIDM running there; its menu adds a link,
+  pauses or resumes everything, switches the speed limiter, or quits. (On Linux it needs a desktop
+  that shows tray icons; without one, closing works as before.)
+* **When done: exit, sleep, hibernate or shut down** once the downloads finish, after a one-minute
+  countdown you can cancel. Chosen per session, never remembered — so nobody's computer shuts down
+  unexpectedly next week. Also `reidm when-done`.
+* **Keeps the computer awake** while downloads run (on by default), and lets it sleep again 30 s
+  after the last one.
+* **Never fills the disk.** A download pauses, keeping everything, before a drive would drop below
+  200 MiB free, and carries on by itself when there is room. The status bar shows free space.
+* **Proxy:** the system's (default), none, or an HTTP, HTTPS or SOCKS5 proxy with user name,
+  password (never shown again) and exceptions. Videos use it too; torrents through SOCKS5 if asked.
+* **Queue order:** move downloads to the top, up, down or to the bottom (right-click, Ctrl+↑/↓);
+  the queue starts them in that order. An optional *#* column shows it.
+* **Checksums:** give a download its published MD5, SHA-1, SHA-256 or SHA-512 (Add URL › More
+  options, or `reidm add --checksum sha256:…`); a mismatch is reported and the file kept.
+  Properties › *Integrity* works out a finished file's checksum.
+* **Notifications** when a download finishes or fails — or the *Download complete* window, or
+  nothing. Where the system has notifications switched off, the window shows instead.
+* **Drag and drop** a `.torrent`, a `.txt` or IDM `.ef2` list, or a link onto the window.
+* **Watch the clipboard** for download links (off by default): a copied link to a file, or a
+  magnet link, offers *Download / Later / Dismiss*, once.
+* **Start reIDM when you sign in** (Options › General).
+* **Settable retries and time limits** (Advanced): retries per connection (0 = for ever), the wait
+  between them, how long a silent connection or server is given.
+* **Screen readers** can read the window; every colour meets WCAG AA contrast in both themes; text
+  is at least 12 points; the list works from the keyboard (arrows, Page Up/Down, Home/End, Shift to
+  select, Space, F2 for Properties, Esc to close a dialog).
+* A short **welcome** on the first run: where downloads go, and connecting the browser.
+
+### Fixed
+
+* **A download could be left with a hole in it after a crash, power cut or full disk**: progress
+  was counted before it reached the disk. It is now recorded only once it is safely written.
+* **The download list survives a crash or power cut**: it is written safely, the previous copy is
+  kept as `downloads.json.bak`, and a damaged list is recovered from it instead of stopping reIDM.
+* **A finished download never replaces a file that is already there**: it is saved as
+  `name (1).ext`.
+* Pause works straight away even when the server has stopped answering, and on downloads waiting
+  in the queue; Resume pressed while a download is stopping is no longer lost.
+* Downloads on a flaky connection keep their connections and finish, instead of dropping to one
+  connection and failing.
+* Re-adding a link whose finished file was deleted downloads it again; re-adding a stopped link
+  uses the browser's fresh cookies.
+* Changing the temporary folder no longer restarts unfinished downloads from nothing.
+* More changed files are noticed instead of being joined to the old version: a server that drops
+  byte ranges, a file that got shorter, or a new modification date.
+* A batch pattern with a huge range is refused at once instead of freezing the window.
+* The scheduler no longer starts or stops the queue twice when the clocks go back.
+* **Torrents of several files were put straight into the download folder** — every file loose in
+  *Compressed*, *Video*… — instead of a folder named after the torrent, and a file already there
+  with the same name was overwritten. A torrent now gets a folder of its own, and a new torrent never
+  writes over a file that is already there: if the name is taken it goes into `Name (1)/`, or a
+  single file into a folder beside it. Torrents begun by 0.7.0 carry on where their files are.
+* **A video could be reported finished with a hole in it** when yt-dlp couldn't fetch one piece. It
+  now stops instead, and carries on by itself when YouTube's addresses expire partway (after about
+  six hours) or the connection drops.
+* The same torrent can't be added twice, whether its magnet link gives the hash in hex or base32 or
+  it comes as a `.torrent` from another site. *Start again* on a torrent waits for its old files to
+  be removed first.
+* A video whose title isn't UTF-8 could hang; `reidm update-check` crashed.
+* A partially unpacked ffmpeg was taken for installed.
+* The site grabber's *include* filter keeps links containing any one of the patterns, as documented
+  (it required all of them).
+
+### The window and the service
+
+* **Very long lists work**: the window no longer stops with "Service unavailable" past about 7,000
+  downloads, and it fetches only what changed — nothing at all while the list is idle. Idle CPU
+  drops from about 20% of a core to near zero (measured with 5,000 downloads; 50,000 load fine).
+* The window never freezes on a click: commands run in the background, actions on many downloads
+  are a single request, and it opens at once while the background service starts.
+* After the background service restarts, the window carries on instead of failing every command.
+* Options never resets your folders or torrent settings: Save sends only what you changed, and waits
+  until the current settings have loaded. *Downloads at the same time* goes up to 64.
+* Restart, Remove completed and deleting files ask first. Closing the window the first time explains
+  that downloads continue, with *Quit reIDM completely* (also in the File menu).
+* Only one service runs per data folder, and it stops with a clear message if its ports are taken.
+  Quitting saves the list first. Problems with the list's storage show as a banner.
+* API: `GET /api/downloads/rows` (rows and deltas), `GET /api/downloads/{id}`,
+  `POST /api/downloads/bulk`, `POST /api/shutdown`; `ETag`/`304` on `GET /api/downloads`;
+  `warnings` in `/api/status`; `404` for unknown downloads.
+* CLI: `reidm list` shows the live list in numeric order; `reidm get` resumes when run again; rates
+  accept `MiB` and bits (`8Mbps`).
+
+### Security
+
+* The IDM-extension socket (port 1001/61001) can no longer pause, remove or delete downloads — any
+  program on the computer could. Tonec's extension never used those messages; `reidm pause`,
+  `resume` and `rm` now use the token-protected API and report unknown downloads.
+* The extension endpoints check the `Host` header (DNS rebinding), request sizes are limited per
+  endpoint with a clear message, and a web page can no longer make the window show the extension
+  as connected. The native-messaging host relays only for IDM's own extension.
+* Pages can no longer detect the extension through `inject.js`, use its privileged messages, or
+  plant fake formats in the video picker.
+
+### Extension 1.7.0
+
+* While reIDM waits for a new address (*Refresh download address*), a link the browser hands over
+  asks **"Use this link to refresh *name*?"** — Refresh, New download or Cancel — instead of looking
+  like a new download; the result is announced by the download's name.
+* A hand-off that reIDM is slow to answer is retried with the same request id, so it can never be
+  added twice.
+* A YouTube quality without sound is joined with sound in its own container (a WebM stays a WebM),
+  and a "stable volume" audio track is downloaded as that track.
+* **A download held while the dialog was open could be lost** if the dialog closed early or the
+  extension restarted. The browser now always gets it back.
+* **On live streams the extension re-fetched the playlist in a loop**, thousands of times a second.
+* The popup's YouTube *best quality* row did nothing; *Download selected* with several items stopped
+  after the first.
+* On YouTube, after moving to another video, the picker offered the previous video's qualities and
+  title.
+* Incognito downloads went without cookies, and the menus, popup and grabber used the normal
+  profile's cookies. Each now uses its own window's cookies, and nothing works in incognito unless
+  allowed.
+* Enter on a focused Cancel or *Download later* started the download.
+* Several downloads at once share one *Download file info* dialog ("2 more waiting", *Start all*).
+  After a refusal it says the browser has the download.
+* Programs a page starts always ask first. Downloads the browser flags as dangerous stay with it.
+* *Download all links on this page* opens the grabber with the file links ticked.
+* Much lighter on busy pages: network listeners see only media addresses, nothing is written to
+  storage unless it changed, and with *Look for video and audio* off no page is touched.
+* HLS qualities outside YouTube are joined into one video by yt-dlp. The media badge is per tab.
+  *Just now* shows cancelled downloads as cancelled.
+* The options page puts the main settings first and the rest under *Advanced*.
+
+### Improved
+
+* A long list costs far less while something downloads: with 50,000 downloads and one running, the
+  service uses about 2–3% of a core instead of about 26%.
+* *Refresh download address* checks the new link before stopping the download.
+* Without a Downloads folder named by the system (a minimal Linux install), downloads go to
+  `~/Downloads` instead of wherever reIDM was started.
+* File and folder pickers no longer freeze the window while they are open.
+* Adding thousands of links at once takes a moment instead of minutes (2,000 links: 51 s → 0.1 s),
+  and the service stays responsive while the list is saved.
+* Files taken from the browser are marked as downloaded from the internet (Windows SmartScreen,
+  macOS Gatekeeper), as the browser would have marked them.
+* On Linux, a disk too small for a download says so when it starts. On Windows, large downloads no
+  longer stall while the disk is filled with zeros.
+* The download list and settings are readable only by you on Linux and macOS (they hold cookies).
+* Videos and torrents keep to the global speed limit: each gets its share, and what they fetch counts
+  against the rest. A new limit reaches a running video within seconds.
+* yt-dlp, Deno and ffmpeg are downloaded to disk and checked as they arrive, not held in memory. A
+  video no longer waits while another download fetches a tool; *Pause* works while a tool
+  downloads; a failed update check is tried again after an hour, not at every video.
+* A `.torrent` link that sends more than 10 MiB, or a page for the site grabber over 8 MiB, is
+  refused instead of being read into memory.
+
 ## 0.7.0
 
 ### Torrents

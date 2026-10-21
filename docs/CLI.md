@@ -15,12 +15,13 @@ reidm <command> [options]
 | [`batch`](#batch) | yes | queue a numbered or lettered series |
 | [`import`](#import) | yes | queue a list or an IDM `.ef2` file |
 | [`export`](#export) | no¹ | write the list as addresses or `.ef2` |
-| [`list`](#list) | no | show the downloads |
+| [`list`](#list) | no¹ | show the downloads |
 | [`pause`, `resume`, `rm`](#pause-resume-rm) | yes | control one download |
 | [`restart`](#restart) | yes | start a download again from the first byte |
 | [`refresh`](#refresh) | yes | give a download a new address |
 | [`limit`](#limit) | yes | show or set the speed limit |
 | [`queue`](#queue) | yes | start or stop the scheduled queue |
+| [`when-done`](#when-done) | yes | sleep, hibernate, shut down or quit once every download is done |
 | [`grab`](#grab) | only with `--add` | find the files a web page links to |
 | [`extension`](#extension) | no | print the browser extension's folder |
 | [`ui`](#ui) | starts it | open the web view |
@@ -28,7 +29,7 @@ reidm <command> [options]
 | [`install-host`, `uninstall-host`](#install-host-uninstall-host) | no | register the browser helper |
 | [`patch-extension`](#patch-extension) | no | adapt Tonec's extension for macOS/Linux |
 
-¹ `export` uses the service when it runs, and reads the saved list when it doesn't.
+¹ `export` and `list` use the service when it runs, and read the saved list when it doesn't.
 
 Downloads are identified by the number `reidm list` shows in its first column.
 
@@ -37,7 +38,9 @@ Downloads are identified by the number `reidm list` shows in its first column.
 On Windows the installer starts the service at login. Elsewhere — or to run it by hand —
 `reidm daemon`. Opening the desktop window (`reidm-gui`), running `reidm ui`, or a download in
 the browser (through the extension's helper) also start it when it isn't running. Only one
-service runs at a time; a second one finds the ports taken and says so.
+service runs at a time for a data folder: a second one says the first is running and exits
+before touching the download list. If another program holds port 61002 or 61001, the service
+says which and exits rather than run without them.
 
 ### `daemon`
 
@@ -59,14 +62,19 @@ The service listens on `127.0.0.1` only:
 | Port | |
 |---|---|
 | 61002 | the HTTP API, the web view, and reIDM's browser extension |
-| 61001 | the IDM extension protocol (WebSocket), and `pause`/`resume`/`rm` below |
+| 61001 | the IDM extension protocol (WebSocket), for the native-messaging helper and patched copies of Tonec's extension |
 | 1001 | the same protocol on the port Tonec's extension dials first — Windows, or wherever it may be bound; skipped with a warning otherwise |
 
 At start-up it also refreshes the browser-extension folder and re-registers the native-messaging
 helper with every Chromium-based browser it finds; both only write what changed.
 
-Stop it with Ctrl+C (or by ending the process). Downloads that were running are listed as
-paused the next time; *Resume* (or `reidm resume`) continues each from where it stopped.
+Stop it with Ctrl+C, by ending the process (`SIGTERM` is handled the same way), or with *Quit
+reIDM completely* in the window. Downloads that were running are listed as paused the next time;
+*Resume* (or `reidm resume`) continues each from where it stopped.
+
+`REIDM_UI_PORT` and `REIDM_LOCAL_PORT` move the two ports, with `REIDM_DATA_DIR` for the data
+folder, to run a second, throw-away service beside the real one — for tests. The commands below
+follow the same variables; the browser extension does not.
 
 ## Adding downloads
 
@@ -77,7 +85,8 @@ reidm get URL [-c N] [-d DIR] [-o NAME] [--referer URL] [--cookie COOKIES]
 ```
 
 Downloads one address in the foreground, with a progress line, and exits when it is done. It
-doesn't need — or touch — the service and its list.
+doesn't need — or touch — the service and its list. Interrupted, the same command run again
+continues where it stopped.
 
 ```sh
 reidm get https://example.com/big.iso -c 16
@@ -87,7 +96,7 @@ reidm get 'https://example.com/report?id=7' -o report.pdf --cookie 'session=abc'
 ### `add`
 
 ```text
-reidm add URL... [--referer URL] [-o NAME] [--later] [--video [FORMAT]]
+reidm add URL... [--referer URL] [-o NAME] [--later] [--video [FORMAT]] [--checksum ALGO:HEX]
 ```
 
 Queues one or more addresses in the service — web links, **magnet links**, and **`.torrent`
@@ -118,6 +127,17 @@ summary line says which happened:
 $ reidm add https://example.com/a.zip https://example.com/b.zip
   already have: https://example.com/a.zip
 1 queued, 0 resumed, 1 already complete, 0 failed
+```
+
+`--checksum` gives the checksum the finished file should have, as download pages publish them:
+`sha256:9f86d0…` (or `md5:`, `sha1:`, `sha512:`; a bare value is recognised by its length). It is
+checked once the file is in place; a file that differs is kept, and the download fails saying
+what was expected and what it got — `reidm resume` checks it again, `reidm restart` downloads it
+again. A single web address only (not a video or a torrent):
+
+```text
+$ reidm add --checksum sha256:5c4e…1f0a https://cdimage.example.org/debian.iso
+1 queued, 0 resumed, 0 already complete, 0 failed
 ```
 
 ### `batch`
@@ -179,9 +199,8 @@ Prints each download's number, state, progress and file, and under a failed one,
 The states are *Queued* (waiting for a free slot), *Running*, *Paused*, *Scheduled* (in the
 scheduled queue, not started), *Done* and *Failed*.
 
-It reads the saved list, so it works when the service isn't running; while it is, the list is
-saved every few seconds, so very recent progress may lag slightly. The [HTTP API](API.md) has the
-live view.
+It asks the service for the live list, in order of number. When the service isn't running it
+reads the list as last saved instead.
 
 ### `export`
 
@@ -209,7 +228,8 @@ reidm rm ID [--purge]
 ```
 
 `resume` continues a paused or failed download from where it stopped. `rm` takes it off the
-list; `--purge` also deletes the file — finished, or the partial `.reidm` file.
+list; `--purge` also deletes the file — finished, or the partial `.reidm` file. Each says what it
+did, and fails with the reason (`there is no download #12`) when it couldn't.
 
 ### `restart`
 
@@ -228,9 +248,10 @@ reidm refresh ID NEW-URL
 
 IDM's *Refresh download address*: points an unfinished download at a new address — an expired
 signed link replaced by a fresh one, or a mirror — and carries on from where it was. reIDM first
-checks the new address: it must serve a file of the same size and, if part of the download is
-already done, serve byte ranges so it can continue. An address that fails either check is
-refused and the download is left as it was.
+checks the new address, while the download carries on: it must serve a file of the same size
+and, if part of the download is already done, serve byte ranges so it can continue. An address
+that fails either check is refused and the download is left as it was — still running, if it
+was.
 
 ```text
 $ reidm refresh 7 'https://cdn.example.com/file.bin?expires=…&sig=…'
@@ -249,8 +270,9 @@ reidm limit on         # turn it back on
 ```
 
 The global speed limit, shared by every download and connection, applied at once to transfers
-already running. `RATE` is per second, in binary units as IDM uses them: `500K` = 500 KiB/s,
-`2M` = 2 MiB/s, `1.5MB`, `800kb/s`, or plain bytes (`65536`).
+already running. `RATE` is bytes per second, in binary units as IDM uses them: `500K` = 500 KiB/s,
+`2M` = 2 MiB/s, `1.5MB`, `1.5MiB`, `800kb/s`, or plain bytes (`65536`). A connection speed in bits
+— `8Mbps`, `500kbps`, with a lowercase `b` — is divided by eight: `8Mbps` is 1 MiB/s.
 
 A limit for a single download is set in its Properties window, or with
 [`POST /api/downloads/{id}/limit`](API.md#per-download-speed-limit).
@@ -266,6 +288,26 @@ Starts or stops every download in the scheduled queue (those added with `--later
 in the window), and prints how many — `1 download(s) started`. No more than *downloads at the same time* run at once; the
 rest wait their turn. The times and days the queue starts by itself are set in the window's
 *Scheduler*, or through [`/api/settings`](API.md#settings).
+
+### `when-done`
+
+```text
+reidm when-done                 # say what is set
+reidm when-done ACTION          # none, exit, sleep, hibernate or shutdown
+```
+
+What happens once every download is done: `sleep`, `hibernate` or `shutdown` the computer, or
+`exit` (stop reIDM — the service, and the window with it). Once something has run and nothing is
+left running or queued (paused, failed and seeding downloads don't count), there is a minute's
+countdown; anything starting again stops it. `reidm when-done none` cancels. The list is saved
+first. The choice is not saved: it lasts until the service stops.
+
+```text
+$ reidm when-done shutdown
+when everything is done: shutdown
+$ reidm when-done
+when everything is done: shutdown, in 54s (cancel with `reidm when-done none`)
+```
 
 ## Finding files on a page
 

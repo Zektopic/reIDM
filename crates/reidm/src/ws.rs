@@ -15,17 +15,20 @@ use tokio_tungstenite::tungstenite::Message as Ws;
 pub const SUBPROTOCOL: &str = "plugin.v3.internetdownloadmanager.com";
 /// Port the real IDM network monitor listens on (privileged on Unix; best effort here).
 pub const IDM_PORT: u16 = 1001;
-/// Unprivileged port used by the native host and CLI.
-pub const LOCAL_PORT: u16 = 61001;
+/// Unprivileged port used by the native host and patched copies of the IDM extension.
+pub const DEFAULT_LOCAL_PORT: u16 = 61001;
+
+/// `REIDM_LOCAL_PORT` moves it, for a second service beside the real one (tests, measurements).
+pub fn local_port() -> u16 {
+    crate::web::port_from_env("REIDM_LOCAL_PORT", DEFAULT_LOCAL_PORT)
+}
 
 /// Browsers let *any* web page open a WebSocket to localhost, so a page-controlled Origin
 /// must never reach the download queue. Only extension origins (or no Origin: a local
-/// process, which could already write to our data directory) are accepted.
+/// process, which could already write to our data directory) are accepted — the same rule as
+/// the HTTP API's `/ext` endpoints.
 pub fn origin_allowed(origin: Option<&str>) -> bool {
-    match origin {
-        None => true,
-        Some(o) => o.starts_with("chrome-extension://") || o.starts_with("moz-extension://") || o.starts_with("extension://"),
-    }
+    origin.is_none_or(crate::web::is_extension_origin_str)
 }
 
 #[allow(clippy::result_large_err)]
@@ -87,11 +90,6 @@ pub async fn bind(addr: &str) -> Result<TcpListener> {
     Ok(l)
 }
 
-pub async fn listen(addr: &str, mgr: Manager) -> Result<()> {
-    let l = bind(addr).await?;
-    serve(l, mgr).await
-}
-
 pub async fn serve(l: TcpListener, mgr: Manager) -> Result<()> {
     loop {
         let (s, peer) = l.accept().await?;
@@ -113,6 +111,7 @@ mod tests {
         assert!(origin_allowed(None));
         assert!(origin_allowed(Some("chrome-extension://ngpampappnmepgilojfohadhhmbhlaek")));
         assert!(origin_allowed(Some("moz-extension://1234")));
+        assert!(origin_allowed(Some("safari-web-extension://1234")), "the same list as the HTTP API's");
         assert!(!origin_allowed(Some("https://evil.example")));
         assert!(!origin_allowed(Some("http://localhost:8080")));
         assert!(!origin_allowed(Some("null")));
