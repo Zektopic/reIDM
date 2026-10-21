@@ -8,6 +8,7 @@
 mod api;
 mod app;
 mod autostart;
+mod checksum;
 mod dropped;
 mod icons;
 mod model;
@@ -16,6 +17,7 @@ mod options;
 mod playlist;
 mod torrent;
 mod prefs;
+mod queue;
 mod theme;
 mod tray;
 mod view;

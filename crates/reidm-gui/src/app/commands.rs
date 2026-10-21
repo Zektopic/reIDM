@@ -158,6 +158,26 @@ impl App {
         });
     }
 
+    /// Move the selected unfinished downloads in the queue, as one block in their own order.
+    pub(super) fn move_selected(&mut self, to: crate::queue::To) {
+        let picked: HashSet<u64> = self.selected.iter().copied().filter(|id| self.vm.places.contains_key(id)).collect();
+        if picked.is_empty() {
+            return self.toast("Select a download that hasn't finished: only those wait in the queue");
+        }
+        if !crate::queue::can_move(&self.vm.queue, &picked, to) {
+            return;
+        }
+        let ids: Vec<u64> = self.vm.queue.iter().copied().filter(|id| picked.contains(id)).collect();
+        self.cmd.run(move |c| {
+            let r: Result<serde_json::Value, String> = c.post_json("/api/downloads/bulk", serde_json::json!({ "action": "move", "to": to.wire(), "ids": ids }));
+            let refused = r.as_ref().ok().and_then(|v| v["results"].as_array().into_iter().flatten().find_map(|r| r["error"].as_str().map(str::to_string)));
+            match (r, refused) {
+                (Err(e), _) | (Ok(_), Some(e)) => reply(move |app: &mut App| app.toast(format!("Could not move them: {e}"))),
+                _ => None,
+            }
+        });
+    }
+
     /// Ask first, with the count: this empties the history, with no undo.
     pub(super) fn delete_completed(&mut self) {
         let done: Vec<u64> = self.snap.items.iter().filter(|i| i.status == Status::Done).map(|i| i.id).collect();
@@ -449,7 +469,7 @@ impl App {
 
     pub(super) fn open_props(&mut self, id: u64) {
         let limit = self.item(id).and_then(|i| i.speed_limit);
-        self.props = Some(PropsState { id, limit_on: limit.is_some(), limit_kb: limit.map(|l| (l / 1024) as u32).unwrap_or(512).max(1), detail: None, fetched: None, fetching: false });
+        self.props = Some(PropsState { id, limit_on: limit.is_some(), limit_kb: limit.map(|l| (l / 1024) as u32).unwrap_or(512).max(1), detail: None, fetched: None, fetching: false, algo: crate::checksum::Algo::Sha256, expected: String::new(), verifying: None, verified: None });
     }
 
     /// Keep Properties' full copy of its download fresh: about once a second, and never more

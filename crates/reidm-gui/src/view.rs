@@ -20,6 +20,8 @@ pub enum SortKey {
     Rate,
     LastTry,
     Address,
+    /// Place in the queue: unfinished downloads first, in the order they will start.
+    Queue,
 }
 
 #[derive(Clone, PartialEq)]
@@ -46,6 +48,10 @@ pub struct Counts {
     /// Waiting for a free slot (`Queued`).
     pub waiting: usize,
     pub paused: usize,
+    /// The service keeps a queue order (rows carry `order`).
+    pub ordered: bool,
+    /// The service checks checksums (rows carry `checksum_ok`).
+    pub checksums: bool,
 }
 
 impl Counts {
@@ -65,6 +71,9 @@ pub struct ViewModel {
     /// Positions in the snapshot's `items` of the visible rows, in display order.
     pub rows: Vec<usize>,
     pub counts: Counts,
+    /// The unfinished downloads in queue order, and each one's place (from 1).
+    pub queue: Vec<u64>,
+    pub places: std::collections::HashMap<u64, usize>,
     /// How many times the rows were rebuilt (for tests and the debug overlay).
     pub builds: u64,
 }
@@ -93,6 +102,8 @@ impl ViewModel {
                     counts.queued += 1;
                 }
             }
+            counts.ordered |= it.order.is_some();
+            counts.checksums |= it.checksum_ok.is_some();
             counts.categories[0] += 1;
             if let Some(c) = CATEGORIES.iter().position(|c| *c == it.category()) {
                 counts.categories[c] += 1;
@@ -101,6 +112,13 @@ impl ViewModel {
                 rows.push(i);
             }
         }
+        // Only rebuilt with the list itself: a new search or sort doesn't change the queue.
+        if self.key.as_ref().is_none_or(|k| k.rev != key.rev) {
+            self.queue = crate::queue::queue(items.iter().map(|a| a.as_ref()));
+            self.places = crate::queue::places(&self.queue);
+        }
+        let places = &self.places;
+        let place = |i: usize| places.get(&items[i].id).copied().unwrap_or(usize::MAX);
         let rate = |i: usize| snap.rates.get(&items[i].id).copied().unwrap_or(0.0);
         let eta = |i: usize| {
             let it = &items[i];
@@ -119,6 +137,7 @@ impl ViewModel {
                 SortKey::Rate => rate(a).partial_cmp(&rate(b)).unwrap_or(Ordering::Equal),
                 SortKey::LastTry => x.last_try.unwrap_or(0).cmp(&y.last_try.unwrap_or(0)),
                 SortKey::Address => x.url_lower().cmp(y.url_lower()),
+                SortKey::Queue => place(a).cmp(&place(b)),
             }
             // Equal keys keep a stable order (newest last), so rows don't jump between frames.
             .then(x.id.cmp(&y.id));

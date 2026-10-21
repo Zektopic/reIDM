@@ -1,6 +1,7 @@
 //! The download list and its right-click menu.
 
 use super::*;
+use crate::queue::To;
 
 impl App {
     pub(super) fn table(&mut self, ui: &mut egui::Ui, p: &Palette) {
@@ -56,11 +57,18 @@ impl App {
                     None
                 };
 
-                TableBuilder::new(ui)
+                // The place in the queue, when asked for and the service keeps one.
+                let show_place = self.prefs.queue_column && self.vm.counts.ordered;
+                let mut table = TableBuilder::new(ui)
                     .striped(false)
                     .resizable(true)
                     .cell_layout(Layout::left_to_right(Align::Center))
-                    .column(Column::exact(30.0)) // select
+                    .column(Column::exact(30.0)); // select
+                if show_place {
+                    table = table.column(Column::exact(40.0));
+                }
+                let places = &self.vm.places;
+                table
                     .column(Column::initial(300.0).at_least(160.0).clip(true)) // name
                     .column(Column::initial(96.0).at_least(72.0)) // size
                     .column(Column::initial(118.0).at_least(84.0)) // status
@@ -110,6 +118,9 @@ impl App {
                                 }
                             });
                         };
+                        if show_place {
+                            h(&mut header, "#", SortKey::Queue);
+                        }
                         h(&mut header, "File Name", SortKey::Name);
                         h(&mut header, "Size", SortKey::Size);
                         h(&mut header, "Status", SortKey::Status);
@@ -138,6 +149,12 @@ impl App {
                                     check_click = Some(id);
                                 }
                             });
+                            if show_place {
+                                row.col(|ui| {
+                                    let txt = places.get(&id).map(|n| n.to_string()).unwrap_or_default();
+                                    ui.label(RichText::new(txt).size(12.0).color(p.text_dim));
+                                });
+                            }
 
                             // File name, with the type icon and a progress bar underneath
                             row.col(|ui| {
@@ -301,6 +318,13 @@ impl App {
                     ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("ctxmenu-for"), (id, ctx.input(|i| i.pointer.hover_pos()).unwrap_or_default())));
                 }
                 if let Some((id, pos)) = ctx.memory(|m| m.data.get_temp::<(u64, egui::Pos2)>(egui::Id::new("ctxmenu-for"))) {
+                    // Which moves would change anything, for the queue entries below.
+                    let picked: HashSet<u64> = self.selected.iter().copied().filter(|i| self.vm.places.contains_key(i)).collect();
+                    let moves: Vec<(To, bool)> = if self.vm.counts.ordered && !picked.is_empty() {
+                        [To::Top, To::Up, To::Down, To::Bottom].into_iter().map(|to| (to, crate::queue::can_move(&self.vm.queue, &picked, to))).collect()
+                    } else {
+                        Vec::new()
+                    };
                     match self.item(id).cloned() {
                         Some(it) => {
                             let area = egui::Area::new(egui::Id::new("ctxmenu")).fixed_pos(pos).order(egui::Order::Foreground).show(ctx, |ui| {
@@ -339,6 +363,19 @@ impl App {
                                     } else if it.status != Status::Done {
                                         pick(ui, "Add to the scheduled queue", CtxCmd::Queue);
                                     }
+                                    for (to, can) in &moves {
+                                        if ui.add_enabled(*can, egui::Button::new(to.label())).clicked() {
+                                            ctx_cmd = Some(CtxCmd::Move(*to));
+                                        }
+                                    }
+                                    if !moves.is_empty() {
+                                        ui.separator();
+                                    }
+                                    let mut pick = |ui: &mut egui::Ui, label: &str, cmd: CtxCmd| {
+                                        if ui.button(label).clicked() {
+                                            ctx_cmd = Some(cmd);
+                                        }
+                                    };
                                     pick(ui, "Copy address", CtxCmd::CopyUrl(it.request.url.clone()));
                                     pick(ui, "Properties…", CtxCmd::Props);
                                     ui.separator();
@@ -372,6 +409,7 @@ impl App {
                     }
                     Some(CtxCmd::Queue) => self.set_queued(true),
                     Some(CtxCmd::Unqueue) => self.set_queued(false),
+                    Some(CtxCmd::Move(to)) => self.move_selected(to),
                     Some(CtxCmd::Props) => {
                         if let Some(id) = self.focus {
                             self.open_props(id);
@@ -408,4 +446,5 @@ pub(super) enum CtxCmd {
     RemoveFile,
     /// Start (`true`) or stop sharing finished torrents.
     Seed(bool),
+    Move(To),
 }

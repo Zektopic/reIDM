@@ -26,6 +26,8 @@ pub(super) struct AddState {
     /// would make typing crawl.
     pub(super) parsed: String,
     pub(super) count: usize,
+    /// *More options › Expected checksum*, as typed.
+    pub(super) checksum: String,
 }
 
 impl AddState {
@@ -147,6 +149,12 @@ pub(super) struct PropsState {
     pub(super) detail: Option<Detail>,
     pub(super) fetched: Option<Instant>,
     pub(super) fetching: bool,
+    /// *Integrity*: the algorithm to compute, a value to compare with, and the computation
+    /// running or its result.
+    pub(super) algo: crate::checksum::Algo,
+    pub(super) expected: String,
+    pub(super) verifying: Option<Receiver<Result<String, String>>>,
+    pub(super) verified: Option<(crate::checksum::Algo, Result<String, String>)>,
 }
 
 /// The site-grabber window's state. Every field defaults to empty/off.

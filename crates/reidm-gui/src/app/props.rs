@@ -6,6 +6,12 @@ impl App {
     /// One download's details: addresses, sizes, its connections as a segment map, and its own
     /// speed limit. IDM shows this as the download progress dialog.
     pub(super) fn props_window(&mut self, ctx: &egui::Context, p: &Palette) {
+        if let Some(st) = &mut self.props {
+            if let Some(Ok(r)) = st.verifying.as_ref().map(|rx| rx.try_recv()) {
+                st.verifying = None;
+                st.verified = Some((st.algo, r));
+            }
+        }
         let Some(st) = &self.props else { return };
         let id = st.id;
         let Some(it) = self.item(id).cloned() else {
@@ -21,6 +27,8 @@ impl App {
         let mut refresh = false;
         let mut copy = false;
         let (mut limit_on, mut limit_kb) = (st.limit_on, st.limit_kb);
+        let (mut algo, mut expected, verifying, verified) = (st.algo, st.expected.clone(), st.verifying.is_some(), st.verified.clone());
+        let mut verify = false;
         egui::Window::new(it.file_name())
             .id(egui::Id::new("props"))
             .open(&mut open)
@@ -78,6 +86,62 @@ impl App {
                     }
                     if let Some(t) = it.finished_at {
                         row(ui, "Completed", since_human(t, now_secs()));
+                    }
+                    // *Integrity*: with a service that checks checksums, for a finished file.
+                    if let (Some(ok), true) = (it.checksum_ok, it.status == Status::Done || it.checksum_ok == Some(Some(false))) {
+                        label(ui, p, "Integrity");
+                        ui.vertical(|ui| {
+                            match ok {
+                                Some(true) => {
+                                    ui.label(RichText::new("Matches the checksum it was added with").color(p.ok));
+                                }
+                                Some(false) => {
+                                    ui.label(RichText::new("Doesn't match the checksum it was added with: the file is kept, but it isn't the one expected").color(p.err));
+                                }
+                                None => label(ui, p, "No checksum was given when it was added."),
+                            }
+                            if it.status == Status::Done {
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("props-algo").width(90.0).selected_text(algo.label()).show_ui(ui, |ui| {
+                                        for a in crate::checksum::Algo::ALL {
+                                            ui.selectable_value(&mut algo, a, a.label());
+                                        }
+                                    });
+                                    if verifying {
+                                        ui.spinner();
+                                        label(ui, p, "reading the file…");
+                                    } else if ui.button("Verify").on_hover_text("Compute the file's checksum now").clicked() {
+                                        verify = true;
+                                    }
+                                    ui.add(egui::TextEdit::singleline(&mut expected).hint_text("expected value, to compare").desired_width(220.0));
+                                });
+                                if let Some((a, r)) = &verified {
+                                    match r {
+                                        Ok(v) => {
+                                            ui.add(egui::Label::new(RichText::new(format!("{}: {v}", a.label())).monospace().size(12.0).color(p.text)).truncate()).on_hover_text(v);
+                                            match crate::checksum::parse(&expected) {
+                                                Ok(Some(want)) if want.algo == *a => {
+                                                    if want.matches(v) {
+                                                        ui.label(RichText::new("Matches the expected value").color(p.ok));
+                                                    } else {
+                                                        ui.label(RichText::new("Doesn't match the expected value").color(p.err));
+                                                    }
+                                                }
+                                                Ok(Some(want)) => label(ui, p, &format!("The expected value is {}: choose it and Verify again", want.algo.label())),
+                                                Ok(None) => {}
+                                                Err(e) => {
+                                                    ui.label(RichText::new(e).color(p.err).size(12.0));
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            ui.label(RichText::new(format!("Could not compute it: {e}")).color(p.err));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        ui.end_row();
                     }
                     if let Some(t) = &it.torrent {
                         row(ui, "Torrent", format!("{} · info hash {}", t.name, t.info_hash));
@@ -143,6 +207,12 @@ impl App {
         if let Some(st) = &mut self.props {
             st.limit_on = limit_on;
             st.limit_kb = limit_kb;
+            st.algo = algo;
+            st.expected = expected;
+            if verify {
+                st.verified = None;
+                st.verifying = Some(self.client.verify_async(id, algo.wire()));
+            }
         }
         if copy {
             self.copy_text(ctx, it.request.url.clone());

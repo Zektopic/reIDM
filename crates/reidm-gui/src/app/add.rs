@@ -33,6 +33,20 @@ impl App {
                     }
                 }
             });
+            if self.vm.counts.checksums {
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new("More options").id_salt("add-more").default_open(!self.add.checksum.is_empty()).show(ui, |ui| {
+                    label(ui, p, "Expected checksum (single URL only)");
+                    ui.add_enabled(count <= 1, egui::TextEdit::singleline(&mut self.add.checksum).hint_text("sha256:9f86d0…  or just the hex").desired_width(500.0));
+                    match crate::checksum::parse(&self.add.checksum) {
+                        Err(e) => {
+                            ui.label(RichText::new(e).color(p.err).size(12.0));
+                        }
+                        Ok(Some(c)) => label(ui, p, &format!("The finished file is checked against this {} checksum; a mismatch marks the download failed and keeps the file.", c.algo.label())),
+                        Ok(None) => label(ui, p, "From the download page, if it gives one (MD5, SHA-1, SHA-256 or SHA-512)."),
+                    }
+                });
+            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 if ui.button("Import list…").clicked() {
@@ -63,7 +77,14 @@ impl App {
                 self.toast("Enter an http or https address first");
             } else if urls.len() == 1 {
                 let name = Some(self.add.name.trim().to_string()).filter(|n| !n.is_empty());
-                let body = serde_json::json!({ "url": urls[0], "filename": name, "dir": dir, "later": later });
+                let checksum = match crate::checksum::parse(&self.add.checksum) {
+                    Ok(c) => c.map(|c| c.json()),
+                    Err(e) => return self.toast(format!("The expected checksum: {e}")),
+                };
+                let mut body = serde_json::json!({ "url": urls[0], "filename": name, "dir": dir, "later": later });
+                if let Some(c) = checksum {
+                    body["checksum"] = c;
+                }
                 self.add = AddState::default();
                 self.cmd.run(move |c| {
                     let r = c.post("/api/downloads", body);

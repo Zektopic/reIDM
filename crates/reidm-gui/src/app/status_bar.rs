@@ -59,6 +59,13 @@ impl App {
                             ui.label(RichText::new("Total rate:").color(p.text_dim).size(12.0));
                             ui.separator();
                         }
+                        if let Some(free) = &self.snap.service.free_space {
+                            let dir = self.snap.service.settings.as_ref().map(|s| s.default_dir.as_str());
+                            if let Some((text, tip, low)) = crate::model::free_space_line(free, dir) {
+                                ui.label(RichText::new(text).color(if low { p.warn } else { p.text_dim }).size(12.0)).on_hover_text(tip);
+                                ui.separator();
+                            }
+                        }
                         if let Some(s) = &self.snap.service.settings {
                             let txt = if s.limit_enabled && s.speed_limit > 0 { format!("Speed limit: {}", rate_human(s.speed_limit as f64)) } else { "Speed limit: off".into() };
                             let col = if s.limit_enabled { p.warn } else { p.text_dim };

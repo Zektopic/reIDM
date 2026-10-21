@@ -395,6 +395,15 @@ impl Client {
         })
     }
 
+    /// Compute a finished download's checksum. Reading a big file takes a while.
+    pub fn verify_async(&self, id: u64, algo: &str) -> Receiver<Result<String, String>> {
+        let body = serde_json::json!({ "algo": algo });
+        self.in_background(Duration::from_secs(3600), move |c| {
+            let v: serde_json::Value = c.post_json(&format!("/api/downloads/{id}/verify"), body)?;
+            v["value"].as_str().map(str::to_string).ok_or_else(|| "the service gave no checksum".to_string())
+        })
+    }
+
     /// Point a download at a new address. The service checks the new address first, which takes
     /// a network round trip.
     pub fn refresh_async(&self, id: u64, url: &str) -> Receiver<Result<(), String>> {

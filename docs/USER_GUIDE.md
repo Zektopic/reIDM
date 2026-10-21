@@ -48,7 +48,8 @@ delete the file.
 
 **The status bar** counts downloads by state and shows whether the browser extension is connected
 (*Browser: Chrome 153*; click it to set the extension up), the speed limit (click to change it),
-and the total transfer rate.
+the total transfer rate, and the free space on the download folder's disk (hover for the
+temporary folder's too; it turns orange under 1 GB).
 
 **The notification area.** reIDM puts an icon there (the system tray on Windows, the menu bar on
 macOS, the panel on Linux desktops that show such icons). Closing the window hides it there —
@@ -77,6 +78,10 @@ The dialog fills itself with whatever links are on the clipboard when it opens.
 - *Save to* picks the folder for this download.
 - **Start download** queues it now; **Download later** puts it in the scheduled queue without
   starting it.
+- *More options › Expected checksum* (one address only): paste the MD5, SHA-1, SHA-256 or SHA-512
+  the download page gives — `sha256:9f86d0…`, `SHA-256 9f86d0…` or just the hex. The finished
+  file is checked against it; a mismatch marks the download failed (*checksum mismatch*) and
+  keeps the file.
 
 **Drag and drop** onto the window: a `.torrent` file opens *Add torrent*; a `.txt` list of
 addresses or an IDM `.ef2` export is imported; a link saved as a shortcut (`.url` on Windows,
@@ -142,6 +147,9 @@ server that refuses extra connections just ends up with fewer; the download carr
 - a **segment map**: the file as a bar, each part's progress filled in, and an orange mark where
   each connection is writing;
 - **Limit this download to … KB/s** — a speed cap for this download alone, applied immediately;
+- for a finished download, **Integrity**: whether it matched the checksum it was added with, and
+  **Verify**, which computes its MD5, SHA-1, SHA-256 or SHA-512 now and compares it with a value
+  you paste;
 - Pause/Resume, Open folder, Refresh address…, and Restart.
 
 **Stopping and resuming.** *Stop* pauses; *Resume* continues from where it stopped, even after a
@@ -235,6 +243,12 @@ queue* moves any unfinished download into it.
   - Pick the days; all days selected means every day.
   - If the computer was asleep at the start time, the queue starts when it wakes — and if it slept
     through the stop time as well, it stays stopped.
+
+**Queue order.** Downloads waiting for a free slot start in the order of the queue, which you
+can change: right-click › **Move to the top**, **Move up**, **Move down**, **Move to the
+bottom**, or Ctrl+↑ / Ctrl+↓. Several selected downloads move together and keep their order.
+View › *Show each download's place in the queue (#)* adds a column with it; click its header to
+sort by it.
 
 However many downloads the queue starts, no more than *Downloads at the same time* (Options) run
 at once; the rest wait their turn. That limit applies to all downloads, not just the queue.
@@ -339,6 +353,7 @@ Those marked *requires restart* apply the next time reIDM starts.
 | Ctrl+V | Add URL with the links on the clipboard |
 | Delete | delete the selected downloads (asks first) |
 | Ctrl+A | select everything shown |
+| Ctrl+↑ / Ctrl+↓ | move the selected downloads up or down the queue |
 | Enter | open the selected download if it's finished, otherwise its properties |
 | Alt+click (in the browser) | let the browser download a link instead of reIDM |
 

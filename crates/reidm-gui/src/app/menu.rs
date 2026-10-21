@@ -144,6 +144,13 @@ impl App {
                     ui.menu_button("View", |ui| {
                         ui.checkbox(&mut self.prefs.dark, "Dark theme");
                         ui.checkbox(&mut self.cats_open, "Show categories");
+                        if ui
+                            .add_enabled(self.vm.counts.ordered, egui::Checkbox::new(&mut self.prefs.queue_column, "Show each download's place in the queue (#)"))
+                            .on_disabled_hover_text("The download service running keeps no queue order; restart reIDM after updating.")
+                            .changed()
+                        {
+                            self.prefs.save();
+                        }
                         ui.separator();
                         for v in [View::Category(Category::All), View::Unfinished, View::Finished, View::Queue] {
                             if ui.button(v.label()).clicked() {

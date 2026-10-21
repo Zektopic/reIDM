@@ -290,7 +290,7 @@ impl App {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (del, all, enter, new, paste) = ctx.input(|i| {
+        let (del, all, enter, new, paste, up, down) = ctx.input(|i| {
             let cmd = i.modifiers.command;
             (
                 i.key_pressed(egui::Key::Delete),
@@ -298,8 +298,13 @@ impl App {
                 i.key_pressed(egui::Key::Enter),
                 (cmd && i.key_pressed(egui::Key::N)) || i.key_pressed(egui::Key::Insert),
                 i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+                cmd && i.key_pressed(egui::Key::ArrowUp),
+                cmd && i.key_pressed(egui::Key::ArrowDown),
             )
         });
+        if (up || down) && self.vm.counts.ordered {
+            self.move_selected(if up { crate::queue::To::Up } else { crate::queue::To::Down });
+        }
         if del && !self.selected.is_empty() {
             self.confirm = Some(Confirm::Remove(self.selected_ids()));
         }

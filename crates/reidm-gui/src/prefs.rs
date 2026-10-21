@@ -47,6 +47,9 @@ pub struct Prefs {
     /// Offer links copied to the clipboard as downloads.
     #[serde(default)]
     pub watch_clipboard: bool,
+    /// The list shows each download's place in the queue.
+    #[serde(default)]
+    pub queue_column: bool,
 }
 
 impl Default for Prefs {
@@ -64,6 +67,7 @@ impl Default for Prefs {
             on_finish: None,
             notify_failures: true,
             watch_clipboard: false,
+            queue_column: false,
         }
     }
 }

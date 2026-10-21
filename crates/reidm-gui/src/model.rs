@@ -104,6 +104,11 @@ pub struct Item {
     /// How many byte ranges it is split into.
     pub parts: usize,
     pub torrent: Option<TorrentRow>,
+    /// Its place in the queue (lowest starts first); `None` from a service that keeps no order.
+    pub order: Option<u64>,
+    /// Whether the finished file matched the checksum it was added with: `Some(None)` when it
+    /// had none, `None` from a service that doesn't check checksums.
+    pub checksum_ok: Option<Option<bool>>,
     // Worked out once when the row arrives, not on every frame: the list is filtered, sorted and
     // counted by these, and with tens of thousands of rows the allocations add up.
     name: String,
@@ -147,6 +152,15 @@ struct RowWire {
     parts: usize,
     #[serde(default)]
     torrent: Option<TorrentRow>,
+    #[serde(default)]
+    order: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    checksum_ok: Option<Option<bool>>,
+}
+
+/// A field that may be `null`: present (even as `null`) is `Some`, absent is `None`.
+fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(d).map(Some)
 }
 
 impl From<RowWire> for Item {
@@ -174,6 +188,8 @@ impl From<RowWire> for Item {
             connections: w.connections,
             parts: w.parts,
             torrent: w.torrent,
+            order: w.order,
+            checksum_ok: w.checksum_ok,
         }
     }
 }
@@ -462,6 +478,14 @@ pub struct FreeSpace {
     pub free: u64,
 }
 
+/// The status bar's free space: the download folder's disk (or the first reported), the
+/// tooltip listing every folder, and whether it is getting low (under 1 GB).
+pub fn free_space_line(free: &[FreeSpace], download_dir: Option<&str>) -> Option<(String, String, bool)> {
+    let main = free.iter().find(|f| Some(f.path.as_str()) == download_dir).or_else(|| free.first())?;
+    let tip = free.iter().map(|f| format!("{}: {} free", f.path, size_human(f.free))).collect::<Vec<_>>().join("\n");
+    Some((format!("{} free", size_human(main.free)), tip, main.free < 1_000_000_000))
+}
+
 /// When reIDM's own browser extension last checked in.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct ExtensionSeen {
@@ -552,4 +576,20 @@ pub fn eta_human(secs: f64) -> String {
     }
     let s = secs as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_status_bar_shows_the_download_folder_s_disk() {
+        let fs = [FreeSpace { path: "/tmp/parts".into(), free: 500_000_000 }, FreeSpace { path: "/home/me/Downloads".into(), free: 123_456_789_012 }];
+        let (text, tip, low) = free_space_line(&fs, Some("/home/me/Downloads")).unwrap();
+        assert_eq!(text, "123.5 GB free");
+        assert_eq!(tip, "/tmp/parts: 500.0 MB free\n/home/me/Downloads: 123.5 GB free");
+        assert!(!low);
+        assert!(free_space_line(&fs, None).unwrap().2, "the first, and it is low");
+        assert_eq!(free_space_line(&[], None), None);
+    }
 }
