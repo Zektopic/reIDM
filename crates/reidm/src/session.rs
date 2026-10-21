@@ -110,6 +110,7 @@ impl Session {
             dir: None,
             media: None,
             torrent: None,
+            checksum: None,
         })
     }
 

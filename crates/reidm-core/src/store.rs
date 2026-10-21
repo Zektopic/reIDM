@@ -20,7 +20,7 @@ use crate::{url_key_of, Item};
 use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,13 @@ use std::time::{Duration, Instant};
 const DEBOUNCE: Duration = Duration::from_secs(2);
 /// After a failed save (a full disk, say), how long to wait before trying again.
 const RETRY: Duration = Duration::from_secs(5);
+/// A list so long that saving it takes a while waits longer between saves, so that saving
+/// takes at most about 1/SAVE_SHARE of a core: with 50,000 downloads and one running, saving
+/// every 2 s was most of what the service did. Urgent saves (adds, removals, status changes)
+/// never wait.
+const SAVE_SHARE: u32 = 25;
+/// ...but never longer than this.
+const LONGEST_WAIT: Duration = Duration::from_secs(30);
 
 /// A value shared copy-on-write: cloning it is a pointer copy, and changing it copies the value
 /// only while a save is still holding the old one.
@@ -74,12 +81,85 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Shared<T> {
     }
 }
 
+/// How many changed ids the list remembers for [`DbCell::changed_since`]. A caller further
+/// behind than this is told to look at everything, which is always correct, just slower.
+const CHANGES_KEPT: usize = 65_536;
+
+/// The items, by id. Taking one for writing records its id, so the list can say which items
+/// changed since a revision ([`DbCell::changed_since`]) instead of a window comparing them all.
+#[derive(Default)]
+pub(crate) struct Items {
+    map: BTreeMap<u64, Shared<Item>>,
+    /// Items taken for writing since the list was locked; collected when the lock is let go.
+    touched: Vec<u64>,
+}
+
+impl Items {
+    pub(crate) fn get(&self, id: &u64) -> Option<&Shared<Item>> {
+        self.map.get(id)
+    }
+
+    /// The item, for changing. Counts as a change to it whether or not anything is changed, so
+    /// look with [`Items::get`] first when a change is not certain.
+    pub(crate) fn get_mut(&mut self, id: &u64) -> Option<&mut Shared<Item>> {
+        let it = self.map.get_mut(id)?;
+        self.touched.push(*id);
+        Some(it)
+    }
+
+    pub(crate) fn contains_key(&self, id: &u64) -> bool {
+        self.map.contains_key(id)
+    }
+
+    pub(crate) fn keys(&self) -> impl DoubleEndedIterator<Item = &u64> + '_ {
+        self.map.keys()
+    }
+
+    pub(crate) fn values(&self) -> impl DoubleEndedIterator<Item = &Shared<Item>> + '_ {
+        self.map.values()
+    }
+
+    pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = (&u64, &Shared<Item>)> + '_ {
+        self.map.iter()
+    }
+
+    /// Every item, for changing: each counts as changed. For a few of many, find their ids with
+    /// [`Items::iter`] and take each with [`Items::get_mut`] instead.
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Shared<Item>> + '_ {
+        let touched = &mut self.touched;
+        self.map.iter_mut().map(move |(id, it)| {
+            touched.push(*id);
+            it
+        })
+    }
+
+    /// A copy for saving: pointers only.
+    fn snapshot(&self) -> BTreeMap<u64, Shared<Item>> {
+        self.map.clone()
+    }
+}
+
+impl Serialize for Items {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        self.map.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Items {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Items { map: BTreeMap::deserialize(d)?, touched: Vec::new() })
+    }
+}
+
 /// The list. Its shape on disk is the one every version has written: `next_id` and `items`.
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct Db {
     pub(crate) next_id: u64,
     /// Change an item's address only through [`Db::set_url`], which keeps the index right.
-    pub(crate) items: BTreeMap<u64, Shared<Item>>,
+    pub(crate) items: Items,
+    /// The queue position the next new download gets: after every other. Worked out on load.
+    #[serde(skip)]
+    pub(crate) next_order: u64,
     /// Which items have each address (by [`crate::url_key`]), so recognising a link already in
     /// the list does not parse every address in it. Several items can share an address: the
     /// same video page in two formats.
@@ -92,10 +172,12 @@ impl Db {
         Db { next_id: 1, ..Default::default() }
     }
 
-    /// Build the address index; called once after loading.
+    /// Build the address index; called once after loading, after anything else done to the
+    /// list as loaded (which is not a change to it, so the record of changes starts empty).
     pub(crate) fn reindex(&mut self) {
+        self.items.touched.clear();
         self.by_key.clear();
-        for (id, it) in &self.items {
+        for (id, it) in self.items.iter() {
             if let Some(k) = url_key_of(&it.request.url) {
                 self.by_key.entry(k).or_default().push(*id);
             }
@@ -106,11 +188,13 @@ impl Db {
         if let Some(k) = url_key_of(&it.request.url) {
             self.by_key.entry(k).or_default().push(it.id);
         }
-        self.items.insert(it.id, Shared::new(it));
+        self.items.touched.push(it.id);
+        self.items.map.insert(it.id, Shared::new(it));
     }
 
     pub(crate) fn remove(&mut self, id: u64) -> Option<Item> {
-        let it = self.items.remove(&id)?.into_inner();
+        let it = self.items.map.remove(&id)?.into_inner();
+        self.items.touched.push(id);
         if let Some(k) = url_key_of(&it.request.url) {
             self.unindex(&k, id);
         }
@@ -154,10 +238,22 @@ struct Snapshot {
     items: BTreeMap<u64, Shared<Item>>,
 }
 
+/// Which items changed at which revision, newest last.
+struct ChangeLog {
+    entries: VecDeque<(u64, Box<[u64]>)>,
+    /// How many ids `entries` holds.
+    kept: usize,
+    /// Changes at or before this revision have been forgotten.
+    forgotten: u64,
+}
+
 /// The list behind its lock, with the revision counter and the saver that changes to it drive.
 pub(crate) struct DbCell {
     db: Mutex<Db>,
     rev: Arc<AtomicU64>,
+    /// Taken (inside the list's lock) to move the revision on and record what changed, so a
+    /// reader never sees a revision whose changes are not recorded yet.
+    changes: Mutex<ChangeLog>,
     saver: Saver,
     path: PathBuf,
 }
@@ -187,7 +283,22 @@ impl DerefMut for DbGuard<'_> {
 impl Drop for DbGuard<'_> {
     fn drop(&mut self) {
         if self.touched {
-            self.cell.rev.fetch_add(1, Ordering::Relaxed);
+            let mut ids = std::mem::take(&mut self.g.items.touched);
+            ids.sort_unstable();
+            ids.dedup();
+            {
+                let mut log = self.cell.changes.lock().unwrap_or_else(PoisonError::into_inner);
+                let rev = self.cell.rev.fetch_add(1, Ordering::Relaxed) + 1;
+                if !ids.is_empty() {
+                    log.kept += ids.len();
+                    log.entries.push_back((rev, ids.into_boxed_slice()));
+                    while log.kept > CHANGES_KEPT {
+                        let Some((r, old)) = log.entries.pop_front() else { break };
+                        log.kept -= old.len();
+                        log.forgotten = r;
+                    }
+                }
+            }
             self.cell.saver.request(false);
         }
     }
@@ -197,7 +308,8 @@ impl DbCell {
     /// Hold `db`, saved to `path`, and start the thread that saves it. The thread ends when
     /// [`DbCell::close`] is called.
     pub(crate) fn start(db: Db, path: PathBuf, rev: Arc<AtomicU64>) -> Arc<Self> {
-        let cell = Arc::new(DbCell { db: Mutex::new(db), rev, saver: Saver::default(), path });
+        let changes = Mutex::new(ChangeLog { entries: VecDeque::new(), kept: 0, forgotten: rev.load(Ordering::Relaxed) });
+        let cell = Arc::new(DbCell { db: Mutex::new(db), rev, changes, saver: Saver::default(), path });
         let c = cell.clone();
         std::thread::Builder::new()
             .name("reidm-save".into())
@@ -212,6 +324,22 @@ impl DbCell {
             Ok(g) => Ok(DbGuard { g, cell: self, touched: false }),
             Err(p) => Err(PoisonError::new(DbGuard { g: p.into_inner(), cell: self, touched: false })),
         }
+    }
+
+    /// The ids of the items added, changed or removed after revision `since`, as far as the list
+    /// itself records them (a running download's progress moves the revision too, without an
+    /// entry here). `None` when `since` is older than what is remembered.
+    pub(crate) fn changed_since(&self, since: u64) -> Option<Vec<u64>> {
+        let log = self.changes.lock().unwrap_or_else(PoisonError::into_inner);
+        if since < log.forgotten {
+            return None;
+        }
+        // Entries are in revision order: walk back from the newest to the first one not wanted.
+        let mut ids: Vec<u64> = log.entries.iter().rev().take_while(|(r, _)| *r > since).flat_map(|(_, ids)| ids.iter().copied()).collect();
+        drop(log);
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
     }
 
     /// Ask for a save: soon, or (`urgent`) at once. Returns the save's number for [`DbCell::wait`].
@@ -240,7 +368,7 @@ impl DbCell {
     fn write_now(&self) -> Result<()> {
         let snap = {
             let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
-            Snapshot { next_id: db.next_id, items: db.items.clone() }
+            Snapshot { next_id: db.next_id, items: db.items.snapshot() }
         };
         // Compact: a list of thousands is several times smaller, and as quick to read back.
         let bytes = serde_json::to_vec(&snap)?;
@@ -262,7 +390,8 @@ impl DbCell {
                         continue;
                     }
                     let now = Instant::now();
-                    let mut due = if st.closing || st.urgent { now } else { st.dirty_since.unwrap_or(now) + DEBOUNCE };
+                    let wait = (st.last_took * SAVE_SHARE).clamp(DEBOUNCE, LONGEST_WAIT);
+                    let mut due = if st.closing || st.urgent { now } else { st.dirty_since.unwrap_or(now) + wait };
                     if let Some(r) = st.retry_at.filter(|_| !st.closing) {
                         due = due.max(r);
                     }
@@ -275,8 +404,10 @@ impl DbCell {
                 st.dirty_since = None;
                 st.wanted
             };
+            let started = Instant::now();
             let res = self.write_now();
             let mut st = s.state.lock().unwrap();
+            st.last_took = started.elapsed();
             match res {
                 Ok(()) => {
                     st.written = st.written.max(target);
@@ -324,6 +455,8 @@ struct SaveState {
     retry_at: Option<Instant>,
     error: Option<String>,
     closing: bool,
+    /// How long the last save took, which sets how long the next may wait for company.
+    last_took: Duration,
 }
 
 impl Saver {
@@ -551,6 +684,43 @@ mod tests {
         std::fs::write(sibling(&p, ".bak"), br#"{"n":4}"#).unwrap();
         assert_eq!(load::<V>(&p, "list", &mut w).unwrap(), Some(V { n: 4 }));
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn item(id: u64) -> Item {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "request": { "url": format!("http://h/{id}"), "referer": null, "cookie": null, "user_agent": null, "filename": null, "dir": null },
+            "path": format!("/tmp/{id}"), "size": null, "downloaded": 0, "status": { "state": "Paused" }, "segments": [], "resumable": false
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_record_of_changes_names_each_change_and_forgets_the_oldest() {
+        let d = dir("changes");
+        let rev = Arc::new(AtomicU64::new(1));
+        let cell = DbCell::start(Db::fresh(), d.join("l.json"), rev.clone());
+        cell.lock().unwrap().insert(item(1));
+        let r1 = rev.load(Ordering::SeqCst);
+        assert_eq!(cell.changed_since(1), Some(vec![1]));
+        assert_eq!(cell.changed_since(r1), Some(vec![]));
+        // Looking is not changing.
+        let _ = cell.lock().unwrap().items.get(&1).map(|i| i.id);
+        assert_eq!(rev.load(Ordering::SeqCst), r1);
+        cell.lock().unwrap().items.get_mut(&1).unwrap().downloaded = 5;
+        assert_eq!(cell.changed_since(r1), Some(vec![1]));
+        // More changes than are kept: the oldest are forgotten, and asking about them says so.
+        {
+            let mut db = cell.lock().unwrap();
+            for id in 2..(CHANGES_KEPT as u64 + 10) {
+                db.insert(item(id));
+            }
+        }
+        cell.lock().unwrap().items.get_mut(&1).unwrap().downloaded = 6;
+        assert_eq!(cell.changed_since(r1), None);
+        let now = rev.load(Ordering::SeqCst);
+        cell.lock().unwrap().items.get_mut(&2).unwrap().downloaded = 1;
+        assert_eq!(cell.changed_since(now), Some(vec![2]));
+        cell.close();
     }
 
     #[cfg(unix)]

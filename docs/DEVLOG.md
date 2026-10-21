@@ -9,6 +9,92 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-21 — Extension 1.7.0: "Use this link to refresh …?", idempotent hand-offs (0.8.0)
+
+Source: docs/design/0.8-phase2.md ("Refresh address (extension M14)", "Idempotent /ext/add
+(extension M19)"), and what the October extension review left open (L13, L18).
+
+### Refreshing an address asks first (M14)
+
+**Context.** After *Refresh download address* → "click the link again in the browser", reIDM
+tries every link it is handed in the next 180 s against the waiting download. The extension
+didn't know, so the user saw an ordinary *Download file info* dialog for what was really a
+refresh; pressing Cancel ("it's a duplicate") lost the refresh, and any unrelated download in
+that window went through the refresh attempt first.
+**Decision.**
+- Before each hand-off of an http(s) link without `media` (browser downloads, clicked links, the
+  right-click menu and popup, a direct-address video format), the worker pings reIDM. If
+  `/ext/ping` reports `refresh_armed: {id, name}` (a bare id is accepted too), the dialog first
+  shows **Use this link to refresh *name*?** with **Refresh**, **New download** and **Cancel**,
+  titled *Refresh download address*. Address, origin and size stay visible (the size helps decide
+  "same file?"); name and folder are hidden, as they are the waiting download's.
+- The question is shown **even with the dialog off**: the user armed it moments ago, and which
+  link they meant is theirs to say. *New download* then starts at once; with the dialog on it
+  turns into the usual form.
+- The answer goes to `/ext/add`: Refresh → `refresh_id: <id>`; New download (Start or Later) →
+  `no_refresh: true`. "Start all" and the no-window fallback send neither, so reIDM decides as
+  before.
+- Outcomes: `refreshed` → notification *Address refreshed — <name> continues from this link*, and
+  *Just now* lists it under the waiting download's name. Refresh asked but reIDM added a new
+  download instead (a service that ignores `refresh_id`) → *Added as a new download — this link is
+  not the same file as <name>…*. A refusal of a held browser download → the browser keeps it, and
+  the dialog says so, as for any refusal.
+- Without the field (reIDM before 0.8) nothing changes: no ping-driven question, no new fields.
+**Alternatives.** Using the once-a-minute ping's value (misses most of the 3-minute window).
+Skipping the dialog and refreshing silently (the unrelated-download problem stays). Calling
+`/api/downloads/{id}/refresh` directly (needs the API token, which the extension can't read).
+Asking only when the dialog is on (then the user who switched the dialog off gets the old
+guessing behaviour exactly when they armed something).
+**Cost.** One localhost GET per hand-off. Negligible next to the hand-off itself, and it keeps the
+content scripts' "is reIDM up" status fresh.
+**Evidence.** Browser suite check 14 (five checks with the dialog on, two with it off). Against the
+current service they print `skipped: service lacks refresh_armed`. Run once against a stand-in
+proxy that adds `refresh_armed` to the current service's ping: all 19 checks in that run passed
+(the dialog's question and title, Refresh moves the waiting download to the mirror with no new
+item, *Just now* says `refreshed`, New download → usual form → new item with the waiting download
+untouched and nothing left in the browser, dialog off → question still shown, New download starts
+at once).
+
+### Idempotent hand-offs (M19)
+
+**Decision.** `send()` gives every `/ext/add` a `request_id` (`crypto.randomUUID()`, 36 chars) and
+reuses it for the launch-then-retry and for the one retry after the 25 s timeout. The retry
+against the original address after a redirect is a different request and gets its own id.
+`/ext/add-batch` gets none: it has no retry.
+**Evidence.** Suite check 15: a stand-in reIDM that never answers the first request; the extension
+asks again after 25 s with the same id and takes the second answer. Costs ~25 s per default run.
+
+### L13: the picked format keeps its container; stable-volume audio
+
+**Context.** reIDM names a video download `<stem>.%(ext)s` (media.rs), so the extension's
+extension was only ever what the dialog showed; but a WebM video joined with M4A audio becomes an
+MKV under `--merge-output-format mp4/webm/mkv`.
+**Decision.** Video-only formats get audio of their own container first (`<itag>+bestaudio[ext=webm]`
+for WebM, `[ext=m4a]` for MP4), then any audio. "Stable volume" (DRC) audio is asked for as
+yt-dlp's `<itag>-drc`, then the plain itag. The content script now passes `drc` to the worker.
+
+### L18: host access stays required
+
+Without host access the extension can read no cookies, so a fresh install would hand reIDM
+signed-in downloads it then can't fetch (falling back to the browser), and click interception
+couldn't run. Per-site grants make the first download from each site behave differently;
+asking for all sites at first run is the same grant with an extra prompt. Documented in
+BROWSER_INTEGRATION.md and extension/README.md instead.
+
+### Not done
+
+- **Expected checksum in the dialog.** The dialog has no *More* section to put it in, a checksum
+  is rarely known at the moment of the click, and reIDM's own Add dialog, `reidm add --checksum`
+  and Properties' *Integrity* row cover it. Revisit if users ask.
+- L15 (PDF stays on the click list, as in IDM), as before.
+
+### What the service must do (passed to the engine stream)
+
+`/ext/ping` `refresh_armed`; `/ext/add` `refresh_id` (refuse, never add, when the link isn't the
+armed file — a held browser download must stay with the browser) and `no_refresh` (an armed
+download that was never probed accepts any link, so "New download" needs an explicit opt-out); a
+repeated `request_id` waits for the first request's answer, refusals included.
+
 ## 2026-10-20 — Extension 1.6.0: never lose a held download, one dialog, cheap when idle (0.8.0)
 
 Source: the October extension review (H1–H6, M1–M22, L1–L18).

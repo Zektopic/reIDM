@@ -212,14 +212,41 @@ function launchReidm() {
 
 /** Hand one URL to reIDM, starting reIDM first if it is not running. */
 async function send(details) {
-  let r = await post('/ext/add', details);
-  if (!r.ok && r.unreachable && (await launchReidm())) r = await post('/ext/add', details);
-  // A timeout leaves open whether reIDM took the link. reIDM answers a second request for an
-  // address it already has with "existing", without checking it again, so asking once more
-  // settles the question instead of guessing — guessing "no" would have both reIDM and the
-  // browser download it.
-  if (!r.ok && r.timedOut) r = await post('/ext/add', details, BATCH_TIMEOUT_MS);
+  // One id for this hand-off, the same on every attempt below: a reIDM that knows it (0.8 and
+  // later) answers a repeat with its first answer instead of adding the link a second time.
+  const body = { ...details, request_id: details.request_id || crypto.randomUUID() };
+  let r = await post('/ext/add', body);
+  if (!r.ok && r.unreachable && (await launchReidm())) r = await post('/ext/add', body);
+  // A timeout leaves open whether reIDM took the link. Asking once more settles it instead of
+  // guessing — guessing "no" would have both reIDM and the browser download it. reIDM answers
+  // the repeated `request_id` with what it made of the first; an older reIDM still answers an
+  // address it already has with "existing", without checking it again.
+  if (!r.ok && r.timedOut) r = await post('/ext/add', body, BATCH_TIMEOUT_MS);
   return r;
+}
+
+/**
+ * The download reIDM is waiting to give a new address, if any: `{id, name}`. The user armed it in
+ * reIDM (*Refresh download address*, then "click the link again in the browser"), and for the
+ * next three minutes reIDM tries every link it is handed against it. Asked afresh for each
+ * capture, because the once-a-minute ping would miss most of that window. A reIDM older than
+ * 0.8 doesn't say, and then nothing changes: no question, and reIDM decides as before.
+ */
+async function refreshArmed(url) {
+  if (!isHttp(url)) return null;
+  const a = (await ping())?.refresh_armed;
+  const id = a && typeof a === 'object' ? a.id : a;
+  if (!Number.isInteger(id)) return null;
+  const name = a && typeof a.name === 'string' ? a.name.slice(0, 260) : null;
+  return { id, name };
+}
+
+/** What `/ext/add` is told about an armed refresh: the user's answer to "Use this link to
+ *  refresh …?". Without an answer ("Start all", or no dialog could open) nothing is said, and
+ *  reIDM tries the link against the waiting download as it always has. */
+function refreshFields(choice, armed) {
+  if (!armed || !choice.refresh) return {};
+  return choice.refresh === 'yes' ? { refresh_id: armed.id } : { no_refresh: true };
 }
 
 async function sendBatch(items, referer, later, storeId) {
@@ -406,6 +433,7 @@ async function takeOver(item, suggest) {
       user_agent: navigator.userAgent,
       verify: true,
     };
+    const armed = await refreshArmed(url);
     // The browser's copy stays paused, and its "Save as" unopened, while the user decides.
     const choice = await maybeAsk({
       url,
@@ -416,6 +444,7 @@ async function takeOver(item, suggest) {
       probe: false, // the browser is already fetching it; a probe would be one request more
       fallback: 'browser',
       program: isProgram(details.filename),
+      refresh: armed,
     });
     if (choice.action === 'cancel') {
       // IDM's Cancel: nobody downloads it, neither reIDM nor the browser.
@@ -435,12 +464,14 @@ async function takeOver(item, suggest) {
     }
     details.filename = choice.filename || details.filename;
     if (choice.action === 'later') details.later = true;
+    Object.assign(details, refreshFields(choice, armed));
     let r = await send(details);
     // A redirect's target can be bound to the request that produced it; the original address
     // is worth one more try before giving up.
     if (!r.ok && !r.unreachable && item.url !== url && isHttp(item.url)) {
       r = await send({ ...details, url: item.url, cookie: await cookieHeader(item.url, store) });
     }
+    noteOffer(r, armed, choice);
     choice.report(r);
     if (r.ok) {
       // Noted before cancelling, so a worker that dies in between leaves a record saying the
@@ -450,7 +481,7 @@ async function takeOver(item, suggest) {
       await cancelAndErase(item.id);
       release();
       await pendingDelete(item.id);
-      recordCapture({ url, filename: details.filename, outcome: r.outcome, id: r.id });
+      recordCapture({ url, filename: listedName(r, details.filename), outcome: r.outcome, id: r.id });
       flashBadge(r.outcome === 'already_complete' ? '=' : '✓', '#2ea053', 2500);
       announce(r, details.filename || nameFromUrl(url));
       return;
@@ -556,11 +587,27 @@ function toast(title, message, id) {
 function announce(r, name) {
   if (!r || !r.ok) return;
   const what = name || 'the download';
+  const offer = r.offered;
+  const target = (offer && offer.name) || 'The download waiting for a new address';
   if (r.outcome === 'already_complete') toast('Already downloaded', `${what} is already in reIDM, finished.`, `reidm-${r.id}`);
   else if (r.outcome === 'existing') toast('reIDM carries on', `${what} was already in reIDM; it continues from where it stopped.`, `reidm-${r.id}`);
-  else if (r.outcome === 'refreshed') toast('Address refreshed', `The download waiting for a new address continues from this link.`, `reidm-${r.id}`);
-  else toast('Downloading in reIDM', what, `reidm-${r.id}`);
+  else if (r.outcome === 'refreshed') toast('Address refreshed', `${target} continues from this link.`, `reidm-${r.id}`);
+  else if (offer && offer.answer === 'yes') {
+    // Asked to refresh, but reIDM found this link is another file and added it instead (a
+    // reIDM that doesn't know `refresh_id` does that rather than refuse).
+    toast('Added as a new download', `This link is not the same file as ${offer.name || 'the waiting download'}, so reIDM added it as ${what}. The waiting download still needs a new address.`, `reidm-${r.id}`);
+  } else toast('Downloading in reIDM', what, `reidm-${r.id}`);
 }
+
+/** Note on a hand-off's result what the user was asked about an armed refresh, for `announce`
+ *  and *Just now*. */
+function noteOffer(r, armed, choice) {
+  if (armed && r) r.offered = { ...armed, answer: choice.refresh || null };
+  return r;
+}
+
+/** The name a hand-off is listed under in *Just now*: the waiting download's, if it took the link. */
+const listedName = (r, filename) => (r && r.outcome === 'refreshed' && r.offered && r.offered.name) || filename;
 
 // ── the toolbar badge ───────────────────────────────────────────────────
 //
@@ -690,6 +737,10 @@ function advance() {
     fallback: FALLBACK_TEXT[r.fallback] || FALLBACK_TEXT.none,
     program: !!r.program,
     probing,
+    // "Use this link to refresh …?" first; `ask` says whether *New download* then shows the
+    // usual form or starts at once, as it would with the dialog off.
+    refresh: r.refresh ? { name: r.refresh.name || `download #${r.refresh.id}` } : null,
+    ask: !!settings.askBeforeDownload || !!r.program,
   });
   if (probing) {
     probeSize(r.url).then((p) => {
@@ -771,8 +822,11 @@ function onDialogConnect(port) {
         return;
       }
       const action = m.action === 'later' ? 'later' : 'start';
+      // On a request that offered a refresh, anything but *Refresh* is a new download.
+      const refresh = cur.req.refresh ? (m.action === 'refresh' ? 'yes' : 'no') : undefined;
       settle(cur, {
         action,
+        refresh,
         filename: m.filename || cur.req.filename,
         report: (r) => {
           if (dialog.current !== cur) return;
@@ -821,13 +875,16 @@ function askUser(req) {
 }
 
 /**
- * Ask when the user wants to be asked — and always for a program a page started by itself.
+ * Ask when the user wants to be asked — and always for a program a page started by itself, and
+ * while reIDM waits for a new address (`refresh`): the user armed that a moment ago in reIDM,
+ * and whether this link is the one they meant is theirs to say, not a guess.
  * `req`: { url, filename, from?, size?, sizeNote?, probe?: false, incognito?, nameFromServer?,
- *          fallback: 'browser' | 'none', program? }.
+ *          fallback: 'browser' | 'none', program?, refresh?: {id, name} }.
+ * Resolves to `{action, filename, refresh?: 'yes' | 'no', reason?, report(result)}`.
  */
 async function maybeAsk(req) {
   await settingsReady;
-  if (!settings.askBeforeDownload && !req.program) return { action: 'start', filename: req.filename, report: () => {} };
+  if (!settings.askBeforeDownload && !req.program && !req.refresh) return { action: 'start', filename: req.filename, report: () => {} };
   return askUser(req);
 }
 
@@ -859,7 +916,8 @@ async function captureLink(msg, sender) {
   if (incognito && !settings.captureIncognito) return { ok: false, error: 'incognito' };
   let filename = msg.filename || nameFromUrl(url) || undefined;
   const referer = (sender.tab && sender.tab.url) || undefined;
-  const choice = await maybeAsk({ url, from: referer, filename, incognito, nameFromServer: !msg.filename, fallback: 'browser', program: isProgram(filename) });
+  const armed = await refreshArmed(url);
+  const choice = await maybeAsk({ url, from: referer, filename, incognito, nameFromServer: !msg.filename, fallback: 'browser', program: isProgram(filename), refresh: armed });
   // Cancelled: the click is used up and nothing downloads. `ok` so the page doesn't hand the
   // click back to the browser.
   if (choice.action === 'cancel') {
@@ -878,9 +936,10 @@ async function captureLink(msg, sender) {
     verify: true,
     refuse_html: true,
     later: choice.action === 'later',
-  }));
+    ...refreshFields(choice, armed),
+  }).then((res) => noteOffer(res, armed, choice)));
   if (r.ok) {
-    recordCapture({ url, filename, outcome: r.outcome, id: r.id });
+    recordCapture({ url, filename: listedName(r, filename), outcome: r.outcome, id: r.id });
     flashBadge(r.outcome === 'already_complete' ? '=' : '✓', '#2ea053', 2500);
     announce(r, filename || nameFromUrl(url));
   } else {
@@ -927,7 +986,8 @@ async function addLink(url, ctx, { referer, filename } = {}) {
   if (!isHttp(url)) return { ok: false, error: 'that is not an http or https link' };
   if (ctx.incognito && !settings.captureIncognito) return { ok: false, error: INCOGNITO_OFF };
   const proposed = filename || nameFromUrl(url) || undefined;
-  const choice = await maybeAsk({ url, from: referer, filename: proposed, incognito: ctx.incognito, nameFromServer: !filename, fallback: 'none' });
+  const armed = await refreshArmed(url);
+  const choice = await maybeAsk({ url, from: referer, filename: proposed, incognito: ctx.incognito, nameFromServer: !filename, fallback: 'none', refresh: armed });
   if (choice.action === 'cancel' || choice.action === 'release') {
     const r = { ok: false, cancelled: true, error: 'cancelled' };
     recordResult(url, proposed, r);
@@ -941,8 +1001,9 @@ async function addLink(url, ctx, { referer, filename } = {}) {
     cookie: await cookieHeader(url, ctx.storeId),
     user_agent: navigator.userAgent,
     later: choice.action === 'later',
-  }));
-  recordResult(url, name, r);
+    ...refreshFields(choice, armed),
+  }).then((res) => noteOffer(res, armed, choice)));
+  recordResult(url, listedName(r, name), r);
   return r;
 }
 
@@ -1331,17 +1392,21 @@ function formatFilename(title, format, url) {
 /**
  * The yt-dlp format selector for a format picked in the list: that exact format when yt-dlp
  * offers it (its list is not always the page's), else the best at the same height — H.264 with
- * AAC first, which plays anywhere. A format without sound gets the best audio joined to it.
- * With nothing picked (`null` from the popup's "best quality" row too), the best there is.
+ * AAC first, which plays anywhere. A format without sound gets the best audio in its own
+ * container joined to it (WebM with Opus, MP4 with AAC), so the file stays the type the dialog
+ * named rather than becoming an MKV. "Stable volume" audio is yt-dlp's `<itag>-drc`, else the
+ * plain one. With nothing picked (`null` from the popup's "best quality" row too), the best
+ * there is. reIDM names the file after yt-dlp's result, whatever the extension sent.
  */
 function ytdlpFormat(f) {
   f = f || {};
   const id = Number.isInteger(f.itag) ? String(f.itag) : null;
-  if (f.audioOnly) return [id, 'bestaudio[ext=m4a]', 'bestaudio'].filter(Boolean).join('/');
+  if (f.audioOnly) return [id && f.drc ? `${id}-drc` : null, id, 'bestaudio[ext=m4a]', 'bestaudio'].filter(Boolean).join('/');
   const h = Number(f.height) || parseInt(f.quality, 10) || 0;
   const cap = h ? `[height<=${h}]` : '';
+  const audio = /webm/i.test(f.mime || '') ? 'bestaudio[ext=webm]' : 'bestaudio[ext=m4a]';
   const alts = [];
-  if (id) alts.push(...(f.hasAudio ? [id] : [`${id}+bestaudio[ext=m4a]`, `${id}+bestaudio`]));
+  if (id) alts.push(...(f.hasAudio ? [id] : [`${id}+${audio}`, `${id}+bestaudio`]));
   alts.push(`bestvideo${cap}[vcodec^=avc1]+bestaudio[ext=m4a]`, `bestvideo${cap}+bestaudio`, `best${cap}`);
   return alts.join('/');
 }
@@ -1424,7 +1489,8 @@ async function downloadFormat(msg, sender) {
   await settingsReady;
   if (ctx.incognito && !settings.captureIncognito) return { ok: false, error: INCOGNITO_OFF };
   const proposed = formatFilename(title, f, url);
-  const choice = await maybeAsk({ url, from: frameUrl, filename: proposed, size: f.size > 0 ? f.size : null, incognito: ctx.incognito, fallback: 'none' });
+  const armed = await refreshArmed(url);
+  const choice = await maybeAsk({ url, from: frameUrl, filename: proposed, size: f.size > 0 ? f.size : null, incognito: ctx.incognito, fallback: 'none', refresh: armed });
   if (choice.action === 'cancel' || choice.action === 'release') {
     const r = { ok: true, cancelled: true };
     recordResult(url, proposed, r);
@@ -1438,8 +1504,9 @@ async function downloadFormat(msg, sender) {
     cookie: await cookieHeader(url, ctx.storeId),
     user_agent: navigator.userAgent,
     later: choice.action === 'later',
-  }));
-  recordResult(url, name, r);
+    ...refreshFields(choice, armed),
+  }).then((res) => noteOffer(res, armed, choice)));
+  recordResult(url, listedName(r, name), r);
   if (r.ok) {
     flashBadge('✓', '#2ea053', 2500);
     announce(r, name);
@@ -1640,4 +1707,4 @@ const reconciled = reconcilePending();
 ping();
 
 // For DevTools and `tools/capture-test.mjs`: a module worker's functions are not globals.
-globalThis.reidm = { ping, launchReidm, status: () => status, stats, ytdlpFormat, cookieStoreFor, syncPageHook: () => syncPageHook() };
+globalThis.reidm = { ping, launchReidm, send, status: () => status, stats, ytdlpFormat, cookieStoreFor, syncPageHook: () => syncPageHook() };

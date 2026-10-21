@@ -124,6 +124,37 @@ reIDM — allow it when Windows asks. An old torrent may simply have no seeders 
 firewall, and check that the listening port (Options › Torrents) is forwarded by your router —
 reIDM asks routers that support it (UPnP).
 
+**A download is *Paused* with "not enough space on …".** Carrying on would have left that drive
+with less free space than reIDM keeps (200 MiB, *Advanced settings › Free space to keep*). Nothing
+it downloaded is lost. Free some space — or choose another download or temporary folder — and it
+carries on by itself within half a minute; *Resume* checks at once. Pausing it means it waits for
+you instead. When the download folder is on another drive than the temporary folder, that drive
+needs room for the whole file, which is copied there at the end.
+
+**"checksum mismatch: expected …, got …".** The file downloaded is not the one the checksum
+describes. It is kept where it was saved. Check that the expected value is the right one (the
+page's checksum for *this* file, and the right kind — SHA-256 is not MD5): *Resume* checks the
+file again. If the value is right, the file was damaged or replaced on the way: *Restart*
+downloads it again.
+
+**Downloads fail since a proxy was set.** Options › Network: check the server, port and kind
+(an HTTP proxy is not a SOCKS5 one), and the user name and password. Hosts in the bypass list are
+reached directly. Videos use the same proxy unless *Videos through the proxy* is off; torrents
+only through a SOCKS5 proxy, and only when asked (from the next start of the torrent engine).
+*Use the system's proxy* follows the `HTTPS_PROXY`/`HTTP_PROXY` environment variables (and
+Windows' own setting).
+
+**The computer still goes to sleep during a download.** *Keep the computer awake* (Options ›
+General) is on by default. On Linux it needs `systemd-inhibit` (systemd's logind); without it the
+service's log says *cannot keep the computer awake*. A laptop told to sleep (its lid closed, the
+power button) still sleeps: only automatic sleep is held off. While only seeding, reIDM lets the
+computer sleep unless *also while seeding* is on.
+
+**The computer slept or shut down after downloading.** Someone chose it under *When everything is
+done* (or `reidm when-done`). It waits a minute after the last download, cancellable from the
+window or with `reidm when-done none`, and is forgotten when reIDM stops. If it did *not* happen,
+the status banner says why the system refused (on Linux, logind's permission for the session).
+
 **Resume capability: No.** The server doesn't serve byte ranges. The download uses one connection,
 and stopping it means starting again. Nothing in reIDM can change that.
 

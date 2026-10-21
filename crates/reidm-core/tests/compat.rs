@@ -234,3 +234,70 @@ async fn a_finished_file_moves_across_drives() {
     assert_eq!(std::fs::read_dir(&parts).unwrap().count(), 0, "the part file goes once the move is done");
     let _ = std::fs::remove_dir_all(&parts);
 }
+
+/// Files exactly as 0.8's first phase wrote them (every field it had, none it didn't): they load
+/// unchanged, the new settings take their defaults, the queue gets an order in the order the
+/// downloads were added, and the files written back still read as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn files_from_0_8_phase_1_load_with_the_new_defaults() {
+    let dir = tmp("p1");
+    let (state, dl) = (dir.join("state"), dir.join("dl"));
+    std::fs::create_dir_all(&state).unwrap();
+    let d = dl.to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(
+        state.join("settings.json"),
+        format!(
+            r#"{{
+  "default_dir": "{d}",
+  "connections": 8,
+  "max_concurrent": 4,
+  "speed_limit": 0,
+  "limit_enabled": false,
+  "schedule": {{ "enabled": false, "start": null, "stop": null, "days": [] }},
+  "sort_by_category": true,
+  "category_dirs": {{}},
+  "temp_dir": null,
+  "seed_ratio": 1.0,
+  "upload_limit": 0,
+  "torrent_port": 6881,
+  "torrent_dht": true
+}}"#
+        ),
+    )
+    .unwrap();
+    let item = |id: u64, state: &str| {
+        format!(
+            r#""{id}": {{ "id": {id}, "request": {{ "url": "http://127.0.0.1:9/{id}.bin", "referer": null, "cookie": null, "user_agent": null, "filename": null, "dir": "{d}" }},
+            "path": "{d}/{id}.bin", "size": null, "downloaded": 0, "status": {{ "state": "{state}" }}, "segments": [], "resumable": false,
+            "added": 1760000000, "last_try": null, "finished_at": null, "etag": null, "last_modified": null, "speed_limit": null, "scheduled": true,
+            "part": "{d}/{id}.bin.reidm" }}"#
+        )
+    };
+    // Ids out of order on purpose: the order follows the id, not the file's order.
+    std::fs::write(state.join("downloads.json"), format!(r#"{{ "next_id": 8, "items": {{ {}, {}, {} }} }}"#, item(7, "Paused"), item(2, "Queued"), item(5, "Paused"))).unwrap();
+
+    let m = Manager::open(&state, dl.clone(), 8).unwrap();
+    assert!(m.warnings().is_empty(), "{:?}", m.warnings());
+    let s = m.settings();
+    assert_eq!(s.performance, reidm_core::Performance::Balanced);
+    assert_eq!((s.write_buffer_kib, s.retries, s.retry_wait_secs, s.idle_timeout_secs, s.connect_timeout_secs, s.min_free_space_mib), (256, 5, 3, 60, 30, 200));
+    assert!(s.keep_awake && !s.keep_awake_seeding);
+    assert_eq!(s.proxy, reidm_core::Proxy::default());
+    assert_eq!(m.queue_order(), [2, 5, 7], "in the order they were added");
+    let items = m.list();
+    assert!(items.iter().all(|i| i.checksum_ok.is_none() && !i.waiting_for_space && i.request.checksum.is_none()));
+    // A new download goes to the back of the queue.
+    let new = m.add_with(reidm_core::Request { url: "http://127.0.0.1:9/new.bin".into(), dir: Some(dl), ..Default::default() }, reidm_core::AddOptions { later: true, ..Default::default() }).unwrap().id;
+    assert_eq!(m.queue_order().last(), Some(&new));
+
+    // What is written back is the same shape, with the order kept.
+    assert!(m.flush());
+    m.update_settings(SettingsPatch { keep_awake: Some(false), ..Default::default() }).unwrap();
+    drop(m);
+    let m = Manager::open(&state, dir.join("elsewhere"), 8).unwrap();
+    assert_eq!(m.queue_order(), [2, 5, 7, new]);
+    assert!(!m.settings().keep_awake);
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(state.join("downloads.json")).unwrap()).unwrap();
+    assert_eq!(saved["next_id"], 9);
+    assert!(saved["items"]["2"]["order"].as_u64().unwrap() < saved["items"]["5"]["order"].as_u64().unwrap());
+}

@@ -68,8 +68,15 @@
 * Pages can no longer detect the extension through `inject.js`, use its privileged messages, or
   plant fake formats in the video picker.
 
-### Extension 1.6.0
+### Extension 1.7.0
 
+* While reIDM waits for a new address (*Refresh download address*), a link the browser hands over
+  asks **"Use this link to refresh *name*?"** — Refresh, New download or Cancel — instead of looking
+  like a new download; the result is announced by the download's name.
+* A hand-off that reIDM is slow to answer is retried with the same request id, so it can never be
+  added twice.
+* A YouTube quality without sound is joined with sound in its own container (a WebM stays a WebM),
+  and a "stable volume" audio track is downloaded as that track.
 * **A download held while the dialog was open could be lost** if the dialog closed early or the
   extension restarted. The browser now always gets it back.
 * **On live streams the extension re-fetched the playlist in a loop**, thousands of times a second.

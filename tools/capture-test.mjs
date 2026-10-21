@@ -31,7 +31,12 @@
 //      a YouTube download or store junk; an unchanged status is not rewritten; cookie stores;
 //  13. finding media: a live stream is not re-fetched in a loop, per-tab badges, relative and
 //      SPA manifests, YouTube SPA navigation, images never wake the worker, and the page hook
-//      exists only while media detection is on.
+//      exists only while media detection is on;
+//  14. while reIDM waits for a new address, a captured link asks "Use this link to refresh …?":
+//      Refresh moves the waiting download to the link, New download adds the link as its own
+//      (at once with the dialog off). Skipped, saying so, against a service that doesn't report
+//      `refresh_armed` in /ext/ping (before 0.8);
+//  15. a hand-off that timed out is asked again with the same `request_id`.
 //
 // REIDM_PROMPT=1 turns on the browser's "Ask where to save each file" and runs checks 1–2 and
 // the dialog checks that end with reIDM taking the download;
@@ -126,7 +131,14 @@ const FILES = {
   '/files/q1.zip': body(70 << 10, 16),
   '/files/q2.zip': body(80 << 10, 17),
   '/files/setup.exe': body(60 << 10, 18),
+  // Refreshing an address (M14): two downloads waiting for one, a mirror of the first, and two
+  // other files that are not either.
+  '/files/rfa.zip': body(140 << 10, 23),
+  '/files/rfb.zip': body(150 << 10, 24),
+  '/dl/other': body(160 << 10, 25),
+  '/files/other.zip': body(170 << 10, 26),
 };
+FILES['/mirror/rfa.zip'] = FILES['/files/rfa.zip'];
 /** Served a little at a time, so a download the extension pauses is really still unfinished. */
 const SLOW = { '/slow/a': body(600 << 10, 21), '/slow/b': body(700 << 10, 22) };
 const log = [];
@@ -146,6 +158,9 @@ const PAGE = `<!doctype html><html><head><title>capture test</title>
 <a id="refuse" href="/dl/refuse?id=13">refuse (reIDM is refused, the browser is not)</a>
 <a id="closed" href="/dl/closed?id=14">closed (dialog closed at once)</a>
 <a id="setup" href="/files/setup.exe">setup.exe (a program)</a>
+<a id="mirror" href="/mirror/rfa.zip">rfa.zip from a mirror (refresh)</a>
+<a id="other" href="/dl/other?id=30">other (not the download being refreshed)</a>
+<a id="other2" href="/files/other.zip">other.zip (not the download being refreshed either)</a>
 <a id="magnet" href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Test%20Torrent.bin">a magnet link</a>
 <form method="post" action="/post/export"><input type="hidden" name="q" value="1">
 <button id="post" type="submit">POST export</button></form>
@@ -733,6 +748,7 @@ async function dialogChecks() {
   await deleteItem(vid);
   await noDialog();
 
+  await refreshChecks();
   if (!process.env.REIDM_PROMPT) await fallbackDialogChecks();
   await opt.close();
 }
@@ -803,6 +819,79 @@ async function fallbackDialogChecks() {
   await forgetBrowserDownloads(['refuse', 'closed', 'a.bin', 'b.bin']);
 }
 
+/** What the dialog shows when it offers to refresh a waiting download's address. */
+const offerView = (d) => d.run(`({ offer: !document.getElementById('offer').hidden && !document.getElementById('offerRefresh').disabled,
+  name: document.getElementById('offerName').textContent, title: document.title, url: document.getElementById('url').textContent })`);
+const offerShowing = (d, re) => waitFor('the refresh offer', async () => {
+  const v = await offerView(d).catch(() => null);
+  return v && v.offer && re.test(v.url) ? v : null;
+}, 15000);
+
+/** A download waiting in reIDM for a new address, as *Refresh download address* leaves it:
+ *  added (checked, so its size is known) for later, then armed. Null when the service doesn't
+ *  tell the extension about it (before 0.8), and then the checks are skipped. */
+async function armRefresh(p) {
+  let it = itemFor(await reidmItems(), p);
+  if (!it) {
+    await fetch(`${API}/ext/add`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: `${onRoot()}${p}`, verify: true, later: true }) });
+    it = itemFor(await reidmItems(), p);
+  }
+  if (!it) return null;
+  await fetch(`${API}/api/downloads/${it.id}/refresh-capture`, { method: 'POST', headers: { 'X-Reidm-Token': token(), 'Content-Type': 'application/json' }, body: '{}' });
+  const info = await (await fetch(`${API}/ext/ping`)).json();
+  if (!('refresh_armed' in info)) {
+    console.log('skipped: service lacks refresh_armed');
+    await disarmRefresh();
+    return null;
+  }
+  return it;
+}
+const disarmRefresh = () => fetch(`${API}/api/refresh-capture/cancel`, { method: 'POST', headers: { 'X-Reidm-Token': token() } }).catch(() => {});
+
+/** M14: while reIDM waits for a new address, a captured link first asks "Use this link to
+ *  refresh …?". With the dialog on. */
+async function refreshChecks() {
+  await noDialog();
+  const a = await armRefresh('/files/rfa.zip');
+  if (!a) return;
+  try {
+    // Refresh: a click on a mirror of the same file becomes the waiting download's address.
+    await click('#mirror');
+    let d = await dialog();
+    const v = d && (await offerShowing(d, /\/mirror\/rfa\.zip/));
+    check('refresh armed: the dialog asks "Use this link to refresh rfa.zip?"', !!v && v.name === 'rfa.zip' && /^Refresh download address/.test(v.title), JSON.stringify(v));
+    if (d) await press(d, 'offerRefresh');
+    const moved = await waitFor('the waiting download on its new address', async () => {
+      const i = (await reidmItems()).find((x) => x.id === a.id);
+      return i && i.request.url.endsWith('/mirror/rfa.zip') ? i : null;
+    });
+    check('Refresh: the waiting download carries on from the new address, with no new download', !!moved && (await reidmItems()).filter((x) => /rfa\.zip$/.test(x.request.url)).length === 1);
+    const r = (await recent())[0];
+    check('Refresh: "Just now" says the address was refreshed', !!r && r.outcome === 'refreshed' && r.filename === 'rfa.zip', JSON.stringify(r));
+    await noDialog();
+
+    // New download: a download the browser started, which is another file, is added as its own;
+    // the waiting download is left as it was.
+    const b = await armRefresh('/files/rfb.zip');
+    await click('#other');
+    d = await dialog();
+    const w = d && (await offerShowing(d, /\/dl\/other/));
+    check('refresh armed, another file: the dialog offers the refresh first', !!w && w.name === 'rfb.zip', JSON.stringify(w));
+    if (d) await press(d, 'offerNew');
+    const form = d && (await dialogShowing(d, /\/dl\/other/));
+    check('New download: the usual form follows, with the file’s own name', !!form && form.name === 'other.bin', JSON.stringify(form));
+    if (d) await press(d, 'start');
+    const added = await waitFor('other in reIDM', async () => itemFor(await reidmItems(), '/dl/other'));
+    const still = (await reidmItems()).find((x) => x.id === b.id);
+    check('New download: reIDM adds it, and the waiting download keeps its address', !!added && !!still && still.request.url.endsWith('/files/rfb.zip'), JSON.stringify(still && still.request.url));
+    check('New download: the browser kept nothing', !(await browserDownloads()).some((x) => x.url.includes('/dl/other')));
+    await deleteItem(added);
+    await noDialog();
+  } finally {
+    await disarmRefresh();
+  }
+}
+
 /** With the dialog off. */
 async function quietChecks() {
   // M15: a program a page starts still asks first.
@@ -812,6 +901,24 @@ async function quietChecks() {
   check('a program asks even with the dialog off, and warns', !!v && v.program, JSON.stringify(v));
   if (d) await press(d, 'cancel');
   await noDialog();
+
+  // M14 with the dialog off: the refresh is still offered (the user just armed it), and *New
+  // download* then starts at once, with no form.
+  const b = await armRefresh('/files/rfb.zip');
+  if (b) {
+    try {
+      await click('#other2');
+      const od = await dialog();
+      const ov = od && (await offerShowing(od, /\/files\/other\.zip/));
+      check('refresh armed, dialog off: the refresh is still offered', !!ov && ov.name === 'rfb.zip', JSON.stringify(ov));
+      if (od) await press(od, 'offerNew');
+      const added = await waitFor('other.zip in reIDM', async () => itemFor(await reidmItems(), '/files/other.zip'));
+      check('refresh armed, dialog off: New download starts it at once', !!added && !!(await noDialog()));
+      await deleteItem(added);
+    } finally {
+      await disarmRefresh();
+    }
+  }
 
   // H1 with the dialog off: straight to reIDM, best format.
   const opt = await extensionPage('options.html');
@@ -843,6 +950,43 @@ async function quietChecks() {
   const stores = await inWorker(`chrome.tabs.query({}).then(t => t.find(x => x.url === '${onRoot()}/').id).then(async id => [await reidm.cookieStoreFor(id, false), await reidm.cookieStoreFor(null, true)])`);
   check('cookies come from the tab’s own store, never the wrong profile’s', stores[0] === '0' && stores[1] === null, JSON.stringify(stores));
   await opt.close();
+}
+
+/** M19: a hand-off carries a `request_id`, and the retry after a timeout carries the same one,
+ *  so reIDM can tell a repeat from a second download. Against a stand-in for reIDM whose first
+ *  answer comes too late; it takes the extension's 25 s timeout to run. */
+async function requestIdChecks() {
+  const bodies = [];
+  const stand = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      if (!req.url.startsWith('/ext/add')) {
+        res.writeHead(404);
+        return res.end();
+      }
+      try {
+        bodies.push(JSON.parse(b));
+      } catch {
+        bodies.push(null);
+      }
+      if (bodies.length === 1) return; // never answered: the extension gives up on it and asks again
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, id: 1, outcome: 'existing' }));
+    });
+  });
+  await new Promise((r) => stand.listen(0, '127.0.0.1', r));
+  try {
+    await inWorker(`chrome.storage.sync.set({ port: ${stand.address().port} }).then(() => new Promise(r => setTimeout(r, 300))).then(() => true)`);
+    await inWorker(`(globalThis.__sent = null, reidm.send({ url: '${onRoot()}/files/m19.zip' }).then(r => (globalThis.__sent = r)), true)`);
+    const r = await waitFor('the retried hand-off', () => inWorker('globalThis.__sent'), 45000);
+    const ids = bodies.map((x) => x && x.request_id);
+    check('a timed-out hand-off is asked again with the same request id', !!r && r.ok && ids.length === 2 && !!ids[0] && ids[0] === ids[1], JSON.stringify({ ids, r }));
+  } finally {
+    await inWorker('chrome.storage.sync.set({ port: 61002 }).then(() => new Promise(r => setTimeout(r, 300))).then(() => true)');
+    stand.closeAllConnections();
+    stand.close();
+  }
 }
 
 /** Finding media, cheaply. */
@@ -1037,6 +1181,7 @@ async function main() {
   check('magnet link: the page stayed where it was', (await evalPage('location.pathname')) === '/');
   if (tor) await fetch(`${API}/api/downloads/${tor.id}`, { method: 'DELETE', headers: { 'X-Reidm-Token': token() } });
 
+  await requestIdChecks();
   await mediaChecks();
   await openPage(`http://127.0.0.1:${SITE_PORT}/`);
 

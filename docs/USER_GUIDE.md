@@ -166,8 +166,31 @@ the file it had (`If-Range`) and checks the total size. If the server now has a 
 the download stops with *The file changed on the server since this download began*, instead of
 splicing two versions together. Use **Restart** to fetch the new version.
 
-**Retrying.** A connection that drops is retried five times, waiting a little longer each time.
-A server that stops sending entirely for 60 seconds counts as a dropped connection.
+**Retrying.** A connection that drops is retried five times, waiting 3 seconds, then twice as long
+each time (up to a minute). A server that stops sending entirely for 60 seconds counts as a dropped
+connection, and one that doesn't answer within 30 seconds too. All four numbers are in the
+Advanced settings (retries 0 means for ever).
+
+**How hard reIDM works.** The *performance* choice sets connections per download, downloads at the
+same time, the disk-write buffer and the peers per torrent together: *Light* (4, 2, 64 KiB, 40) for
+an old computer or a shared line, *Balanced* (8, 4, 256 KiB, 100, the default) and *Maximum* (16,
+8, 1 MiB, 200) for a fast line and disk. Changing one of those numbers yourself makes it *Custom*.
+
+**Not enough space.** reIDM doesn't fill a drive: before a download starts, and every few seconds
+while it runs, it checks that what is left to write fits with 200 MiB to spare (the Advanced
+setting *free space to keep*). If not, the download pauses — keeping everything it has — and its
+status says how much it needs and how much is free. It carries on by itself within half a minute
+of there being room (*Resume* checks at once; *Pause* makes it wait for you).
+
+**Checksums.** Give a download the checksum its page publishes (`reidm add --checksum
+sha256:…`, or through the API) and reIDM checks the finished file against it. A file that differs
+is kept, and the download fails saying what was expected and what it got. A finished download's
+checksum can be worked out at any time from its Properties.
+
+**Proxy.** reIDM follows the system's proxy by default, can connect directly, or through a proxy
+you set (HTTP, HTTPS or SOCKS5, with a user name and password and a list of hosts to reach
+directly). Videos use it too; torrents only through SOCKS5, if asked. The password is kept in the
+settings file, readable by your user only, and never shown again.
 
 **When a download finishes** reIDM shows a desktop notification (where there is a notification
 area) or IDM's small *Download complete* window, with *Open*, *Open folder* and *Close* — Options
@@ -255,7 +278,20 @@ View › *Show each download's place in the queue (#)* adds a column with it; cl
 sort by it.
 
 However many downloads the queue starts, no more than *Downloads at the same time* (Options) run
-at once; the rest wait their turn. That limit applies to all downloads, not just the queue.
+at once; the rest wait their turn, in the queue's order: new downloads join at the back, and
+*Move to top / up / down / to bottom* changes the order (several selected move together, in their
+own order; finished downloads are stepped over). That limit applies to all downloads, not just the
+queue.
+
+**Keeping the computer awake.** While a download transfers, reIDM keeps the computer from going to
+sleep by itself (an option, on by default; also while seeding, if you ask), and lets it sleep 30
+seconds after the last one.
+
+**When everything is done.** reIDM can quit, or put the computer to sleep, hibernate or shut it down,
+once every download is done — `reidm when-done shutdown`, or the window's menu. It waits for
+something to run and then for nothing to be running or queued, counts down for a minute (anything
+starting again stops the countdown), saves the list and acts, once. The choice is forgotten when
+reIDM stops.
 
 ## The speed limiter
 

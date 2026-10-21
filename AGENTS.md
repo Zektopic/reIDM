@@ -31,6 +31,18 @@ REIDM_PROMPT=1 xvfb-run -a node tools/capture-test.mjs            # with "Ask wh
 REIDM_ONLY_GRABBER=1 xvfb-run -a node tools/capture-test.mjs      # the resource grabber
 ```
 
+For changes to the engine's transfer path, its saving or its memory use, also measure on imitated
+machines (Linux; cgroup limits via `systemd-run --user`; a throw-away service on its own ports):
+
+```sh
+cargo build --release --locked -p reidm
+node tools/profile-test.mjs                    # potato (½ core, 256 MB), laptop (2 cores, 1 GB), desktop
+```
+
+It downloads from a local server and compares every file byte for byte, kills one download with
+SIGKILL part way and checks that it resumes intact, and measures speed, CPU per GiB, memory and
+idle cost with a long list. Record the table in the devlog when the numbers move.
+
 CI installs the **newest stable** Rust, which may be newer than yours, and a new deprecation then
 fails `-D warnings` there first. Before pushing, lint with CI's version as well (it is printed in
 the *Install Rust* step), in its own target folder so your normal build isn't redone:
