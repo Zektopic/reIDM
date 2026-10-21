@@ -33,6 +33,7 @@ impl App {
         }
         self.tray_logic(ctx);
         self.when_done_logic(ctx);
+        self.clipboard_logic(ctx);
         self.handle_close(ctx);
 
         // Poll as often as what is on screen deserves.

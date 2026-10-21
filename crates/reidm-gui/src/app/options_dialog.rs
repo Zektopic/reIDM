@@ -271,8 +271,12 @@ impl App {
         section(ui, "Look");
         ui.checkbox(&mut self.prefs.dark, "Dark theme");
         caption(ui, p, "Light text on a dark background.");
+
+        section(ui, "Links you copy");
         ui.checkbox(&mut self.prefs.clipboard, "Fill Add URL with links from the clipboard");
         caption(ui, p, "Links you copied are already in Add URL when it opens.");
+        ui.checkbox(&mut self.prefs.watch_clipboard, "Watch the clipboard for download links");
+        caption(ui, p, "When you copy a link to a file or a magnet link, reIDM offers to download it, once. It looks about once a second while this is on.");
 
         section(ui, "Browser");
         ui.horizontal(|ui| {

@@ -44,6 +44,9 @@ pub struct Prefs {
     /// Say so when a download fails, the same way.
     #[serde(default = "yes")]
     pub notify_failures: bool,
+    /// Offer links copied to the clipboard as downloads.
+    #[serde(default)]
+    pub watch_clipboard: bool,
 }
 
 impl Default for Prefs {
@@ -60,6 +63,7 @@ impl Default for Prefs {
             tray_notified: false,
             on_finish: None,
             notify_failures: true,
+            watch_clipboard: false,
         }
     }
 }

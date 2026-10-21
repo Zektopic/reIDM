@@ -284,7 +284,12 @@ impl App {
         else {
             return;
         };
-        match std::fs::read(&path) {
+        self.import_path(&path);
+    }
+
+    /// Queue the downloads in a URL list or an IDM `.ef2` export.
+    pub(super) fn import_path(&mut self, path: &std::path::Path) {
+        match std::fs::read(path) {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
                 if reidm_core::lists::looks_like_ef2(&text) {

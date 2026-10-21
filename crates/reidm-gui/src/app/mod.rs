@@ -12,6 +12,7 @@ mod commands;
 mod complete;
 mod confirm;
 mod grabber;
+mod intake;
 mod integration;
 mod lifecycle;
 mod menu;
@@ -126,6 +127,14 @@ pub struct App {
     countdown_cancelled: Option<u64>,
     countdown_seen: Option<u64>,
 
+    // watching the clipboard
+    clip_watcher: Option<intake::ClipboardWatcher>,
+    clip_on: bool,
+    clip_priming: bool,
+    clip_seen: crate::dropped::ClipboardSeen,
+    /// Copied links waiting for *Download this link?*, oldest first.
+    clip_offers: std::collections::VecDeque<String>,
+
     // updates
     update: Option<UpdateOffer>,
     update_rx: Option<Receiver<Result<Option<reidm_core::update::Release>, String>>>,
@@ -202,6 +211,11 @@ impl App {
             quitting: false,
             countdown_cancelled: None,
             countdown_seen: None,
+            clip_watcher: None,
+            clip_on: false,
+            clip_priming: false,
+            clip_seen: Default::default(),
+            clip_offers: Default::default(),
             update: None,
             update_rx: None,
             cats_open: true,
@@ -357,6 +371,8 @@ impl eframe::App for App {
         self.integration_window(&ctx, &p);
         self.complete_window(&ctx, &p);
         self.countdown_window(&ctx, &p);
+        self.clipboard_prompt(&ctx, &p);
+        self.drops(&ctx, &p);
 
         // Draw again only when something will have changed. A new snapshot and a command's
         // answer each ask for a frame themselves; what is left is time passing.

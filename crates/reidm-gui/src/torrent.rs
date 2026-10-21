@@ -82,16 +82,7 @@ impl TorrentWindow {
                         ui.add(egui::TextEdit::singleline(&mut self.url).hint_text(hint).desired_width(480.0));
                         if ui.button("Browse .torrent…").clicked() {
                             if let Some(path) = rfd::FileDialog::new().add_filter("Torrent", &["torrent"]).pick_file() {
-                                match std::fs::read(&path) {
-                                    Ok(b) => {
-                                        use base64::Engine;
-                                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                                        self.file = Some((name, base64::engine::general_purpose::STANDARD.encode(b)));
-                                        self.info = None;
-                                        self.start_inspect(api);
-                                    }
-                                    Err(e) => self.error = Some(format!("cannot read {}: {e}", path.display())),
-                                }
+                                self.use_file(&path, api);
                             }
                         }
                     }
@@ -174,6 +165,25 @@ impl TorrentWindow {
             self.open = false;
         }
         done
+    }
+
+    /// Open on a `.torrent` file (dropped on the window), and list what it holds.
+    pub fn open_with_file(&mut self, path: &std::path::Path, api: &Client) {
+        *self = TorrentWindow { open: true, ..Default::default() };
+        self.use_file(path, api);
+    }
+
+    fn use_file(&mut self, path: &std::path::Path, api: &Client) {
+        match std::fs::read(path) {
+            Ok(b) => {
+                use base64::Engine;
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.file = Some((name, base64::engine::general_purpose::STANDARD.encode(b)));
+                self.info = None;
+                self.start_inspect(api);
+            }
+            Err(e) => self.error = Some(format!("cannot read {}: {e}", path.display())),
+        }
     }
 
     fn start_inspect(&mut self, api: &Client) {

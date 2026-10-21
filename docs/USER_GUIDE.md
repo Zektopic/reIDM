@@ -78,6 +78,19 @@ The dialog fills itself with whatever links are on the clipboard when it opens.
 - **Start download** queues it now; **Download later** puts it in the scheduled queue without
   starting it.
 
+**Drag and drop** onto the window: a `.torrent` file opens *Add torrent*; a `.txt` list of
+addresses or an IDM `.ef2` export is imported; a link saved as a shortcut (`.url` on Windows,
+`.webloc` on macOS, a `.desktop` link on Linux) opens Add URL with it filled in. Windows,
+macOS and Linux hand programs dropped files only, not text, so a link dragged straight from a
+browser page doesn't arrive unless the browser makes a shortcut of it.
+
+**Watch the clipboard** (Options › General, off by default): when you copy a link to a file —
+one of the types reIDM takes over from the browser, like `.zip`, `.iso` or `.mp4` — or a magnet
+link, a small *Download this link?* box offers **Download**, **Later** (into the scheduled
+queue) or **Dismiss**. Each link is offered once per session, and never one reIDM copied
+itself (*Copy address*). reIDM looks about once a second while it is on, and not at all when
+it is off.
+
 Adding an address reIDM already knows doesn't create a second copy: a paused or failed download
 carries on, and a finished one is reported as already downloaded. Two addresses that differ only
 in the order of their query parameters, or in a `#fragment`, count as the same download.
@@ -282,6 +295,7 @@ or later.
 | Dark theme | |
 | Show a window when a download completes | |
 | Fill Add URL with links from the clipboard | |
+| Watch the clipboard for download links | off by default; see [Adding downloads](#adding-downloads) |
 | Browser | whether the extension is connected, and *Set up…* |
 | Updates | *Check now*. reIDM also checks once shortly after it starts |
 | **Folders** tab: | |

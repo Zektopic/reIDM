@@ -8,6 +8,7 @@
 mod api;
 mod app;
 mod autostart;
+mod dropped;
 mod icons;
 mod model;
 mod notify;

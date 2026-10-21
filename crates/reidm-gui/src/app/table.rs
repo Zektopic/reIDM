@@ -378,7 +378,7 @@ impl App {
                         }
                     }
                     Some(CtxCmd::CopyUrl(u)) => {
-                        ctx.copy_text(u);
+                        self.copy_text(ctx, u);
                         self.toast("Address copied");
                     }
                     Some(CtxCmd::Remove) => {

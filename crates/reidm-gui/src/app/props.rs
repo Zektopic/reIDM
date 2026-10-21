@@ -145,7 +145,7 @@ impl App {
             st.limit_kb = limit_kb;
         }
         if copy {
-            ctx.copy_text(it.request.url.clone());
+            self.copy_text(ctx, it.request.url.clone());
             self.toast("Address copied");
         }
         if let Some(l) = apply_limit {

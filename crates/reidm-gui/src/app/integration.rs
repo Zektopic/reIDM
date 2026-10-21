@@ -72,7 +72,7 @@ impl App {
                 }
             });
         if let Some(c) = copy {
-            ctx.copy_text(c);
+            self.copy_text(ctx, c);
             self.toast("Path copied");
         }
         if !open {
