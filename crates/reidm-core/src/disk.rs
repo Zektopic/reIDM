@@ -163,6 +163,75 @@ fn c_path(p: &Path) -> io::Result<std::ffi::CString> {
     std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| io::ErrorKind::InvalidInput.into())
 }
 
+/// The nearest folder that exists at or above `path`: a download's folder may not have been
+/// created yet, and the space that matters is that of the drive it will be on.
+fn existing(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|p| !p.as_os_str().is_empty() && p.exists())
+}
+
+/// The space free to this user on the drive `path` is (or will be) on.
+pub(crate) fn free_space(path: &Path) -> io::Result<u64> {
+    let p = existing(path).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", path.display())))?;
+    #[cfg(unix)]
+    {
+        let c = c_path(p)?;
+        // SAFETY: a NUL-terminated path, and a zeroed struct the call fills in.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Blocks free to an unprivileged user (not the root reserve), in fragment-size units.
+        #[allow(clippy::unnecessary_cast)]
+        Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
+        }
+        let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut avail = 0u64;
+        // SAFETY: a NUL-terminated path, one out-pointer to a local, and nulls for the rest.
+        if unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(avail)
+    }
+}
+
+/// Which drive `path` is on, to tell whether two folders share one.
+pub(crate) fn volume(path: &Path) -> Option<String> {
+    let p = existing(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        p.metadata().ok().map(|m| m.dev().to_string())
+    }
+    #[cfg(windows)]
+    {
+        // The drive letter or `\\server\share` the path starts with.
+        match p.components().next()? {
+            std::path::Component::Prefix(pre) => Some(pre.as_os_str().to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        }
+    }
+}
+
+/// How much of a part file of `size` bytes still needs space on the drive. Where the space
+/// was reserved up front (Linux `fallocate`), nothing; where the file fills in as it is written
+/// (sparse files), what is not written yet.
+pub(crate) fn unreserved(part: &Path, size: u64, written: u64) -> u64 {
+    #[cfg(unix)]
+    if let Ok(m) = part.metadata() {
+        use std::os::unix::fs::MetadataExt;
+        return size.saturating_sub(m.blocks().saturating_mul(512));
+    }
+    let _ = part;
+    size.saturating_sub(written)
+}
+
 /// An address as a browser records it next to a download: without a user name or password.
 #[cfg(any(windows, test))]
 fn public_url(raw: &str) -> Option<String> {
@@ -242,6 +311,23 @@ mod tests {
     #[test]
     fn the_quarantine_value_is_what_gatekeeper_reads() {
         assert_eq!(quarantine_value(0x6500_0000), "0081;65000000;reIDM;");
+    }
+
+    #[test]
+    fn free_space_is_measured_for_folders_that_do_not_exist_yet() {
+        let d = std::env::temp_dir();
+        let free = free_space(&d.join("not-yet").join("deeper")).unwrap();
+        assert!(free > 0);
+        assert_eq!(volume(&d.join("not-yet")), volume(&d));
+        let p = d.join(format!("reidm-unreserved-{}", std::process::id()));
+        let f = std::fs::File::create(&p).unwrap();
+        preallocate(&f, 4 << 20).unwrap();
+        // Reserved (Linux) or sparse: either way, never more than the file's size is asked for,
+        // and what is written is never asked for again.
+        assert!(unreserved(&p, 4 << 20, 0) <= 4 << 20);
+        write_at(&f, &vec![1u8; 1 << 20], 0).unwrap();
+        assert!(unreserved(&p, 4 << 20, 1 << 20) <= 3 << 20);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

@@ -308,12 +308,16 @@ fn looks_like_file(u: &Url, opts: &Options) -> bool {
 
 /// Build a client and walk `start`. Convenience for callers that do not already have one.
 pub async fn grab_page(start: &str, opts: &Options) -> Result<Vec<Found>> {
-    let client = reqwest::Client::builder()
+    grab_through(start, opts, &crate::Proxy::default()).await
+}
+
+/// [`grab_page`], connecting the way `proxy` says.
+pub async fn grab_through(start: &str, opts: &Options, proxy: &crate::Proxy) -> Result<Vec<Found>> {
+    let b = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent(concat!("reIDM/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("building the HTTP client")?;
+        .user_agent(concat!("reIDM/", env!("CARGO_PKG_VERSION")));
+    let client = proxy.configure(b)?.build().context("building the HTTP client")?;
     grab(&client, start, opts).await
 }
 

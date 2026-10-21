@@ -179,7 +179,7 @@ impl Manager {
     /// Fetch a `.torrent` from the web, with the download's cookies, referer and user agent (a
     /// private tracker's site wants them), and at most [`MAX_TORRENT_FILE`] of it.
     pub(crate) async fn fetch_torrent_file(&self, req: &Request) -> Result<Vec<u8>> {
-        let r = self.0.http.get(req.url.trim()).headers(Self::headers(req)).timeout(Duration::from_secs(30)).send().await?.error_for_status()?;
+        let r = self.http().get(req.url.trim()).headers(Self::headers(req)).timeout(Duration::from_secs(30)).send().await?.error_for_status()?;
         read_capped(r, MAX_TORRENT_FILE, Duration::from_secs(30), "that .torrent").await
     }
 
@@ -220,6 +220,10 @@ impl Manager {
                     }),
                     ratelimits: librqbit::limits::LimitsConfig { upload_bps: limit(settings.upload_limit), download_bps: limit(settings.effective_limit()) },
                     client_name_and_version: Some(concat!("reIDM ", env!("CARGO_PKG_VERSION")).into()),
+                    // The performance preset's: fewer peers is less work for an old computer.
+                    peer_limit: Some(settings.performance.torrent_peers()),
+                    // Peers through the SOCKS5 proxy, when the user asked for that.
+                    connect: settings.proxy.for_torrents().map(|u| librqbit::ConnectionOptions { proxy_url: Some(u), ..Default::default() }),
                     ..Default::default()
                 };
                 let session = match Session::new_with_opts(settings.default_dir.clone(), opts(settings.torrent_port)).await {
@@ -347,7 +351,17 @@ impl Manager {
         };
 
         let mut last_save = Instant::now();
+        let mut last_space = Instant::now();
         loop {
+            // reIDM doesn't see the torrent engine's writes, so it looks at the space now and then.
+            if last_space.elapsed() >= crate::SPACE_CHECK_EVERY {
+                last_space = Instant::now();
+                if let Some(it) = self.get(id).filter(|it| it.size.is_some_and(|sz| it.downloaded < sz)) {
+                    if let Some(why) = self.short_of_space(&it).await {
+                        live.stop_for_space(why);
+                    }
+                }
+            }
             if live.cancel.load(Ordering::SeqCst) {
                 let _ = s.pause(&handle).await;
                 if let Some(t) = self.0.db.lock().unwrap().items.get_mut(&id).and_then(|i| i.torrent.as_mut()) {
@@ -382,6 +396,20 @@ impl Manager {
                 }
                 if let Some(t) = self.0.db.lock().unwrap().items.get_mut(&id).and_then(|i| i.torrent.as_mut()) {
                     t.seeding = seed;
+                }
+                // Each file is marked as from the internet, as a browser's download would be.
+                if let Some(it) = self.get(id) {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Some(t) = &it.torrent {
+                            let folder = t.folder.clone().or_else(|| it.path.parent().map(Path::to_path_buf));
+                            for f in t.files.iter().filter(|f| f.selected) {
+                                if let Some(dir) = &folder {
+                                    crate::disk::mark_from_internet(&dir.join(&f.path), &it.request.url, it.request.referer.as_deref());
+                                }
+                            }
+                        }
+                    })
+                    .await;
                 }
                 return Ok(true);
             }

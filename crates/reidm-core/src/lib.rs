@@ -6,19 +6,28 @@
 //! not decide how long the whole file takes.
 
 pub mod category;
+pub mod checksum;
 mod disk;
 pub mod grabber;
 mod limiter;
 pub mod lists;
 pub mod media;
+pub mod power;
+pub mod queue;
 pub mod schedule;
+mod settings;
+mod space;
 mod store;
 pub mod torrent;
 pub mod update;
 
 pub use category::Category;
+pub use checksum::Checksum;
+pub use power::WhenDone;
+pub use queue::Move;
 pub use limiter::Limiter;
 pub use media::{valid_format, Media};
+pub use settings::{Performance, Profile, Proxy, ProxyKind, ProxyMode, Settings, SettingsPatch};
 pub use torrent::{TorrentFile, TorrentInfo, TorrentRequest, TorrentStatus};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -28,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use store::{Db, DbCell};
 
@@ -36,18 +45,15 @@ const MIN_SPLIT: u64 = 1 << 20; // don't split files under 1 MiB
 /// Dynamic segmentation never hands a connection less than this: below it, the cost of a new
 /// request is more than the time the extra connection would save.
 const MIN_PIECE: u64 = 256 << 10;
-const MAX_RETRIES: u32 = 5;
-/// Give up on a server that stops sending entirely.
-const IDLE_LIMIT: Duration = Duration::from_secs(60);
-/// Give up on a request the server accepted and never answered. Without this a request sent
-/// over a connection that died (a Wi-Fi switch, a NAT timeout) waits for the system to give
-/// up on it, which takes a quarter of an hour.
-const ANSWER_LIMIT: Duration = Duration::from_secs(30);
-/// How much a connection collects before writing it. Writing every network read (8-16 KiB)
-/// cost a thread hand-off each, about a core at 1 GB/s, and many small interleaved writes make
-/// a hard disk seek; 256 KiB keeps memory at a few MiB for a typical eight-connection download.
-const WRITE_BATCH: usize = 256 << 10;
-/// ...unless it has been holding bytes for this long: a slow download should still show progress.
+// How long a server may stay silent or take to answer, how often a connection retries, and how
+// much it collects before writing (256 KiB by default: writing every 8-16 KiB network read cost a
+// thread hand-off each, about a core at 1 GB/s, and many small interleaved writes make a hard
+// disk seek) are settings: see `Settings::idle_timeout_secs`, `connect_timeout_secs`, `retries`
+// and `write_buffer_kib`. A request that is never answered must time out at all: one sent over a
+// connection that died (a Wi-Fi switch, a NAT timeout) otherwise waits for the system to give up
+// on it, which takes a quarter of an hour.
+/// A connection writes what it holds after this long, however little: a slow download should
+/// still show progress.
 const WRITE_AT_LEAST_EVERY: Duration = Duration::from_secs(1);
 /// How often a running download's progress is made durable and recorded.
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(3);
@@ -61,6 +67,13 @@ const STOP_LIMIT: Duration = Duration::from_secs(15);
 const MAX_NAME_BYTES: usize = 200;
 /// How long "use the next link the browser sends as this download's new address" stays armed.
 const REFRESH_WINDOW: Duration = Duration::from_secs(180);
+/// How often downloads stopped for want of space look again.
+const SPACE_RETRY_EVERY: Duration = Duration::from_secs(30);
+/// How often a video or torrent download (whose writes reIDM doesn't see) checks the space left.
+const SPACE_CHECK_EVERY: Duration = Duration::from_secs(10);
+/// Queue positions start here, so that *Move to top* has room below them for a very long time
+/// before the list has to be numbered again.
+const ORDER_BASE: u64 = 1 << 32;
 /// How long a browser hand-off may spend checking the address. The browser is holding its own
 /// copy meanwhile, so an answer has to come back promptly either way.
 const PROBE_LIMIT: Duration = Duration::from_secs(12);
@@ -83,6 +96,10 @@ pub struct Request {
     /// [`torrent`](crate::torrent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torrent: Option<TorrentRequest>,
+    /// What the finished file's checksum should be. Checked once it is in place; a file that
+    /// differs is kept, and the download fails saying so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum: Option<Checksum>,
 }
 
 /// How to add a download, beyond what to fetch.
@@ -251,6 +268,18 @@ pub struct Item {
     /// download finishes is kept, and the download takes another name.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     replace: bool,
+    /// Its place in the queue: of the downloads waiting, the lowest starts first. Lists from
+    /// before 0.8 have none; they are given one in id order when loaded.
+    #[serde(default)]
+    pub order: u64,
+    /// Whether the finished file matched [`Request::checksum`]; `None` when there was none to
+    /// check, or it has not been checked yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksum_ok: Option<bool>,
+    /// Stopped because the disk was too full to carry on; started again by itself once there
+    /// is room (see [`Manager::spawn_space_watch`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_space: bool,
 }
 
 impl Item {
@@ -375,6 +404,9 @@ struct Live {
     /// Removed while running: the row as it was, and whether to delete its files. Its files are
     /// deleted once its connections have stopped writing them.
     removed: Arc<Mutex<Option<(Item, bool)>>>,
+    /// Stopped because the disk is too full to carry on, and why: it then waits for room
+    /// instead of for the user.
+    no_space: Arc<Mutex<Option<String>>>,
 }
 
 impl Live {
@@ -386,7 +418,14 @@ impl Live {
             limiter: Arc::new(Limiter::new(speed_limit.unwrap_or(0))),
             requeue: Arc::default(),
             removed: Arc::default(),
+            no_space: Arc::default(),
         }
+    }
+
+    /// Stop this run for want of space, saying why.
+    fn stop_for_space(&self, why: String) {
+        *self.no_space.lock().unwrap() = Some(why);
+        self.cancel.set();
     }
 }
 
@@ -408,129 +447,12 @@ struct RunCtx {
     /// Ranges can only be split when the server serves ranges of a file of known length.
     splittable: bool,
     live: Live,
+    /// The settings when the run began: retries, time limits, the write buffer.
+    opts: Settings,
 }
 
-fn default_max_concurrent() -> usize {
-    4
-}
-
-/// User-adjustable options, persisted next to the download list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Settings {
-    pub default_dir: PathBuf,
-    pub connections: usize,
-    /// How many downloads may transfer at once. The rest wait as `Queued`, which is what
-    /// makes adding a hundred links at once reasonable.
-    #[serde(default = "default_max_concurrent")]
-    pub max_concurrent: usize,
-    /// The global speed cap in bytes per second, applied while `limit_enabled` is on. Kept when
-    /// the limiter is switched off, so switching it back on restores the same cap.
-    #[serde(default)]
-    pub speed_limit: u64,
-    #[serde(default)]
-    pub limit_enabled: bool,
-    #[serde(default)]
-    pub schedule: schedule::Schedule,
-    /// File each download into its category's folder, as IDM does.
-    #[serde(default = "yes")]
-    pub sort_by_category: bool,
-    /// A category's folder where the user moved it; otherwise `<default_dir>/<Category>`, and
-    /// the download folder itself for *General*.
-    #[serde(default)]
-    pub category_dirs: BTreeMap<Category, PathBuf>,
-    /// Where unfinished downloads are kept until they are complete; `None` is the `parts`
-    /// folder in the data folder.
-    #[serde(default)]
-    pub temp_dir: Option<PathBuf>,
-    /// Seed a finished torrent until it has uploaded this many times its size: 0 not at all,
-    /// below 0 for as long as reIDM runs.
-    #[serde(default = "default_seed_ratio")]
-    pub seed_ratio: f64,
-    /// Torrent uploads' cap in bytes per second; 0 for none.
-    #[serde(default)]
-    pub upload_limit: u64,
-    /// The port torrents listen on for peers; 0 for any free one.
-    #[serde(default = "default_torrent_port")]
-    pub torrent_port: u16,
-    /// Find torrents' peers through the DHT too, not only their trackers.
-    #[serde(default = "yes")]
-    pub torrent_dht: bool,
-}
-
-fn default_seed_ratio() -> f64 {
-    1.0
-}
-
-fn default_torrent_port() -> u16 {
-    6881
-}
-
-fn yes() -> bool {
+pub(crate) fn yes() -> bool {
     true
-}
-
-impl Settings {
-    /// The folder for a category: the user's choice, else its own folder under the download
-    /// folder (the download folder itself for *General*).
-    pub fn folder(&self, c: Category) -> PathBuf {
-        match self.category_dirs.get(&c) {
-            Some(d) => d.clone(),
-            None if c == Category::General => self.default_dir.clone(),
-            None => self.default_dir.join(c.name()),
-        }
-    }
-
-    /// Where a file with this name goes when no folder was asked for.
-    pub fn folder_for(&self, file_name: &str) -> PathBuf {
-        if self.sort_by_category {
-            self.folder(Category::of(file_name))
-        } else {
-            self.default_dir.clone()
-        }
-    }
-
-    /// The cap actually in force, in bytes per second; 0 means none.
-    pub fn effective_limit(&self) -> u64 {
-        if self.limit_enabled {
-            self.speed_limit
-        } else {
-            0
-        }
-    }
-}
-
-/// A partial update to [`Settings`]: `None` leaves a field as it is.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SettingsPatch {
-    #[serde(default)]
-    pub default_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub connections: Option<usize>,
-    #[serde(default)]
-    pub max_concurrent: Option<usize>,
-    #[serde(default)]
-    pub speed_limit: Option<u64>,
-    #[serde(default)]
-    pub limit_enabled: Option<bool>,
-    #[serde(default)]
-    pub schedule: Option<schedule::Schedule>,
-    #[serde(default)]
-    pub sort_by_category: Option<bool>,
-    /// Replaces every category's folder; a category left out goes back to its default.
-    #[serde(default)]
-    pub category_dirs: Option<BTreeMap<Category, PathBuf>>,
-    /// The temporary folder; an empty path goes back to the default.
-    #[serde(default)]
-    pub temp_dir: Option<PathBuf>,
-    #[serde(default)]
-    pub seed_ratio: Option<f64>,
-    #[serde(default)]
-    pub upload_limit: Option<u64>,
-    /// Takes effect when the torrent session next starts, as does `torrent_dht`.
-    #[serde(default)]
-    pub torrent_port: Option<u16>,
-    #[serde(default)]
-    pub torrent_dht: Option<bool>,
 }
 
 struct Inner {
@@ -543,7 +465,11 @@ struct Inner {
     db_path: PathBuf,
     settings_path: PathBuf,
     settings: Mutex<Settings>,
-    http: reqwest::Client,
+    /// Built from the settings (proxy, time limits), and built again when they change. A
+    /// running download takes the new one for its next connection.
+    http: RwLock<reqwest::Client>,
+    /// What to do when every download is done, and its countdown.
+    when_done: Mutex<power::Countdown>,
     /// The global speed limit, shared by every connection of every download.
     limiter: Arc<Limiter>,
     /// A download waiting for the browser to supply a fresh address, and until when.
@@ -815,6 +741,39 @@ fn scheduler_mark(prev: chrono::NaiveDateTime, now: chrono::NaiveDateTime) -> ch
     }
 }
 
+/// The client every request reIDM makes goes through, built from the settings.
+fn http_client(s: &Settings) -> Result<reqwest::Client> {
+    let b = reqwest::Client::builder()
+        .connect_timeout(s.connect_timeout())
+        // Per read, so it limits how long a server may go quiet, not how long a file may take.
+        .read_timeout(s.idle_timeout())
+        // A connection that died silently is noticed instead of being reused.
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        // The bytes on disk must be the bytes the server stores. With transparent
+        // decompression a misconfigured server's `.gz` would be saved decompressed, and a
+        // compressed response to a range request cannot be decoded at all.
+        .no_gzip()
+        .no_brotli();
+    Ok(s.proxy.configure(b)?.build()?)
+}
+
+/// A size as people read it: `1.5 GiB`.
+pub(crate) fn human(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let (mut v, mut i) = (n as f64, 0);
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
+}
+
 /// What a first request tells us about a URL.
 struct Probe {
     size: Option<u64>,
@@ -851,7 +810,7 @@ struct Effects {
 impl Manager {
     /// Open with the default concurrency limit; see [`Manager::open_with`].
     pub fn open(data_dir: &Path, default_dir: PathBuf, connections: usize) -> Result<Self> {
-        Self::open_with(data_dir, default_dir, connections, default_max_concurrent())
+        Self::open_with(data_dir, default_dir, connections, settings::default_max_concurrent())
     }
 
     /// `max_concurrent` is only the default for a first run; a saved `settings.json` wins.
@@ -865,7 +824,6 @@ impl Manager {
         let db_path = data_dir.join("downloads.json");
         let mut db: Db = store::load(&db_path, "download list", &mut warnings)?.unwrap_or_else(Db::fresh);
         db.next_id = db.next_id.max(db.items.keys().next_back().map_or(1, |k| k + 1));
-        db.reindex();
         for it in db.items.values_mut() {
             // anything that was running when we last exited is now paused
             if it.status == Status::Running || it.status == Status::Queued {
@@ -876,41 +834,29 @@ impl Manager {
                 s.active = false;
             }
         }
+        // Lists from before the queue had an order: in the order they were added.
+        let mut next_order = db.items.values().map(|i| i.order).max().map_or(ORDER_BASE, |m| (m + 1).max(ORDER_BASE));
+        for it in db.items.values_mut().filter(|i| i.order == 0) {
+            it.order = next_order;
+            next_order += 1;
+        }
+        db.next_order = next_order;
+        // Last: it also forgets the changes above, which are the list as loaded, not changes to it.
+        db.reindex();
         // Saved options win over the values passed on the command line.
         let settings_path = data_dir.join("settings.json");
         let saved: Option<Settings> = store::load::<Settings>(&settings_path, "settings", &mut warnings)?.filter(|s| s.connections > 0);
-        let mut settings = saved.unwrap_or(Settings {
-            default_dir: default_dir.clone(),
-            connections,
-            max_concurrent,
-            speed_limit: 0,
-            limit_enabled: false,
-            schedule: Default::default(),
-            sort_by_category: true,
-            category_dirs: BTreeMap::new(),
-            temp_dir: None,
-            seed_ratio: default_seed_ratio(),
-            upload_limit: 0,
-            torrent_port: default_torrent_port(),
-            torrent_dht: true,
-        });
-        settings.connections = settings.connections.clamp(1, 32);
-        settings.max_concurrent = settings.max_concurrent.clamp(1, 64);
-
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            // Per read, so it limits how long a server may go quiet, not how long a file may take.
-            .read_timeout(IDLE_LIMIT)
-            // A connection that died silently is noticed instead of being reused.
-            .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            // The bytes on disk must be the bytes the server stores. With transparent
-            // decompression a misconfigured server's `.gz` would be saved decompressed, and a
-            // compressed response to a range request cannot be decoded at all.
-            .no_gzip()
-            .no_brotli()
-            .build()?;
+        let mut settings = saved.unwrap_or_else(|| Settings::new(default_dir.clone(), connections, max_concurrent));
+        settings.normalize();
+        let http = match http_client(&settings) {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("{e:#}; reIDM connects the way the system says until the proxy is corrected in Options");
+                tracing::warn!("{msg}");
+                warnings.push(msg);
+                http_client(&Settings { proxy: Proxy::default(), ..settings.clone() })?
+            }
+        };
         let limiter = Arc::new(Limiter::new(settings.effective_limit()));
         let rev = Arc::new(AtomicU64::new(1));
         Ok(Self(Arc::new(Inner {
@@ -921,7 +867,8 @@ impl Manager {
             db_path,
             settings_path,
             settings: Mutex::new(settings),
-            http,
+            http: RwLock::new(http),
+            when_done: Mutex::default(),
             limiter,
             refresh: Mutex::new(None),
             torrents: tokio::sync::OnceCell::new(),
@@ -965,9 +912,6 @@ impl Manager {
     /// Apply a partial settings update. Persisted immediately; a new speed limit applies to
     /// transfers already running.
     pub fn update_settings(&self, patch: SettingsPatch) -> Result<()> {
-        if let Some(s) = &patch.schedule {
-            s.validate()?;
-        }
         if let Some(d) = &patch.default_dir {
             std::fs::create_dir_all(d).with_context(|| format!("cannot use {} as the download folder", d.display()))?;
         }
@@ -985,45 +929,13 @@ impl Manager {
         }
         let limit = {
             let mut s = self.0.settings.lock().unwrap();
-            if let Some(d) = patch.default_dir {
-                s.default_dir = d;
+            // Applied to a copy first: a proxy the HTTP client can't use is refused with nothing
+            // changed, rather than half applied.
+            let mut next = s.clone();
+            if next.apply(patch)?.client {
+                *self.0.http.write().unwrap() = http_client(&next)?;
             }
-            if let Some(c) = patch.connections {
-                s.connections = c.clamp(1, 32);
-            }
-            if let Some(m) = patch.max_concurrent {
-                s.max_concurrent = m.clamp(1, 64);
-            }
-            if let Some(v) = patch.speed_limit {
-                s.speed_limit = v;
-            }
-            if let Some(v) = patch.limit_enabled {
-                s.limit_enabled = v;
-            }
-            if let Some(v) = patch.schedule {
-                s.schedule = v;
-            }
-            if let Some(v) = patch.sort_by_category {
-                s.sort_by_category = v;
-            }
-            if let Some(v) = patch.category_dirs {
-                s.category_dirs = v;
-            }
-            if let Some(v) = patch.temp_dir {
-                s.temp_dir = (!v.as_os_str().is_empty()).then_some(v);
-            }
-            if let Some(v) = patch.seed_ratio.filter(|v| v.is_finite()) {
-                s.seed_ratio = v;
-            }
-            if let Some(v) = patch.upload_limit {
-                s.upload_limit = v;
-            }
-            if let Some(v) = patch.torrent_port {
-                s.torrent_port = v;
-            }
-            if let Some(v) = patch.torrent_dht {
-                s.torrent_dht = v;
-            }
+            *s = next;
             s.effective_limit()
         };
         self.0.limiter.set_rate(limit);
@@ -1031,6 +943,11 @@ impl Manager {
         // Raising the limit should let waiting downloads start now, not at the next completion.
         self.pump();
         self.save_settings().context("the new options apply now, but could not be saved for next time")
+    }
+
+    /// The HTTP client as the settings have it now. Cheap: clients share their insides.
+    pub(crate) fn http(&self) -> reqwest::Client {
+        self.0.http.read().unwrap().clone()
     }
 
     fn save_settings(&self) -> Result<()> {
@@ -1108,6 +1025,37 @@ impl Manager {
         if !p.segs.is_empty() {
             it.segments = p.segs.clone();
         }
+    }
+
+    /// The downloads added, changed or removed since revision `rev` (as [`Manager::revision`]
+    /// said it), by id; `None` when `rev` is too long ago to say, and everything should be
+    /// looked at again. Running downloads are always included: their progress moves the
+    /// revision without being recorded one change at a time.
+    pub fn changed_since(&self, rev: u64) -> Option<Vec<u64>> {
+        let mut ids = self.0.db.changed_since(rev)?;
+        ids.extend(self.0.live.lock().unwrap().keys().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
+    }
+
+    /// Several downloads, as [`Manager::get`] gives each, under one lock: `None` for one that
+    /// is no longer in the list.
+    pub fn get_many(&self, ids: &[u64]) -> Vec<(u64, Option<Item>)> {
+        let db = self.0.db.lock().unwrap();
+        let live = self.0.live.lock().unwrap();
+        ids.iter()
+            .map(|id| {
+                let it = db.items.get(id).map(|i| {
+                    let mut it = (**i).clone();
+                    if let Some(l) = live.get(id) {
+                        Self::overlay(&mut it, l);
+                    }
+                    it
+                });
+                (*id, it)
+            })
+            .collect()
     }
 
     pub fn get(&self, id: u64) -> Option<Item> {
@@ -1205,6 +1153,12 @@ impl Manager {
         if !matches!(u.scheme(), "http" | "https") && !torrent_ok {
             bail!("unsupported scheme {:?} (only http/https, and magnet links)", u.scheme());
         }
+        if let Some(c) = req.checksum.take() {
+            if req.media.is_some() || req.torrent.is_some() {
+                bail!("a checksum can only be checked for a single file downloaded from a web address, not a video or a torrent");
+            }
+            req.checksum = Some(c.checked()?);
+        }
         if let Some(m) = &req.media {
             if !valid_format(&m.format) {
                 bail!("not a format selector: {:?}", m.format);
@@ -1249,6 +1203,10 @@ impl Manager {
             // `req.filename` may carry a better name than the one we guessed last time.
             if it.request.filename.is_none() {
                 it.request.filename = req.filename.as_deref().map(sanitize_filename);
+            }
+            // As may a checksum, given the second time round.
+            if it.request.checksum.is_none() && req.checksum.is_some() && it.status != Status::Done {
+                it.request.checksum = req.checksum.take();
             }
             if running.is_none() {
                 // The usual reason a download stopped is an expired session, and clicking the
@@ -1314,7 +1272,11 @@ impl Manager {
             torrent: None,
             part: None,
             replace: false,
+            order: db.next_order,
+            checksum_ok: None,
+            waiting_for_space: false,
         };
+        db.next_order += 1;
         if let Some(p) = probe {
             let n = self.0.settings.lock().unwrap().connections as u64;
             item.segments = initial_segments(p.size, p.resumable, n);
@@ -1410,16 +1372,17 @@ impl Manager {
             let db = self.0.db.lock().unwrap();
             let mut live = self.0.live.lock().unwrap();
             let free = limit.saturating_sub(live.len());
-            for it in db.items.values() {
-                if to_start.len() >= free {
-                    break;
-                }
-                // A queued item that is not live is exactly one that is waiting for a slot.
-                if it.status == Status::Queued && !live.contains_key(&it.id) {
-                    let l = Live::new(it.downloaded, it.speed_limit, &self.0.rev);
-                    live.insert(it.id, l.clone());
-                    to_start.push((it.id, l));
-                }
+            if free == 0 {
+                return;
+            }
+            // A queued item that is not live is exactly one that is waiting for a slot; the
+            // first in the queue's order goes first.
+            let mut waiting: Vec<(u64, &Item)> = db.items.values().filter(|it| it.status == Status::Queued && !live.contains_key(&it.id)).map(|it| (it.order, &**it)).collect();
+            waiting.sort_unstable_by_key(|(order, it)| (*order, it.id));
+            for (_, it) in waiting.into_iter().take(free) {
+                let l = Live::new(it.downloaded, it.speed_limit, &self.0.rev);
+                live.insert(it.id, l.clone());
+                to_start.push((it.id, l));
             }
         }
         for (id, live) in to_start {
@@ -1443,6 +1406,8 @@ impl Manager {
             }
             if let Some(it) = db.items.get_mut(&id) {
                 it.status = Status::Queued;
+                // It looks at the space again when it starts.
+                it.waiting_for_space = false;
             }
         }
         self.save_now();
@@ -1466,8 +1431,11 @@ impl Manager {
     /// Make `it` a download that has not begun, and say what of its old one to delete.
     fn reset_item(&self, it: &mut Item, fx: &mut Effects) {
         fx.delete.push(self.part_for(it));
-        // The file there now is this download's own, so the new one may take its place.
-        it.replace = it.status == Status::Done;
+        // The file there now is this download's own (finished, or failed its checksum), so the
+        // new one may take its place.
+        it.replace = it.status == Status::Done || it.checksum_ok == Some(false);
+        it.checksum_ok = None;
+        it.waiting_for_space = false;
         it.segments.clear();
         it.downloaded = 0;
         it.size = None;
@@ -1516,6 +1484,14 @@ impl Manager {
                 None if db.items.get(&id).is_some_and(|i| i.status == Status::Queued) => {
                     if let Some(it) = db.items.get_mut(&id) {
                         it.status = Status::Paused;
+                    }
+                    true
+                }
+                // Waiting for space: paused by the user, it waits for the user instead.
+                None if db.items.get(&id).is_some_and(|i| i.waiting_for_space) => {
+                    if let Some(it) = db.items.get_mut(&id) {
+                        it.waiting_for_space = false;
+                        it.note = None;
                     }
                     true
                 }
@@ -1624,14 +1600,16 @@ impl Manager {
         let n = {
             let mut db = self.0.db.lock().unwrap();
             let live = self.0.live.lock().unwrap();
-            let mut n = 0;
-            for it in db.items.values_mut() {
-                if it.scheduled && !live.contains_key(&it.id) && matches!(it.status, Status::Paused | Status::Failed(_)) {
+            // Found first, then taken for changing one by one: taking every item would count
+            // all of them as changed.
+            let ids: Vec<u64> = db.items.values().filter(|it| it.scheduled && !live.contains_key(&it.id) && matches!(it.status, Status::Paused | Status::Failed(_))).map(|it| it.id).collect();
+            for id in &ids {
+                if let Some(it) = db.items.get_mut(id) {
                     it.status = Status::Queued;
-                    n += 1;
+                    it.waiting_for_space = false;
                 }
             }
-            n
+            ids.len()
         };
         self.save();
         self.pump();
@@ -1643,11 +1621,9 @@ impl Manager {
         let running: Vec<u64> = {
             let mut db = self.0.db.lock().unwrap();
             let live = self.0.live.lock().unwrap();
-            let mut running = Vec::new();
-            for it in db.items.values_mut().filter(|i| i.scheduled) {
-                if live.contains_key(&it.id) {
-                    running.push(it.id);
-                } else if it.status == Status::Queued {
+            let (running, queued): (Vec<u64>, Vec<u64>) = db.items.values().filter(|i| i.scheduled && (live.contains_key(&i.id) || i.status == Status::Queued)).map(|i| i.id).partition(|id| live.contains_key(id));
+            for id in queued {
+                if let Some(it) = db.items.get_mut(&id) {
                     it.status = Status::Paused;
                 }
             }
@@ -1660,8 +1636,10 @@ impl Manager {
         running.len()
     }
 
-    /// Run the scheduler for as long as the process lives. Call once, from the daemon.
+    /// Run the scheduler for as long as the process lives — and the look for room for
+    /// downloads waiting for space. Call once, from the daemon.
     pub fn spawn_scheduler(&self) {
+        self.spawn_space_watch();
         let me = self.clone();
         tokio::spawn(async move {
             let mut prev = chrono::Local::now().naive_local();
@@ -1723,6 +1701,23 @@ impl Manager {
         target
     }
 
+    /// Whether what `p` found at a new address can carry on `item`: the same size, and byte
+    /// ranges if bytes have already been downloaded.
+    fn same_file(item: &Item, p: &Probe) -> Result<()> {
+        let progressed = item.segments.iter().any(|s| s.done > 0 || s.finished);
+        match (item.size, p.size) {
+            (Some(was), Some(now)) if was != now => {
+                bail!("the new address is a different file: it is {now} bytes, the download is {was} bytes")
+            }
+            (Some(_), None) if progressed => bail!("the new address does not say how large its file is, so it cannot be checked against this download"),
+            _ => {}
+        }
+        if progressed && item.resumable && !p.resumable {
+            bail!("the new address cannot continue a partial download (it does not serve byte ranges); restart the download instead");
+        }
+        Ok(())
+    }
+
     /// Point an unfinished download at a new address — the old one expired, or a mirror is
     /// faster — and carry on from where it was.
     ///
@@ -1750,10 +1745,8 @@ impl Manager {
             }
         }
 
-        // Its connections are still using the old address.
-        if !self.stop_and_wait(id).await {
-            bail!("download {id} is still stopping; try again in a moment");
-        }
+        // Checked while the download carries on: a link that turns out to be some other file
+        // leaves it exactly as it was.
         let item = self.get(id).ok_or_else(|| anyhow!("no such download {id}"))?;
         let mut req = item.request.clone();
         req.url = u.to_string();
@@ -1767,18 +1760,22 @@ impl Manager {
             req.user_agent = new.user_agent;
         }
         let p = self.probe(&req.url, &Self::headers(&req)).await.context("the new address could not be reached")?;
+        Self::same_file(&item, &p)?;
 
-        let progressed = item.segments.iter().any(|s| s.done > 0 || s.finished);
-        match (item.size, p.size) {
-            (Some(was), Some(now)) if was != now => {
-                bail!("the new address is a different file: it is {now} bytes, the download is {was} bytes")
+        // Its connections are still using the old address.
+        let was_active = item.status == Status::Queued || self.0.live.lock().unwrap().contains_key(&id);
+        if !self.stop_and_wait(id).await {
+            bail!("download {id} is still stopping; try again in a moment");
+        }
+        // Again, as it stopped: it may have got its first bytes while the new address was checked.
+        let item = self.get(id).ok_or_else(|| anyhow!("download {id} was removed"))?;
+        if let Err(e) = Self::same_file(&item, &p) {
+            if was_active {
+                let _ = self.resume(id);
             }
-            (Some(_), None) if progressed => bail!("the new address does not say how large its file is, so it cannot be checked against this download"),
-            _ => {}
+            return Err(e);
         }
-        if progressed && item.resumable && !p.resumable {
-            bail!("the new address cannot continue a partial download (it does not serve byte ranges); restart the download instead");
-        }
+        let progressed = item.segments.iter().any(|s| s.done > 0 || s.finished);
 
         let connections = self.0.settings.lock().unwrap().connections as u64;
         {
@@ -1844,7 +1841,19 @@ impl Manager {
                         it.scheduled = false;
                         it.replace = false;
                     }
-                    it.status = if st == Status::Paused && live.requeue.load(Ordering::SeqCst) { Status::Queued } else { st };
+                    let no_space = live.no_space.lock().unwrap().take();
+                    it.status = if st == Status::Paused && live.requeue.load(Ordering::SeqCst) {
+                        Status::Queued
+                    } else {
+                        // Stopped by the disk filling up, not by the user: it says why, and
+                        // starts again by itself once there is room.
+                        if let (Status::Paused, Some(why)) = (&st, no_space) {
+                            tracing::info!("download {id}: {why}");
+                            it.note = Some(why);
+                            it.waiting_for_space = true;
+                        }
+                        st
+                    };
                 }
                 live.removed.lock().unwrap().take()
             };
@@ -1862,6 +1871,7 @@ impl Manager {
         if let Some(it) = db.items.get_mut(&id) {
             if st == Status::Running {
                 it.last_try = Some(now_secs());
+                it.waiting_for_space = false;
             }
             it.note = None;
             it.status = st;
@@ -1905,9 +1915,10 @@ impl Manager {
 
     /// One 1-byte ranged GET tells us size, range support, name and validators in one request.
     async fn probe(&self, url: &str, headers: &HeaderMap) -> Result<Probe> {
-        let r = match tokio::time::timeout(ANSWER_LIMIT, self.0.http.get(url).headers(headers.clone()).header(header::RANGE, "bytes=0-0").send()).await {
+        let answer = self.0.settings.lock().unwrap().connect_timeout();
+        let r = match tokio::time::timeout(answer, self.http().get(url).headers(headers.clone()).header(header::RANGE, "bytes=0-0").send()).await {
             Ok(r) => r?,
-            Err(_) => bail!("the server did not answer within {}s", ANSWER_LIMIT.as_secs()),
+            Err(_) => bail!("the server did not answer within {}s", answer.as_secs()),
         };
         // `416` is how a server reports "that range does not exist", which for `bytes=0-0`
         // means the resource is empty. Treating it as an error made zero-byte files
@@ -1938,11 +1949,21 @@ impl Manager {
     /// Returns Ok(true) when finished, Ok(false) when paused/cancelled.
     async fn run(&self, id: u64, live: Live) -> Result<bool> {
         let mut item = self.get(id).ok_or_else(|| anyhow!("vanished"))?;
+        if let Some(why) = self.short_of_space(&item).await {
+            live.stop_for_space(why);
+            return Ok(false);
+        }
         if item.request.media.is_some() {
             return self.run_media(id, live, item).await;
         }
         if item.request.torrent.is_some() {
             return self.run_torrent(id, live, item).await;
+        }
+        // Downloaded, but it failed its checksum: resuming it checks the file again (the
+        // expected value may have been the wrong one) rather than fetching it a second time.
+        if item.checksum_ok == Some(false) && item.path.is_file() && !item.segments.is_empty() && item.segments.iter().all(Segment::complete) {
+            self.verify_checksum(id).await?;
+            return Ok(true);
         }
         let headers = Self::headers(&item.request);
 
@@ -1965,20 +1986,27 @@ impl Manager {
             let n = self.0.settings.lock().unwrap().connections as u64;
             // The name is chosen and recorded under one lock: two downloads whose servers give
             // the same name must not both take it.
-            let mut db = self.0.db.lock().unwrap();
-            let claimed: HashSet<PathBuf> = db.items.iter().filter(|(k, _)| **k != id).map(|(_, i)| i.path.clone()).collect();
-            // Update in place rather than inserting: the download may have been removed while
-            // the probe was in flight, and re-inserting would resurrect it.
-            let Some(slot) = db.items.get_mut(&id) else { return Ok(false) };
-            if let (Some(d), Some(name)) = (&dir, &server_name) {
-                slot.path = unique_path(d, name, |p| claimed.contains(p));
+            {
+                let mut db = self.0.db.lock().unwrap();
+                let claimed: HashSet<PathBuf> = db.items.iter().filter(|(k, _)| **k != id).map(|(_, i)| i.path.clone()).collect();
+                // Update in place rather than inserting: the download may have been removed while
+                // the probe was in flight, and re-inserting would resurrect it.
+                let Some(slot) = db.items.get_mut(&id) else { return Ok(false) };
+                if let (Some(d), Some(name)) = (&dir, &server_name) {
+                    slot.path = unique_path(d, name, |p| claimed.contains(p));
+                }
+                slot.size = p.size;
+                slot.resumable = p.resumable;
+                slot.etag = p.etag;
+                slot.last_modified = p.last_modified;
+                slot.segments = initial_segments(p.size, p.resumable, n);
+                item = (**slot).clone();
             }
-            slot.size = p.size;
-            slot.resumable = p.resumable;
-            slot.etag = p.etag;
-            slot.last_modified = p.last_modified;
-            slot.segments = initial_segments(p.size, p.resumable, n);
-            item = (**slot).clone();
+            // Now that its size is known.
+            if let Some(why) = self.short_of_space(&item).await {
+                live.stop_for_space(why);
+                return Ok(false);
+            }
         }
 
         let part = self.part_for(&item);
@@ -2026,7 +2054,8 @@ impl Manager {
 
         let splittable = item.resumable && item.size.is_some_and(|s| s >= MIN_SPLIT);
         let incomplete = item.segments.iter().filter(|s| !s.complete()).count();
-        let connections = self.0.settings.lock().unwrap().connections.max(1);
+        let opts = self.settings();
+        let connections = opts.connections.max(1);
         let workers = match (incomplete, splittable) {
             (0, _) => 0,
             // More connections than ranges is fine: the extra ones split the largest range.
@@ -2056,6 +2085,7 @@ impl Manager {
             last_modified: item.last_modified.clone(),
             splittable,
             live: live.clone(),
+            opts,
         });
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..workers {
@@ -2071,6 +2101,12 @@ impl Manager {
                     tokio::time::sleep(CHECKPOINT_EVERY).await;
                     if let Err(e) = me.checkpoint(id, &live, &file, &mut saved).await {
                         tracing::warn!("download {id}: progress not recorded this time: {e:#}");
+                    }
+                    // The disk may be filling up with something else meanwhile.
+                    if let Some(it) = me.get(id) {
+                        if let Some(why) = me.short_of_space(&it).await {
+                            live.stop_for_space(why);
+                        }
                     }
                 }
             })
@@ -2115,6 +2151,7 @@ impl Manager {
         drop(ctx);
         drop(file);
         self.finalize(id, &part, &live).await?;
+        self.verify_checksum(id).await?;
         Ok(true)
     }
 
@@ -2321,11 +2358,11 @@ impl Manager {
                         return Err(e);
                     }
                     attempt += 1;
-                    if attempt > MAX_RETRIES {
+                    if ctx.opts.out_of_retries(attempt) {
                         return Err(e);
                     }
                     tracing::debug!("download {} range {idx} retry {attempt}: {e:#}", ctx.id);
-                    nap(Duration::from_millis(500 * 2u64.pow(attempt)), &ctx.live.cancel).await;
+                    nap(ctx.opts.retry_wait(attempt), &ctx.live.cancel).await;
                 }
             }
         }
@@ -2336,7 +2373,8 @@ impl Manager {
     /// server stops sending, or the download is cancelled.
     async fn transfer(&self, idx: usize, ctx: &RunCtx, from: u64, end: u64) -> Result<()> {
         let open_ended = end == u64::MAX;
-        let mut rb = self.0.http.get(&ctx.url).headers(ctx.headers.clone());
+        // Taken for each request, so a new proxy applies from the next connection on.
+        let mut rb = self.http().get(&ctx.url).headers(ctx.headers.clone());
         if ctx.resumable {
             rb = rb.header(header::RANGE, format!("bytes={from}-{end}"));
             if let Some(v) = &ctx.validator {
@@ -2344,9 +2382,9 @@ impl Manager {
             }
         }
         let resp = tokio::select! {
-            r = tokio::time::timeout(ANSWER_LIMIT, rb.send()) => match r {
+            r = tokio::time::timeout(ctx.opts.connect_timeout(), rb.send()) => match r {
                 Ok(r) => r?,
-                Err(_) => bail!("the server did not answer within {}s", ANSWER_LIMIT.as_secs()),
+                Err(_) => bail!("the server did not answer within {}s", ctx.opts.connect_timeout_secs),
             },
             _ = ctx.live.cancel.cancelled() => return Ok(()),
         };
@@ -2412,20 +2450,22 @@ impl Manager {
         let mut held_since = Instant::now();
         // Gives up on a server that accepted the request and then went silent, instead of
         // holding the slot forever. Reset by every read, not recreated.
-        let idle = tokio::time::sleep(IDLE_LIMIT);
+        let idle_limit = ctx.opts.idle_timeout();
+        let write_batch = ctx.opts.write_buffer_kib << 10;
+        let idle = tokio::time::sleep(idle_limit);
         tokio::pin!(idle);
         let outcome: Result<End> = loop {
             let chunk = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break Ok(End::Cancelled),
-                _ = &mut idle => break Err(anyhow!("no data received for {}s", IDLE_LIMIT.as_secs())),
+                _ = &mut idle => break Err(anyhow!("no data received for {}s", idle_limit.as_secs())),
                 c = stream.next() => match c {
                     None => break Ok(End::Body),
                     Some(Err(e)) => break Err(e.into()),
                     Some(Ok(c)) => c,
                 },
             };
-            idle.as_mut().reset(tokio::time::Instant::now() + IDLE_LIMIT);
+            idle.as_mut().reset(tokio::time::Instant::now() + idle_limit);
             let want = chunk.len() as u64;
             // Pace first, then claim: the claim should cover a write, not a wait.
             ctx.live.limiter.take(want, cancel.cancelled()).await;
@@ -2449,7 +2489,7 @@ impl Manager {
             if (take as u64) < want {
                 break Ok(End::Range);
             }
-            if buf.len() >= WRITE_BATCH || held_since.elapsed() >= WRITE_AT_LEAST_EVERY {
+            if buf.len() >= write_batch || held_since.elapsed() >= WRITE_AT_LEAST_EVERY {
                 if let Err(e) = self.write_out(idx, ctx, &mut buf).await {
                     break Err(e);
                 }
@@ -2531,9 +2571,15 @@ mod tests {
         /// the write that crosses the line is written, as a real short write would be.
         fail_after: AtomicU64,
         written: AtomicU64,
+        /// The free space every drive reports, plus one (0: the real figure).
+        free_space: AtomicU64,
     }
 
     impl Faults {
+        pub(super) fn free_space(&self) -> Option<u64> {
+            self.free_space.load(Ordering::SeqCst).checked_sub(1)
+        }
+
         pub(super) fn write(&self, f: &std::fs::File, data: &[u8], off: u64) -> Option<std::io::Result<()>> {
             let limit = self.fail_after.load(Ordering::SeqCst);
             if limit == 0 {
