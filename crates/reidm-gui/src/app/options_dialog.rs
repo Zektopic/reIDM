@@ -143,8 +143,19 @@ impl App {
                 }
             });
             ui.separator();
-            // The same height on every tab, so switching doesn't make the window jump.
-            egui::ScrollArea::vertical().max_height(420.0).auto_shrink([false, false]).show(ui, |ui| match self.options.tab {
+            // The same height on every tab, so switching doesn't make the window jump: as much
+            // of the main window as is left around the dialog's title, tabs and buttons. Where a
+            // tab is still taller, a solid scroll bar (not egui's hover-only one) says there is
+            // more, so a caption cut at the bottom doesn't read as a mistake.
+            let body = (ctx.content_rect().height() - 230.0).clamp(240.0, 560.0);
+            // The handle in the text's colour: a solid bar otherwise uses the widgets' fill,
+            // which in the light theme is nearly the panel's own colour.
+            ui.style_mut().spacing.scroll = egui::style::ScrollStyle { foreground_color: true, ..egui::style::ScrollStyle::solid() };
+            egui::ScrollArea::vertical()
+                .max_height(body)
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+                .show(ui, |ui| match self.options.tab {
                 OptTab::General => self.general_tab(ui, p, &mut asked),
                 OptTab::Folders => self.folders_tab(ui, p),
                 OptTab::Downloads => self.downloads_tab(ui, p, &mut asked),
@@ -366,7 +377,9 @@ impl App {
         }
 
         section(ui, "Downloads at the same time");
-        if ui.add(egui::Slider::new(&mut f.max, crate::options::AT_ONCE)).changed() {
+        // Logarithmic: most people want 2 to 8, and on a straight 1–64 scale those share the
+        // first tenth of the rail.
+        if ui.add(egui::Slider::new(&mut f.max, crate::options::AT_ONCE).logarithmic(true)).changed() {
             f.knob_changed();
         }
         caption(ui, p, "The rest wait their turn. Torrents that are only sharing don't count.");

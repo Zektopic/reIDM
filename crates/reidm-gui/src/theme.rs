@@ -97,6 +97,9 @@ fn visuals(p: &Palette, dark: bool) -> Visuals {
     v.override_text_color = Some(p.text);
     v.selection.bg_fill = p.accent.gamma_multiply(0.35);
     v.selection.stroke = Stroke::new(1.0, p.accent);
+    // A slider's rail is drawn in the inactive fill, which is almost the panel's colour; fill
+    // the chosen part with the selection colour so its value can be seen at a glance.
+    v.slider_trailing_fill = true;
     v.widgets.noninteractive.bg_fill = p.panel;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
