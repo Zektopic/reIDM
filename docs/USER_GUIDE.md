@@ -68,9 +68,12 @@ downloading.
 
 **When everything is done** (Downloads › *When done*, or the icon's menu): do nothing, exit reIDM,
 sleep, hibernate or shut down the computer once nothing is downloading or waiting (paused, failed
-and sharing torrents don't count). A 60-second countdown with **Cancel** comes up first, and the
-window comes to the front for it. The choice lasts until reIDM exits, so nobody's computer shuts
-down unexpectedly next week.
+and sharing torrents don't count). It waits until something has run since you chose it, so
+choosing *Shut down* with nothing to do doesn't shut the computer down a minute later. A
+60-second countdown with **Cancel** comes up first, and the window comes to the front for it;
+anything starting again stops the countdown. It happens once, and the choice goes back to *Do
+nothing*; it is never kept when reIDM exits, so nobody's computer shuts down unexpectedly next
+week.
 
 ## Adding downloads
 
@@ -84,8 +87,9 @@ The dialog fills itself with whatever links are on the clipboard when it opens.
   starting it.
 - *More options › Expected checksum* (one address only): paste the MD5, SHA-1, SHA-256 or SHA-512
   the download page gives — `sha256:9f86d0…`, `SHA-256 9f86d0…` or just the hex. The finished
-  file is checked against it; a mismatch marks the download failed (*checksum mismatch*) and
-  keeps the file.
+  file is checked against it; a mismatch shows *Checksum mismatch* and keeps the file. **Resume**
+  checks the file again without downloading it (for when the expected value was wrong);
+  **Restart** downloads it again.
 
 **Drag and drop** onto the window: a `.torrent` file opens *Add torrent*; a `.txt` list of
 addresses or an IDM `.ef2` export is imported; a link saved as a shortcut (`.url` on Windows,
@@ -165,6 +169,10 @@ starts that download over rather than leave a hole.
 the file it had (`If-Range`) and checks the total size. If the server now has a different file,
 the download stops with *The file changed on the server since this download began*, instead of
 splicing two versions together. Use **Restart** to fetch the new version.
+
+**When the disk is full.** Before a download would leave less than 200 MB free on its drive
+(Advanced settings), it stops with *Waiting for disk space*; hover over it to see which drive and
+how much more it needs. It carries on by itself once there is room.
 
 **Retrying.** A connection that drops is retried five times, waiting 3 seconds, then twice as long
 each time (up to a minute). A server that stops sending entirely for 60 seconds counts as a dropped

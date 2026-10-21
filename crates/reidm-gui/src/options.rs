@@ -31,25 +31,6 @@ pub struct Knobs {
 impl Performance {
     pub const PRESETS: [Performance; 3] = [Performance::Light, Performance::Balanced, Performance::Maximum];
 
-    /// The knobs of a preset; `Custom` has none. A copy of the service's table
-    /// (`Performance::apply` in the engine, `docs/design/0.8-phase2.md`): the service writes
-    /// them itself when it gets a preset, and the window only needs them to show which preset
-    /// the current values amount to.
-    pub fn knobs(self) -> Option<Knobs> {
-        let (connections, at_once, buffer_kib) = match self {
-            Performance::Light => (4, 2, 64),
-            Performance::Balanced => (8, 4, 256),
-            Performance::Maximum => (16, 8, 1024),
-            Performance::Custom => return None,
-        };
-        Some(Knobs { connections, at_once, buffer_kib })
-    }
-
-    /// The preset these values amount to, or `Custom`.
-    pub fn detect(k: Knobs) -> Performance {
-        Performance::PRESETS.into_iter().find(|p| p.knobs() == Some(k)).unwrap_or(Performance::Custom)
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Performance::Light => "Light",
@@ -153,8 +134,11 @@ impl ProxyForm {
         if self.mode != ProxyMode::Manual {
             return None;
         }
-        if self.host.trim().is_empty() {
+        let host = self.host.trim();
+        if host.is_empty() {
             Some("Enter the proxy's address, or choose another proxy setting.")
+        } else if !host.chars().all(|c| c.is_ascii_alphanumeric() || ".-_:[]".contains(c)) {
+            Some("The proxy's address is a name or an IP address only, like proxy.example.com, without a path or spaces.")
         } else if self.port == 0 {
             Some("Enter the proxy's port.")
         } else {
@@ -204,8 +188,11 @@ pub struct OptionsForm {
     pub limit_on: bool,
     /// The total speed limit in KB/s, kept while the limiter is off.
     pub limit_kb: u64,
-    /// The service knows performance presets.
-    pub presets: bool,
+    /// The performance preset, when the service has them: as loaded, then as chosen here, or
+    /// worked out again when a knob it sets is changed by hand.
+    pub performance: Option<Performance>,
+    /// What each preset sets, from the service.
+    pub profiles: Vec<(Performance, Knobs)>,
     pub buffer_kib: Option<u32>,
     pub retries: Option<u32>,
     pub retry_wait: Option<u32>,
@@ -238,7 +225,15 @@ impl OptionsForm {
             limit_on: s.limit_enabled,
             // With no rate chosen yet, offer 1 MB/s rather than a limit of nothing.
             limit_kb: if s.speed_limit >= 1024 { s.speed_limit / 1024 } else { 1024 },
-            presets: s.performance.is_some(),
+            profiles: Performance::PRESETS
+                .into_iter()
+                .filter_map(|p| {
+                    let pr = s.profiles.get(p.wire())?;
+                    Some((p, Knobs { connections: pr.connections, at_once: pr.max_concurrent, buffer_kib: pr.write_buffer_kib }))
+                })
+                .collect(),
+            // Presets need the service's table too: without it there is nothing to choose from.
+            performance: s.performance.filter(|_| Performance::PRESETS.iter().all(|p| s.profiles.contains_key(p.wire()))),
             buffer_kib: s.write_buffer_kib,
             retries: s.retries,
             retry_wait: s.retry_wait_secs,
@@ -255,19 +250,29 @@ impl OptionsForm {
         Knobs { connections: self.conn, at_once: self.max, buffer_kib: self.buffer_kib.unwrap_or(BUFFER_DEFAULT) }
     }
 
-    /// The preset the knobs amount to, when the service has presets.
+    /// The preset, when the service has them.
     pub fn performance(&self) -> Option<Performance> {
-        self.presets.then(|| Performance::detect(self.knobs()))
+        self.performance
     }
 
-    /// Choose a preset: its knobs, so Advanced shows what it means.
+    /// Choose a preset: its knobs too, so Advanced shows what it means.
     pub fn set_performance(&mut self, p: Performance) {
-        if let Some(k) = p.knobs() {
+        self.performance = self.performance.map(|_| p);
+        if let Some((_, k)) = self.profiles.iter().find(|(q, _)| *q == p) {
             self.conn = k.connections;
             self.max = k.at_once;
             if self.buffer_kib.is_some() {
                 self.buffer_kib = Some(k.buffer_kib);
             }
+        }
+    }
+
+    /// A knob a preset sets was changed by hand: the preset is whichever one the knobs now
+    /// match, or `Custom`.
+    pub fn knob_changed(&mut self) {
+        if self.performance.is_some() {
+            let k = self.knobs();
+            self.performance = Some(self.profiles.iter().find(|(_, pk)| *pk == k).map(|(p, _)| *p).unwrap_or(Performance::Custom));
         }
     }
 
@@ -286,8 +291,13 @@ impl OptionsForm {
             }
         };
         put("default_dir", self.dir.trim() != base.dir.trim(), self.dir.trim().into());
-        put("connections", self.conn != base.conn, self.conn.into());
-        put("max_concurrent", self.max != base.max, self.max.into());
+        // A preset sets its own knobs, and a knob sent with it would win over it: so a preset
+        // goes alone, and changed knobs go only when they are the user's own (`custom`).
+        let preset = self.performance.filter(|p| *p != Performance::Custom && self.performance != base.performance);
+        let knobs = preset.is_none();
+        put("performance", self.performance != base.performance, self.performance.map(Performance::wire).into());
+        put("connections", knobs && self.conn != base.conn, self.conn.into());
+        put("max_concurrent", knobs && self.max != base.max, self.max.into());
         put("sort_by_category", self.sort != base.sort, self.sort.into());
         // The service takes the folders as a whole ("replaces every choice"), so a change to any
         // one sends all of them.
@@ -304,12 +314,9 @@ impl OptionsForm {
         let limit = self.limit_on != base.limit_on || self.limit_kb != base.limit_kb;
         put("limit_enabled", limit, self.limit_on.into());
         put("speed_limit", limit, (self.limit_kb * 1024).into());
-        if let (Some(p), true) = (self.performance(), self.performance() != base.performance()) {
-            put("performance", true, p.wire().into());
-        }
         let opt = |a: Option<u64>, b: Option<u64>| a.is_some() && a != b;
         let n = |v: Option<u32>| v.map(u64::from);
-        put("write_buffer_kib", opt(n(self.buffer_kib), n(base.buffer_kib)), self.buffer_kib.into());
+        put("write_buffer_kib", knobs && opt(n(self.buffer_kib), n(base.buffer_kib)), self.buffer_kib.into());
         put("retries", opt(n(self.retries), n(base.retries)), self.retries.into());
         put("retry_wait_secs", opt(n(self.retry_wait), n(base.retry_wait)), self.retry_wait.into());
         put("idle_timeout_secs", opt(n(self.idle_timeout), n(base.idle_timeout)), self.idle_timeout.into());
@@ -412,7 +419,10 @@ pub const ADVANCED: &[Advanced] = &[
         hint: "When a connection finishes early it takes over half of the slowest one's remaining part, so more connections rarely hurt. Part of the performance preset.",
         kind: Kind::Num { min: 1, max: 32, default: 8 },
         get: |f| Some(AdvValue::Num(f.conn as u64)),
-        set: |f, v| f.conn = num(v) as usize,
+        set: |f, v| {
+            f.conn = num(v) as usize;
+            f.knob_changed();
+        },
         applies: always,
     },
     Advanced {
@@ -422,7 +432,10 @@ pub const ADVANCED: &[Advanced] = &[
         hint: "Bigger means fewer, larger writes: easier on a hard disk, harder on a computer short of memory. Part of the performance preset.",
         kind: Kind::Num { min: 64, max: 4096, default: 256 },
         get: |f| f.buffer_kib.map(|v| AdvValue::Num(v.into())),
-        set: |f, v| f.buffer_kib = Some(num(v) as u32),
+        set: |f, v| {
+            f.buffer_kib = Some(num(v) as u32);
+            f.knob_changed();
+        },
         applies: always,
     },
     Advanced {
@@ -573,6 +586,9 @@ mod tests {
             "performance": "balanced", "write_buffer_kib": 256, "retries": 5, "retry_wait_secs": 3,
             "idle_timeout_secs": 60, "connect_timeout_secs": 30, "keep_awake": true, "keep_awake_seeding": false,
             "min_free_space_mib": 200,
+            "profiles": { "light": { "connections": 4, "max_concurrent": 2, "write_buffer_kib": 64, "torrent_peers": 40 },
+                          "balanced": { "connections": 8, "max_concurrent": 4, "write_buffer_kib": 256, "torrent_peers": 100 },
+                          "maximum": { "connections": 16, "max_concurrent": 8, "write_buffer_kib": 1024, "torrent_peers": 200 } },
             "proxy": { "mode": "manual", "kind": "socks5", "host": "proxy.lan", "port": 1080, "username": "me",
                        "password_set": true, "bypass": ["*.lan", "10.0.0.0/8"], "remote_dns": true, "torrents": false, "videos": true },
         }))
@@ -612,34 +628,50 @@ mod tests {
         assert_eq!(base.performance(), None, "no presets without the service's support");
         assert!(base.proxy.is_none() && base.retries.is_none() && base.keep_awake.is_none());
         let mut f = base.clone();
-        f.set_performance(Performance::Light);
+        f.max = 2;
+        f.knob_changed();
         let c = f.changes(&base);
-        assert!(!c.contains_key("performance") && !c.contains_key("write_buffer_kib"), "{c:?}");
-        assert_eq!((c["connections"].clone(), c["max_concurrent"].clone()), (json!(4), json!(2)));
+        assert_eq!(serde_json::Value::Object(c), json!({ "max_concurrent": 2 }), "no performance for a service without presets");
         // And no Advanced row for what it lacks.
         let shown: Vec<&str> = ADVANCED.iter().filter(|a| a.get(&base).is_some()).map(|a| a.key).collect();
         assert_eq!(shown, ["connections", "torrent_port", "torrent_dht"]);
     }
 
     #[test]
-    fn presets_and_custom() {
+    fn a_preset_goes_alone_and_hand_set_knobs_make_it_custom() {
         let base = OptionsForm::from_settings(&loaded_08());
         assert_eq!(base.performance(), Some(Performance::Balanced));
         let mut f = base.clone();
         f.set_performance(Performance::Maximum);
-        assert_eq!((f.conn, f.max, f.buffer_kib), (16, 8, Some(1024)));
+        assert_eq!((f.conn, f.max, f.buffer_kib), (16, 8, Some(1024)), "the service's table, shown in Advanced");
         let c = f.changes(&base);
-        assert_eq!(c["performance"], "maximum");
-        assert_eq!((c["connections"].clone(), c["max_concurrent"].clone(), c["write_buffer_kib"].clone()), (json!(16), json!(8), json!(1024)));
+        // A knob sent with the preset would win over it: the preset sets its own.
+        assert_eq!(serde_json::Value::Object(c), json!({ "performance": "maximum" }));
 
-        // Any knob off the table is Custom, and saying so is part of the patch.
+        // A knob changed by hand afterwards makes it custom, and goes with it.
         f.conn = 12;
+        f.knob_changed();
         assert_eq!(f.performance(), Some(Performance::Custom));
-        assert_eq!(f.changes(&base)["performance"], "custom");
-        // Back on the table, back to the preset.
+        let c = f.changes(&base);
+        assert_eq!((c["performance"].clone(), c["connections"].clone(), c["max_concurrent"].clone()), (json!("custom"), json!(12), json!(8)));
+        // Knobs that match a preset again are that preset.
         f.conn = 16;
+        f.knob_changed();
         assert_eq!(f.performance(), Some(Performance::Maximum));
-        assert_eq!(Performance::detect(Knobs { connections: 4, at_once: 2, buffer_kib: 64 }), Performance::Light);
+        // And back where it started, nothing at all is sent.
+        f.set_performance(Performance::Balanced);
+        assert!(f.changes(&base).is_empty());
+    }
+
+    #[test]
+    fn presets_need_the_services_table() {
+        let mut s = loaded_08();
+        s.profiles.clear();
+        let f = OptionsForm::from_settings(&s);
+        assert_eq!(f.performance(), None, "nothing to choose from without it");
+        let mut g = f.clone();
+        g.set_performance(Performance::Light);
+        assert!(g.changes(&f).is_empty(), "and nothing is sent");
     }
 
     #[test]
@@ -698,6 +730,8 @@ mod tests {
     fn a_manual_proxy_needs_an_address() {
         let mut f = OptionsForm::from_settings(&loaded_08());
         assert_eq!(f.problem(), None);
+        f.proxy.as_mut().unwrap().host = "proxy.lan/path".into();
+        assert!(f.problem().is_some(), "the service refuses anything but a name or an address");
         let p = f.proxy.as_mut().unwrap();
         p.host.clear();
         assert!(f.problem().is_some());

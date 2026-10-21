@@ -362,7 +362,9 @@ impl App {
         }
 
         section(ui, "Downloads at the same time");
-        ui.add(egui::Slider::new(&mut f.max, crate::options::AT_ONCE));
+        if ui.add(egui::Slider::new(&mut f.max, crate::options::AT_ONCE)).changed() {
+            f.knob_changed();
+        }
         caption(ui, p, "The rest wait their turn. Torrents that are only sharing don't count.");
 
         section(ui, "Speed");

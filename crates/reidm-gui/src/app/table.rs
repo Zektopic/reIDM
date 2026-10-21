@@ -234,11 +234,10 @@ impl App {
                                 let (dr, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
                                 icons::dot(ui.painter(), dr, c);
                                 let n = it.connections;
+                                let (state, why) = it.state_text();
                                 let label = match &it.note {
-                                    Some(note) if it.status == Status::Running => {
-                                        let mut c = note.chars();
-                                        c.next().map(|f| format!("{}{}…", f.to_uppercase(), c.as_str())).unwrap_or_default()
-                                    }
+                                    Some(_) if it.status == Status::Running => state,
+                                    _ if it.waiting_for_space => state,
                                     _ if it.seeding() => {
                                         let t = it.torrent.as_ref().unwrap();
                                         format!("Seeding · ratio {:.2} · {} peer{}", it.ratio().unwrap_or(0.0), t.peers, if t.peers == 1 { "" } else { "s" })
@@ -248,9 +247,10 @@ impl App {
                                         format!("Downloading · {p} peer{}", if p == 1 { "" } else { "s" })
                                     }
                                     _ if it.status == Status::Running && n > 1 => format!("{} ({n})", it.status.label()),
-                                    _ => it.status.label().to_string(),
+                                    _ => state,
                                 };
-                                ui.label(RichText::new(label).size(12.0).color(c)).on_hover_text(if n > 1 { format!("{n} connections") } else { String::new() });
+                                let tip = if !why.is_empty() { why } else if n > 1 { format!("{n} connections") } else { String::new() };
+                                ui.label(RichText::new(label).size(12.0).color(c)).on_hover_text(tip);
                             });
 
                             row.col(|ui| {

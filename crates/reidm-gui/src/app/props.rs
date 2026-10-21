@@ -96,11 +96,12 @@ impl App {
                                     ui.label(RichText::new("Matches the checksum it was added with").color(p.ok));
                                 }
                                 Some(false) => {
-                                    ui.label(RichText::new("Doesn't match the checksum it was added with: the file is kept, but it isn't the one expected").color(p.err));
+                                    ui.label(RichText::new("Doesn't match the checksum it was added with. The file is kept: Resume checks it again without downloading (if the expected value was wrong), Restart downloads it again.").color(p.err));
                                 }
                                 None => label(ui, p, "No checksum was given when it was added."),
                             }
-                            if it.status == Status::Done {
+                            // The service computes it for a finished file, or one kept after a mismatch.
+                            if it.status == Status::Done || ok == Some(false) {
                                 ui.horizontal(|ui| {
                                     egui::ComboBox::from_id_salt("props-algo").width(90.0).selected_text(algo.label()).show_ui(ui, |ui| {
                                         for a in crate::checksum::Algo::ALL {
