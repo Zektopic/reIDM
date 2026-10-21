@@ -7,25 +7,31 @@
 
 mod api;
 mod app;
+mod autostart;
+mod checksum;
+mod dropped;
 mod icons;
 mod model;
+mod notify;
 mod options;
+mod picker;
 mod playlist;
 mod torrent;
 mod prefs;
+mod queue;
 mod theme;
+mod tray;
 mod view;
+mod when_done;
 mod worker;
 
-/// The window/taskbar icon, decoded from the PNG shipped in the repository.
-fn window_icon() -> Option<egui::IconData> {
-    const PNG: &[u8] = include_bytes!("../../../packaging/icon/reidm-256.png");
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(PNG));
+/// A PNG as straight RGBA8, with its width and height.
+pub(crate) fn decode_png(png: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
-    // egui wants straight RGBA8.
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
         png::ColorType::Rgb => {
@@ -38,7 +44,14 @@ fn window_icon() -> Option<egui::IconData> {
         }
         _ => return None,
     };
-    Some(egui::IconData { rgba, width: info.width, height: info.height })
+    Some((rgba, info.width, info.height))
+}
+
+/// The window/taskbar icon, decoded from the PNG shipped in the repository.
+fn window_icon() -> Option<egui::IconData> {
+    const PNG: &[u8] = include_bytes!("../../../packaging/icon/reidm-256.png");
+    let (rgba, width, height) = decode_png(PNG)?;
+    Some(egui::IconData { rgba, width, height })
 }
 
 fn main() -> eframe::Result<()> {

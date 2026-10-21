@@ -70,6 +70,14 @@ pub struct Service {
     pub extension_dir: Option<String>,
     /// Problems with the download list's storage the user should know about.
     pub warnings: Vec<String>,
+    /// Free space on the download and temporary folders' disks; `None` from a service that
+    /// doesn't report it.
+    pub free_space: Option<Vec<crate::model::FreeSpace>>,
+    /// What happens when everything is done, and the countdown to it; `None` from a service
+    /// that can't do it.
+    pub when_done: Option<crate::when_done::WhenDone>,
+    /// The service is stopping (*When done › Exit*): the window closes too.
+    pub exiting: bool,
 }
 
 /// One line of a batch add's reply.
@@ -318,6 +326,9 @@ impl Client {
             refresh_armed: v["refresh_armed"].as_u64(),
             extension_dir: v["extension_dir"].as_str().map(str::to_string),
             warnings: v["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect(),
+            free_space: serde_json::from_value(v["free_space"].clone()).ok(),
+            when_done: serde_json::from_value(v["when_done"].clone()).ok(),
+            exiting: v["exiting"].as_bool().unwrap_or(false),
             settings: self.settings().ok(),
         })
     }
@@ -381,6 +392,15 @@ impl Client {
         self.in_background(Duration::from_secs(180), move |c| {
             let v: serde_json::Value = c.post_json("/api/grab", body)?;
             serde_json::from_value(v["files"].clone()).map_err(|e| e.to_string())
+        })
+    }
+
+    /// Compute a finished download's checksum. Reading a big file takes a while.
+    pub fn verify_async(&self, id: u64, algo: &str) -> Receiver<Result<String, String>> {
+        let body = serde_json::json!({ "algo": algo });
+        self.in_background(Duration::from_secs(3600), move |c| {
+            let v: serde_json::Value = c.post_json(&format!("/api/downloads/{id}/verify"), body)?;
+            v["value"].as_str().map(str::to_string).ok_or_else(|| "the service gave no checksum".to_string())
         })
     }
 

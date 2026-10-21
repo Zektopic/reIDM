@@ -20,6 +20,8 @@ pub enum SortKey {
     Rate,
     LastTry,
     Address,
+    /// Place in the queue: unfinished downloads first, in the order they will start.
+    Queue,
 }
 
 #[derive(Clone, PartialEq)]
@@ -43,6 +45,13 @@ pub struct Counts {
     /// One per entry of `CATEGORIES` (All first).
     pub categories: [usize; 8],
     pub unfinished: usize,
+    /// Waiting for a free slot (`Queued`).
+    pub waiting: usize,
+    pub paused: usize,
+    /// The service keeps a queue order (rows carry `order`).
+    pub ordered: bool,
+    /// The service checks checksums (rows carry `checksum_ok`).
+    pub checksums: bool,
 }
 
 impl Counts {
@@ -62,6 +71,9 @@ pub struct ViewModel {
     /// Positions in the snapshot's `items` of the visible rows, in display order.
     pub rows: Vec<usize>,
     pub counts: Counts,
+    /// The unfinished downloads in queue order, and each one's place (from 1).
+    pub queue: Vec<u64>,
+    pub places: std::collections::HashMap<u64, usize>,
     /// How many times the rows were rebuilt (for tests and the debug overlay).
     pub builds: u64,
 }
@@ -81,7 +93,8 @@ impl ViewModel {
                 Status::Running => counts.running += 1,
                 Status::Done => counts.done += 1,
                 Status::Failed(_) => counts.failed += 1,
-                _ => {}
+                Status::Queued => counts.waiting += 1,
+                Status::Paused => counts.paused += 1,
             }
             if it.status != Status::Done {
                 counts.unfinished += 1;
@@ -89,6 +102,8 @@ impl ViewModel {
                     counts.queued += 1;
                 }
             }
+            counts.ordered |= it.order.is_some();
+            counts.checksums |= it.checksum_ok.is_some();
             counts.categories[0] += 1;
             if let Some(c) = CATEGORIES.iter().position(|c| *c == it.category()) {
                 counts.categories[c] += 1;
@@ -97,6 +112,13 @@ impl ViewModel {
                 rows.push(i);
             }
         }
+        // Only rebuilt with the list itself: a new search or sort doesn't change the queue.
+        if self.key.as_ref().is_none_or(|k| k.rev != key.rev) {
+            self.queue = crate::queue::queue(items.iter().map(|a| a.as_ref()));
+            self.places = crate::queue::places(&self.queue);
+        }
+        let places = &self.places;
+        let place = |i: usize| places.get(&items[i].id).copied().unwrap_or(usize::MAX);
         let rate = |i: usize| snap.rates.get(&items[i].id).copied().unwrap_or(0.0);
         let eta = |i: usize| {
             let it = &items[i];
@@ -115,6 +137,7 @@ impl ViewModel {
                 SortKey::Rate => rate(a).partial_cmp(&rate(b)).unwrap_or(Ordering::Equal),
                 SortKey::LastTry => x.last_try.unwrap_or(0).cmp(&y.last_try.unwrap_or(0)),
                 SortKey::Address => x.url_lower().cmp(y.url_lower()),
+                SortKey::Queue => place(a).cmp(&place(b)),
             }
             // Equal keys keep a stable order (newest last), so rows don't jump between frames.
             .then(x.id.cmp(&y.id));
@@ -135,6 +158,35 @@ impl ViewModel {
     pub fn ids<'a>(&'a self, snap: &'a Snapshot) -> impl Iterator<Item = u64> + 'a {
         self.rows.iter().map(|&i| snap.items[i].id)
     }
+}
+
+/// A move of the keyboard focus through the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nav {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+/// Rows a page moves by.
+const PAGE: usize = 10;
+
+/// The row the focus moves to among `len` rows, from row `from` (none yet: the first row, or
+/// the last for End).
+pub fn step(len: usize, from: Option<usize>, nav: Nav) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    Some(match (from, nav) {
+        (_, Nav::Home) => 0,
+        (_, Nav::End) => last,
+        (None, _) => 0,
+        (Some(i), Nav::Up) => i.saturating_sub(1),
+        (Some(i), Nav::PageUp) => i.saturating_sub(PAGE),
+        (Some(i), Nav::Down) => (i + 1).min(last),
+        (Some(i), Nav::PageDown) => (i + PAGE).min(last),
+    })
 }
 
 #[cfg(test)]
@@ -175,6 +227,18 @@ pub(crate) mod tests {
         assert_eq!(vm.ids(&s).collect::<Vec<_>>(), vec![2]);
         let s2 = snap(s.items.iter().map(|i| (**i).clone()).collect(), 2);
         assert!(vm.update(&s2, all, " A.MP4 ", SortKey::Name, true), "a new snapshot rebuilds");
+    }
+
+    #[test]
+    fn the_keyboard_walks_the_list_and_stops_at_its_ends() {
+        assert_eq!(step(0, None, Nav::Down), None, "nothing to move to");
+        assert_eq!(step(5, None, Nav::Down), Some(0));
+        assert_eq!(step(5, None, Nav::End), Some(4));
+        assert_eq!(step(5, Some(4), Nav::Down), Some(4));
+        assert_eq!(step(5, Some(0), Nav::Up), Some(0));
+        assert_eq!(step(30, Some(3), Nav::PageDown), Some(13));
+        assert_eq!(step(30, Some(25), Nav::PageDown), Some(29));
+        assert_eq!(step(30, Some(3), Nav::PageUp), Some(0));
     }
 
     #[test]
