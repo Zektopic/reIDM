@@ -26,7 +26,7 @@ Opening the window starts the service if it isn't running.
 folder) and whether the browser extension is connected, with a way to set it up. *Get started*
 or Esc closes it; Help › *Welcome…* shows it again.
 
-**Toolbar.** Add URL · Resume · Stop · Stop All · Delete · Delete Completed · Options · Scheduler ·
+**Toolbar.** Add URL · Resume · Pause · Pause All · Remove · Remove Completed · Options · Scheduler ·
 Start Queue · Stop Queue · Site Grabber · Speed Limiter, and a search box that filters the list by
 name or address.
 
@@ -46,9 +46,9 @@ sort; click again to reverse. A small clock before a name marks a download in th
 
 Select with a click, Ctrl+click and Shift+click, or the checkboxes; **double-click** opens a
 finished download, or shows the progress of an unfinished one. **Right-click** for: Open, Open
-containing folder, Stop/Resume, **Restart from the beginning**, **Refresh download address…**,
-add to or remove from the scheduled queue, Copy address, **Properties…**, Remove, and Remove and
-delete the file.
+containing folder, Pause/Resume, **Restart from the beginning**, **Refresh download address…**,
+add to or remove from the scheduled queue, move up or down the [queue](#the-queue-and-the-scheduler),
+Copy address, **Properties…**, Remove, and Remove and delete the file.
 
 **The status bar** counts downloads by state and shows whether the browser extension is connected
 (*Browser: Chrome 153*; click it to set the extension up), the speed limit (click to change it),
