@@ -10,7 +10,10 @@ pub struct Palette {
     pub border: Color32,
     pub text: Color32,
     pub text_dim: Color32,
+    /// Fills: the selection, the primary button, progress bars.
     pub accent: Color32,
+    /// The accent as text on the window's backgrounds, light enough to read in the dark theme.
+    pub accent_fg: Color32,
     pub accent_text: Color32,
     pub ok: Color32,
     pub warn: Color32,
@@ -28,9 +31,12 @@ impl Palette {
             text: Color32::from_rgb(0x1A, 0x1A, 0x1A),
             text_dim: Color32::from_rgb(0x6C, 0x6C, 0x6C),
             accent: Color32::from_rgb(0x0A, 0x60, 0xC8),
+            accent_fg: Color32::from_rgb(0x0A, 0x60, 0xC8),
             accent_text: Color32::WHITE,
-            ok: Color32::from_rgb(0x18, 0x80, 0x38),
-            warn: Color32::from_rgb(0xB0, 0x6A, 0x00),
+            // #188038 was 4.4:1 on the window background.
+            ok: Color32::from_rgb(0x15, 0x7A, 0x34),
+            // Darker than the old #B06A00, which was 4.1:1 on the panel.
+            warn: Color32::from_rgb(0x8A, 0x53, 0x00),
             err: Color32::from_rgb(0xC0, 0x28, 0x28),
             row_alt: Color32::from_rgb(0xFA, 0xFC, 0xFF),
         }
@@ -44,7 +50,10 @@ impl Palette {
             border: Color32::from_rgb(0x3C, 0x3C, 0x3C),
             text: Color32::from_rgb(0xE6, 0xE6, 0xE6),
             text_dim: Color32::from_rgb(0x9A, 0x9A, 0x9A),
-            accent: Color32::from_rgb(0x2A, 0x84, 0xE0),
+            // Darker than #2A84E0, under which the primary button's white label was 3.8:1.
+            accent: Color32::from_rgb(0x22, 0x72, 0xCC),
+            // The fill colour is too dim for text on the dark panels.
+            accent_fg: Color32::from_rgb(0x5A, 0xA2, 0xF0),
             accent_text: Color32::WHITE,
             ok: Color32::from_rgb(0x4C, 0xC0, 0x6A),
             warn: Color32::from_rgb(0xE0, 0xA0, 0x40),
@@ -56,7 +65,7 @@ impl Palette {
     pub fn status_color(&self, s: &crate::model::Status) -> Color32 {
         use crate::model::Status::*;
         match s {
-            Running => self.accent,
+            Running => self.accent_fg,
             Done => self.ok,
             Paused => self.warn,
             Failed(_) => self.err,
@@ -119,4 +128,35 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
         style.spacing.button_padding = egui::vec2(9.0, 4.0);
         style.spacing.menu_margin = egui::Margin::same(6);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG 2 contrast ratio.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let lum = |c: Color32| {
+            let ch = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+        };
+        let (x, y) = (lum(a) + 0.05, lum(b) + 0.05);
+        x.max(y) / x.min(y)
+    }
+
+    #[test]
+    fn text_is_readable_on_every_background() {
+        for (name, p) in [("light", Palette::light()), ("dark", Palette::dark())] {
+            for (what, fg) in [("text", p.text), ("text_dim", p.text_dim), ("accent_fg", p.accent_fg), ("ok", p.ok), ("warn", p.warn), ("err", p.err)] {
+                for (on, bg) in [("bg", p.bg), ("panel", p.panel), ("panel_alt", p.panel_alt)] {
+                    let c = contrast(fg, bg);
+                    assert!(c >= 4.5, "{name}: {what} on {on} is {c:.2}:1, under WCAG AA's 4.5:1");
+                }
+            }
+            assert!(contrast(p.accent_text, p.accent) >= 4.5, "{name}: the primary button's label");
+        }
+    }
 }

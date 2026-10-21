@@ -351,13 +351,23 @@ Those marked *requires restart* apply the next time reIDM starts.
 |---|---|
 | Ctrl+N or Insert | Add URL |
 | Ctrl+V | Add URL with the links on the clipboard |
+| ↑ / ↓, Page Up / Page Down, Home / End | move through the list; with Shift, select as you go |
+| Space | add the download under the cursor to the selection, or take it out |
+| Enter | open the selected download if it's finished, otherwise its properties |
+| F2 or Alt+Enter | properties |
+| Ctrl+↑ / Ctrl+↓ | move the selected downloads up or down the queue |
 | Delete | delete the selected downloads (asks first) |
 | Ctrl+A | select everything shown |
-| Ctrl+↑ / Ctrl+↓ | move the selected downloads up or down the queue |
-| Enter | open the selected download if it's finished, otherwise its properties |
+| Esc | close the dialog on top |
+| Tab / Shift+Tab | move between buttons and fields; the one with the keyboard has a blue outline |
+| Ctrl+Plus / Ctrl+Minus | make everything bigger or smaller |
 | Alt+click (in the browser) | let the browser download a link instead of reIDM |
 
 On macOS, Ctrl is ⌘.
+
+**Screen readers.** The window describes itself to screen readers (Narrator, VoiceOver, Orca):
+every button, the category tree, the column headers and each download (name, state and
+progress) have names.
 
 ## Where reIDM keeps things
 

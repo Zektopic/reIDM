@@ -190,18 +190,22 @@ impl App {
         if save {
             self.save_options();
         } else if cancel || !open {
-            // Put the window's own preferences back, except the Advanced switch, which is a
-            // choice of view rather than a setting.
-            let advanced = self.prefs.advanced_settings;
-            if let Some(before) = self.options.prefs_before.take() {
-                self.prefs = before;
-            }
-            if self.prefs.advanced_settings != advanced {
-                self.prefs.advanced_settings = advanced;
-                self.prefs.save();
-            }
-            self.options.open = false;
+            self.cancel_options();
         }
+    }
+
+    /// Close Options without saving: the window's own preferences go back too, except the
+    /// Advanced switch, which is a choice of view rather than a setting.
+    pub(super) fn cancel_options(&mut self) {
+        let advanced = self.prefs.advanced_settings;
+        if let Some(before) = self.options.prefs_before.take() {
+            self.prefs = before;
+        }
+        if self.prefs.advanced_settings != advanced {
+            self.prefs.advanced_settings = advanced;
+            self.prefs.save();
+        }
+        self.options.open = false;
     }
 
     fn save_options(&mut self) {
@@ -308,9 +312,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_sized(Vec2::new(440.0, 24.0), egui::TextEdit::singleline(&mut self.options.form.dir));
             if ui.button("Browse…").clicked() {
-                if let Some(d) = rfd::FileDialog::new().set_directory(&self.options.form.dir).pick_folder() {
-                    self.options.form.dir = d.to_string_lossy().into_owned();
-                }
+                self.picker.open(&self.ctx, PickFor::DownloadDir, Ask::Folder { start: self.options.form.dir.clone() });
             }
         });
         caption(ui, p, "Where finished downloads go, unless one is given a folder of its own.");
@@ -319,6 +321,7 @@ impl App {
         caption(ui, p, "As IDM does: videos in Video, archives in Compressed, installers in Programs… A folder left empty is the one under the download folder shown in grey.");
         let defaults: Vec<String> = self.options.form.folders.iter().map(|(n, _)| self.default_folder(n)).collect();
         let sort = self.options.form.sort;
+        let mut pick: Option<(&'static str, String)> = None;
         egui::Grid::new("folders").num_columns(4).spacing(Vec2::new(8.0, 6.0)).show(ui, |ui| {
             for ((name, dir), default) in self.options.form.folders.iter_mut().zip(&defaults) {
                 let name: &'static str = name;
@@ -327,9 +330,7 @@ impl App {
                 ui.add_enabled_ui(on, |ui| ui.add_sized(Vec2::new(330.0, 22.0), egui::TextEdit::singleline(dir).hint_text(default.as_str())));
                 if ui.add_enabled(on, egui::Button::new("Browse…")).clicked() {
                     let start = if dir.is_empty() { default.clone() } else { dir.clone() };
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
-                        *dir = d.to_string_lossy().into_owned();
-                    }
+                    pick = Some((name, start));
                 }
                 if ui.add_enabled(!dir.is_empty(), egui::Button::new("Default")).on_hover_text("Back to the folder under the download folder").clicked() {
                     dir.clear();
@@ -337,6 +338,9 @@ impl App {
                 ui.end_row();
             }
         });
+        if let Some((name, start)) = pick {
+            self.picker.open(&self.ctx, PickFor::CategoryDir(name), Ask::Folder { start });
+        }
     }
 
     /// Options › Downloads: how hard reIDM works, and how fast.
@@ -509,19 +513,21 @@ impl App {
         }
         ui.checkbox(&mut self.prefs.notify_failures, "Say so when a download fails, as when one finishes");
         section(ui, "Temporary folder");
+        let mut pick_temp = None;
         let temp_default = reidm_core::default_data_dir().join("parts").to_string_lossy().into_owned();
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut f.temp).hint_text(temp_default.as_str()).desired_width(400.0));
             if ui.button("Browse…").clicked() {
                 let start = if f.temp.is_empty() { temp_default.clone() } else { f.temp.clone() };
-                if let Some(d) = rfd::FileDialog::new().set_directory(&start).pick_folder() {
-                    f.temp = d.to_string_lossy().into_owned();
-                }
+                pick_temp = Some(start);
             }
             if ui.add_enabled(!f.temp.is_empty(), egui::Button::new("Default").small()).on_hover_text("Back to the folder in reIDM's data folder").clicked() {
                 f.temp.clear();
             }
         });
         label(ui, p, "Unfinished downloads wait here and move to their folder when complete, so the download folder only ever holds finished files. On another drive, the move is a copy.");
+        if let Some(start) = pick_temp {
+            self.picker.open(&self.ctx, PickFor::TempDir, Ask::Folder { start });
+        }
     }
 }

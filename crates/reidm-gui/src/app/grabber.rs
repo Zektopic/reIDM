@@ -101,13 +101,13 @@ impl App {
                                 icons::file_card(ui.painter(), icon_rect, cat, self.prefs.dark);
                                 ui.add_space(20.0);
                                 match f.size {
-                                    Some(sz) => ui.label(RichText::new(size_human(sz)).size(11.5).color(p.text_dim)),
-                                    None => ui.label(RichText::new("          ").size(11.5)),
+                                    Some(sz) => ui.label(RichText::new(size_human(sz)).size(12.0).color(p.text_dim)),
+                                    None => ui.label(RichText::new("          ").size(12.0)),
                                 };
                                 ui.label(RichText::new(&f.filename).size(12.0).color(p.text))
                                     .on_hover_text(if f.found_on.is_empty() { f.url.clone() } else { format!("{}\nfound on {}", f.url, f.found_on) });
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.label(RichText::new(&f.ext).size(10.5).color(p.text_dim));
+                                    ui.label(RichText::new(&f.ext).size(12.0).color(p.text_dim));
                                 });
                             });
                         }
@@ -136,7 +136,7 @@ impl App {
 
         if export {
             let all_urls: Vec<String> = found.iter().map(|f| f.url.clone()).collect();
-            self.export_found(&all_urls);
+            self.export_found(all_urls);
         }
         self.grab.found = found;
         self.grab.selected = selected;

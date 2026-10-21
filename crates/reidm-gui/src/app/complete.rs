@@ -26,11 +26,11 @@ impl App {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(it.file_name()).strong());
                         let folder = it.torrent.as_ref().and_then(|t| t.folder.clone()).or_else(|| it.path.parent().map(|d| d.to_path_buf()));
-                        ui.label(RichText::new(format!("{} · {}", it.size.map(size_human).unwrap_or_default(), folder.map(|d| d.display().to_string()).unwrap_or_default())).color(p.text_dim).size(11.5));
+                        ui.label(RichText::new(format!("{} · {}", it.size.map(size_human).unwrap_or_default(), folder.map(|d| d.display().to_string()).unwrap_or_default())).color(p.text_dim).size(12.0));
                     });
                 });
                 if self.completed.len() > 1 {
-                    ui.label(RichText::new(format!("and {} more finished", self.completed.len() - 1)).color(p.text_dim).size(11.0));
+                    ui.label(RichText::new(format!("and {} more finished", self.completed.len() - 1)).color(p.text_dim).size(12.0));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {

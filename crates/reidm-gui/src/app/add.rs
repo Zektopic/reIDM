@@ -18,7 +18,7 @@ impl App {
             );
             let count = self.add.count();
             if count > 1 {
-                ui.label(RichText::new(format!("{count} URLs")).color(p.accent).size(11.0));
+                ui.label(RichText::new(format!("{count} URLs")).color(p.accent_fg).size(12.0));
             }
             ui.add_space(6.0);
             label(ui, p, "Save as (single URL only)");
@@ -28,9 +28,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add_sized(Vec2::new(430.0, 26.0), egui::TextEdit::singleline(&mut self.add.dir));
                 if ui.button("Browse…").clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.add.dir).pick_folder() {
-                        self.add.dir = d.to_string_lossy().into_owned();
-                    }
+                    self.picker.open(ctx, PickFor::AddDir, Ask::Folder { start: self.add.dir.clone() });
                 }
             });
             if self.vm.counts.checksums {
@@ -128,13 +126,13 @@ impl App {
             ui.add_space(8.0);
             match &preview {
                 Ok(urls) if !urls.is_empty() => {
-                    ui.label(RichText::new(format!("{} addresses", urls.len())).color(p.accent));
-                    ui.label(RichText::new(&urls[0]).size(11.5).color(p.text_dim));
+                    ui.label(RichText::new(format!("{} addresses", urls.len())).color(p.accent_fg));
+                    ui.label(RichText::new(&urls[0]).size(12.0).color(p.text_dim));
                     if urls.len() > 2 {
-                        ui.label(RichText::new("…").size(11.5).color(p.text_dim));
+                        ui.label(RichText::new("…").size(12.0).color(p.text_dim));
                     }
                     if urls.len() > 1 {
-                        ui.label(RichText::new(urls.last().unwrap()).size(11.5).color(p.text_dim));
+                        ui.label(RichText::new(urls.last().unwrap()).size(12.0).color(p.text_dim));
                     }
                 }
                 Ok(_) => {}

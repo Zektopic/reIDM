@@ -42,3 +42,16 @@ pub(super) fn segment_map(ui: &mut egui::Ui, p: &Palette, it: &Item, segments: &
     }
     painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, p.border), egui::StrokeKind::Inside);
 }
+
+/// A visible keyboard focus for widgets the window paints itself (egui draws one only for its
+/// own), and a name for screen readers, which can't read painted text.
+pub(super) fn accessible(ui: &egui::Ui, resp: &egui::Response, p: &Palette, typ: egui::WidgetType, name: &str, selected: Option<bool>) {
+    let name = name.replace('\n', " ");
+    resp.widget_info(|| match selected {
+        Some(s) => egui::WidgetInfo::selected(typ, true, s, &name),
+        None => egui::WidgetInfo::labeled(typ, true, &name),
+    });
+    if resp.has_focus() {
+        ui.painter().rect_stroke(resp.rect.shrink(1.0), 4.0, egui::Stroke::new(2.0, p.accent_fg), egui::StrokeKind::Inside);
+    }
+}

@@ -20,12 +20,13 @@ pub struct TorrentWindow {
     picked: Vec<bool>,
     error: Option<String>,
     sending: Option<Receiver<Result<(), String>>>,
+    picker: crate::picker::Picker<()>,
 }
 
 impl TorrentWindow {
     /// Waiting on the service, so the window must keep drawing to notice the answer.
     pub fn busy(&self) -> bool {
-        self.inspecting.is_some() || self.sending.is_some()
+        self.inspecting.is_some() || self.sending.is_some() || self.picker.busy()
     }
 }
 
@@ -50,6 +51,9 @@ impl TorrentWindow {
                     Err(e) => self.error = Some(e),
                 }
             }
+        }
+        if let Some(((), path)) = self.picker.poll() {
+            self.use_file(&path, api);
         }
         let mut done = None;
         if let Some(rx) = &self.sending {
@@ -81,9 +85,7 @@ impl TorrentWindow {
                     None => {
                         ui.add(egui::TextEdit::singleline(&mut self.url).hint_text(hint).desired_width(480.0));
                         if ui.button("Browse .torrent…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().add_filter("Torrent", &["torrent"]).pick_file() {
-                                self.use_file(&path, api);
-                            }
+                            self.picker.open(ctx, (), crate::picker::Ask::Open { title: "Add a torrent", filter: ("Torrent", &["torrent"]) });
                         }
                     }
                 }

@@ -9,10 +9,10 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let sep = |ui: &mut egui::Ui| {
-                        ui.add_space(5.0);
-                        let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 40.0), egui::Sense::hover());
+                        ui.add_space(3.0);
+                        let (r, _) = ui.allocate_exact_size(Vec2::new(1.0, 44.0), egui::Sense::hover());
                         ui.painter().rect_filled(r, 0.0, p.border);
-                        ui.add_space(5.0);
+                        ui.add_space(3.0);
                     };
 
                     if tool(ui, p, "Add URL", Icon::Plus, true).clicked() {
@@ -58,7 +58,7 @@ impl App {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let mut s = std::mem::take(&mut self.search);
-                        ui.add_sized(Vec2::new(190.0, 24.0), egui::TextEdit::singleline(&mut s).hint_text("Search…"));
+                        ui.add_sized(Vec2::new(160.0, 24.0), egui::TextEdit::singleline(&mut s).hint_text("Search…"));
                         self.search = s;
                         let (sr, _) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
                         icons::search(ui.painter(), sr, p.text_dim);
@@ -93,10 +93,11 @@ pub(super) fn tool(ui: &mut egui::Ui, p: &Palette, label: &str, icon: Icon, prim
     let lines: Vec<&str> = label.split('\n').collect();
     let widest = lines
         .iter()
-        .map(|l| ui.painter().layout_no_wrap((*l).to_string(), egui::FontId::proportional(10.5), p.text).size().x)
+        .map(|l| ui.painter().layout_no_wrap((*l).to_string(), egui::FontId::proportional(12.0), p.text).size().x)
         .fold(0.0f32, f32::max);
-    let w = (widest + 16.0).max(56.0);
-    let h = 46.0;
+    let w = (widest + 12.0).max(52.0);
+    // Room for two lines of 12-point caption under the icon.
+    let h = 56.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), egui::Sense::click());
     let fg = if primary { p.accent_text } else { p.text };
 
@@ -126,7 +127,8 @@ pub(super) fn tool(ui: &mut egui::Ui, p: &Palette, label: &str, icon: Icon, prim
         Icon::Gauge => icons::gauge(painter, icon_rect, fg),
     }
     for (i, line) in lines.iter().enumerate() {
-        painter.text(egui::Pos2::new(rect.center().x, rect.top() + 29.0 + i as f32 * 11.0), egui::Align2::CENTER_TOP, *line, egui::FontId::proportional(10.5), fg);
+        painter.text(egui::Pos2::new(rect.center().x, rect.top() + 28.0 + i as f32 * 13.0), egui::Align2::CENTER_TOP, *line, egui::FontId::proportional(12.0), fg);
     }
+    accessible(ui, &resp, p, egui::WidgetType::Button, label, None);
     resp.on_hover_text(label.replace('\n', " "))
 }

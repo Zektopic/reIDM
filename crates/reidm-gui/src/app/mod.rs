@@ -41,8 +41,9 @@ use egui_extras::{Column, TableBuilder};
 use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
+use crate::picker::{Ask, Picker};
 use state::*;
-use widgets::{label, segment_map, window};
+use widgets::{accessible, label, segment_map, window};
 
 /// A reply from the command thread: what to do in the window with a command's result.
 fn reply(f: impl FnOnce(&mut App) + Send + 'static) -> Option<Reply<App>> {
@@ -82,6 +83,8 @@ pub struct App {
     selected: HashSet<u64>,
     /// The row last clicked: what Properties, Open and Enter act on.
     focus: Option<u64>,
+    /// A row the list should scroll to, once (after moving with the keyboard).
+    scroll_to: Option<u64>,
     anchor: Option<u64>,
     search: String,
     sort: SortKey,
@@ -126,6 +129,9 @@ pub struct App {
     /// (by when each ends).
     countdown_cancelled: Option<u64>,
     countdown_seen: Option<u64>,
+
+    /// The file or folder picker open, if any.
+    picker: Picker<PickFor>,
 
     // watching the clipboard
     clip_watcher: Option<intake::ClipboardWatcher>,
@@ -181,6 +187,7 @@ impl App {
             view: View::Category(Category::All),
             selected: HashSet::new(),
             focus: None,
+            scroll_to: None,
             anchor: None,
             search: String::new(),
             sort: SortKey::Name,
@@ -211,6 +218,7 @@ impl App {
             quitting: false,
             countdown_cancelled: None,
             countdown_seen: None,
+            picker: Picker::default(),
             clip_watcher: None,
             clip_on: false,
             clip_priming: false,
@@ -285,43 +293,122 @@ impl App {
         self.selected_items().iter().map(|i| i.id).collect()
     }
 
+    /// Esc closes the dialog on top. The confirmation and the countdown handle their own.
+    fn escape(&mut self) {
+        if self.confirm.is_some() || self.snap.service.when_done.is_some_and(|w| w.fires_at.is_some_and(|at| self.countdown_cancelled != Some(at))) {
+            return;
+        }
+        if self.batch.open {
+            self.batch.open = false;
+        } else if self.sched.open {
+            self.sched.open = false;
+        } else if self.limiter.open {
+            self.limiter.open = false;
+        } else if self.options.open {
+            self.cancel_options();
+        } else if self.add.open {
+            self.add.open = false;
+        } else if self.props.is_some() {
+            self.props = None;
+        } else if self.show_integration {
+            self.show_integration = false;
+        } else if self.about {
+            self.about = false;
+        } else if self.show_grabber {
+            self.show_grabber = false;
+        } else {
+            self.clip_offers.pop_front();
+        }
+    }
+
+    /// Move the focus through the list, selecting as it goes (Shift extends the selection).
+    fn navigate(&mut self, nav: crate::view::Nav, extend: bool) {
+        let ids: Vec<u64> = self.vm.ids(&self.snap).collect();
+        let from = self.focus.and_then(|f| ids.iter().position(|x| *x == f));
+        let Some(to) = crate::view::step(ids.len(), from, nav) else { return };
+        let id = ids[to];
+        if extend {
+            self.select_range(id);
+        } else {
+            self.select_only(id);
+        }
+        self.scroll_to = Some(id);
+    }
+
     /// Keyboard shortcuts for the list. Ignored while a text field has the keyboard.
+    ///
+    /// Each key is read with the modifiers it was pressed with, not those held when the frame
+    /// is drawn: a quick Ctrl+↑ can be over by then.
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        use crate::view::Nav;
+        use egui::Key;
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.escape();
+        }
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (del, all, enter, new, paste, up, down) = ctx.input(|i| {
-            let cmd = i.modifiers.command;
-            (
-                i.key_pressed(egui::Key::Delete),
-                cmd && i.key_pressed(egui::Key::A),
-                i.key_pressed(egui::Key::Enter),
-                (cmd && i.key_pressed(egui::Key::N)) || i.key_pressed(egui::Key::Insert),
-                i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
-                cmd && i.key_pressed(egui::Key::ArrowUp),
-                cmd && i.key_pressed(egui::Key::ArrowDown),
-            )
+        let (keys, paste) = ctx.input(|i| {
+            let keys: Vec<(Key, egui::Modifiers)> = i.events.iter().filter_map(|e| if let egui::Event::Key { key, pressed: true, modifiers, .. } = e { Some((*key, *modifiers)) } else { None }).collect();
+            (keys, i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))))
         });
-        if (up || down) && self.vm.counts.ordered {
-            self.move_selected(if up { crate::queue::To::Up } else { crate::queue::To::Down });
-        }
-        if del && !self.selected.is_empty() {
-            self.confirm = Some(Confirm::Remove(self.selected_ids()));
-        }
-        if all {
-            self.selected = self.vm.ids(&self.snap).collect();
-        }
-        if enter {
-            if let Some(id) = self.focus.filter(|id| self.selected.contains(id)) {
-                if self.item(id).is_some_and(|i| i.status == Status::Done) {
-                    self.open_id(id, false);
-                } else {
-                    self.open_props(id);
+        for (key, m) in keys {
+            let plain = !m.command && !m.alt;
+            let nav = match key {
+                Key::ArrowUp => Some(Nav::Up),
+                Key::ArrowDown => Some(Nav::Down),
+                Key::PageUp => Some(Nav::PageUp),
+                Key::PageDown => Some(Nav::PageDown),
+                Key::Home => Some(Nav::Home),
+                Key::End => Some(Nav::End),
+                _ => None,
+            };
+            match (key, nav) {
+                (Key::ArrowUp | Key::ArrowDown, _) if m.command => {
+                    if self.vm.counts.ordered {
+                        self.move_selected(if key == Key::ArrowUp { crate::queue::To::Up } else { crate::queue::To::Down });
+                    }
                 }
+                (_, Some(n)) if plain => {
+                    // The arrows mean the list here, not egui's moving the focus between widgets.
+                    ctx.memory_mut(|mem| {
+                        if let Some(f) = mem.focused() {
+                            mem.surrender_focus(f);
+                        }
+                    });
+                    self.navigate(n, m.shift);
+                }
+                (Key::Space, _) if plain && ctx.memory(|mem| mem.focused().is_none()) => {
+                    if let Some(id) = self.focus {
+                        self.toggle_select(id);
+                    }
+                }
+                (Key::F2, _) => self.props_of_focus(),
+                (Key::Enter, _) if m.alt => self.props_of_focus(),
+                (Key::Enter, _) => {
+                    if let Some(id) = self.focus.filter(|id| self.selected.contains(id)) {
+                        if self.item(id).is_some_and(|i| i.status == Status::Done) {
+                            self.open_id(id, false);
+                        } else {
+                            self.open_props(id);
+                        }
+                    }
+                }
+                (Key::Delete, _) if !self.selected.is_empty() => self.confirm = Some(Confirm::Remove(self.selected_ids())),
+                (Key::A, _) if m.command => self.selected = self.vm.ids(&self.snap).collect(),
+                (Key::N, _) if m.command => self.open_add(),
+                (Key::Insert, _) => self.open_add(),
+                _ => {}
             }
         }
-        if new || (paste && !self.add.open) {
+        if paste && !self.add.open {
             self.open_add();
+        }
+    }
+
+    fn props_of_focus(&mut self) {
+        if let Some(id) = self.focus.filter(|id| self.selected.contains(id)) {
+            self.open_props(id);
         }
     }
 }
@@ -366,7 +453,7 @@ impl eframe::App for App {
         if let Some(msg) = self.torrent.show(&ctx, &self.client, &p) {
             self.toast(msg);
         }
-        self.about_dialog(&ctx);
+        self.about_dialog(&ctx, &p);
         self.confirm_dialog(&ctx, &p);
         self.grabber_window(&ctx, &p);
         self.props_window(&ctx, &p);

@@ -297,14 +297,7 @@ impl App {
 
     /// Read URLs from a text file or an IDM `.ef2` export.
     pub(super) fn import_from_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("URL lists and IDM exports", &["txt", "list", "csv", "ef2"])
-            .set_title("Import downloads")
-            .pick_file()
-        else {
-            return;
-        };
-        self.import_path(&path);
+        self.picker.open(&self.ctx, PickFor::Import, Ask::Open { title: "Import downloads", filter: ("URL lists and IDM exports", &["txt", "list", "csv", "ef2"]) });
     }
 
     /// Queue the downloads in a URL list or an IDM `.ef2` export.
@@ -326,20 +319,17 @@ impl App {
         }
     }
 
-    /// Write the download list as plain URLs or as IDM's `.ef2`.
+    /// Write the download list as plain URLs or as IDM's `.ef2`: first, where.
     pub(super) fn export_download_list(&mut self, ef2: bool) {
         if self.snap.items.is_empty() {
             return self.toast("There is nothing to export");
         }
+        let (format, filter): (&str, (&'static str, &'static [&'static str])) = if ef2 { ("ef2", ("IDM export", &["ef2"])) } else { ("txt", ("URL list", &["txt"])) };
+        self.picker.open(&self.ctx, PickFor::Export { ef2 }, Ask::Save { title: "Export the download list", name: format!("reidm-downloads.{format}"), filter });
+    }
+
+    fn export_list_to(&mut self, ef2: bool, path: std::path::PathBuf) {
         let format = if ef2 { "ef2" } else { "txt" };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter(if ef2 { "IDM export" } else { "URL list" }, &[format])
-            .set_file_name(format!("reidm-downloads.{format}"))
-            .set_title("Export the download list")
-            .save_file()
-        else {
-            return;
-        };
         let n = self.snap.items.len();
         self.cmd.run(move |c| {
             let r = c.with_timeout(Duration::from_secs(120)).get(&format!("/api/export?format={format}")).and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
@@ -351,13 +341,29 @@ impl App {
     }
 
     /// Export just the grabber's results as a URL list.
-    pub(super) fn export_found(&mut self, urls: &[String]) {
-        let Some(path) = rfd::FileDialog::new().add_filter("URL list", &["txt"]).set_file_name("grabbed-urls.txt").save_file() else {
-            return;
-        };
-        match std::fs::write(&path, reidm_core::grabber::url_list_text(urls)) {
-            Ok(()) => self.toast(format!("Exported {} URL(s)", urls.len())),
-            Err(e) => self.toast(format!("could not write {}: {e}", path.display())),
+    pub(super) fn export_found(&mut self, urls: Vec<String>) {
+        self.picker.open(&self.ctx, PickFor::ExportFound(urls), Ask::Save { title: "Export the files found", name: "grabbed-urls.txt".into(), filter: ("URL list", &["txt"]) });
+    }
+
+    /// A picker closed with a path: do what it was opened for.
+    pub(super) fn poll_picker(&mut self) {
+        let Some((purpose, path)) = self.picker.poll() else { return };
+        let dir = path.to_string_lossy().into_owned();
+        match purpose {
+            PickFor::AddDir => self.add.dir = dir,
+            PickFor::DownloadDir => self.options.form.dir = dir,
+            PickFor::CategoryDir(name) => {
+                if let Some((_, d)) = self.options.form.folders.iter_mut().find(|(n, _)| *n == name) {
+                    *d = dir;
+                }
+            }
+            PickFor::TempDir => self.options.form.temp = dir,
+            PickFor::Import => self.import_path(&path),
+            PickFor::Export { ef2 } => self.export_list_to(ef2, path),
+            PickFor::ExportFound(urls) => match std::fs::write(&path, reidm_core::grabber::url_list_text(&urls)) {
+                Ok(()) => self.toast(format!("Exported {} URL(s)", urls.len())),
+                Err(e) => self.toast(format!("could not write {}: {e}", path.display())),
+            },
         }
     }
 

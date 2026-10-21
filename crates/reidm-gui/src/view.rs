@@ -160,6 +160,35 @@ impl ViewModel {
     }
 }
 
+/// A move of the keyboard focus through the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nav {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+}
+
+/// Rows a page moves by.
+const PAGE: usize = 10;
+
+/// The row the focus moves to among `len` rows, from row `from` (none yet: the first row, or
+/// the last for End).
+pub fn step(len: usize, from: Option<usize>, nav: Nav) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    Some(match (from, nav) {
+        (_, Nav::Home) => 0,
+        (_, Nav::End) => last,
+        (None, _) => 0,
+        (Some(i), Nav::Up) => i.saturating_sub(1),
+        (Some(i), Nav::PageUp) => i.saturating_sub(PAGE),
+        (Some(i), Nav::Down) => (i + 1).min(last),
+        (Some(i), Nav::PageDown) => (i + PAGE).min(last),
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -198,6 +227,18 @@ pub(crate) mod tests {
         assert_eq!(vm.ids(&s).collect::<Vec<_>>(), vec![2]);
         let s2 = snap(s.items.iter().map(|i| (**i).clone()).collect(), 2);
         assert!(vm.update(&s2, all, " A.MP4 ", SortKey::Name, true), "a new snapshot rebuilds");
+    }
+
+    #[test]
+    fn the_keyboard_walks_the_list_and_stops_at_its_ends() {
+        assert_eq!(step(0, None, Nav::Down), None, "nothing to move to");
+        assert_eq!(step(5, None, Nav::Down), Some(0));
+        assert_eq!(step(5, None, Nav::End), Some(4));
+        assert_eq!(step(5, Some(4), Nav::Down), Some(4));
+        assert_eq!(step(5, Some(0), Nav::Up), Some(0));
+        assert_eq!(step(30, Some(3), Nav::PageDown), Some(13));
+        assert_eq!(step(30, Some(25), Nav::PageDown), Some(29));
+        assert_eq!(step(30, Some(3), Nav::PageUp), Some(0));
     }
 
     #[test]

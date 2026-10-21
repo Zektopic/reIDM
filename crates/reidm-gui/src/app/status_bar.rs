@@ -55,7 +55,7 @@ impl App {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.snap.total_rate > 0.0 {
-                            ui.label(RichText::new(rate_human(self.snap.total_rate)).color(p.accent).size(12.0).strong());
+                            ui.label(RichText::new(rate_human(self.snap.total_rate)).color(p.accent_fg).size(12.0).strong());
                             ui.label(RichText::new("Total rate:").color(p.text_dim).size(12.0));
                             ui.separator();
                         }
@@ -76,9 +76,9 @@ impl App {
                         }
                         if let Some(u) = &self.update {
                             if u.checking {
-                                ui.label(RichText::new("Checking for updates…").color(p.text_dim).size(11.0));
+                                ui.label(RichText::new("Checking for updates…").color(p.text_dim).size(12.0));
                             } else if let Some(e) = &u.error {
-                                ui.label(RichText::new("Update check failed").color(p.warn).size(11.0)).on_hover_text(e);
+                                ui.label(RichText::new("Update check failed").color(p.warn).size(12.0)).on_hover_text(e);
                             }
                         }
                     });

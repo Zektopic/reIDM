@@ -14,6 +14,7 @@ mod icons;
 mod model;
 mod notify;
 mod options;
+mod picker;
 mod playlist;
 mod torrent;
 mod prefs;

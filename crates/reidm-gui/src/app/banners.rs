@@ -34,7 +34,7 @@ impl App {
                     ui.add_space(14.0);
                     ui.label(RichText::new(format!("reIDM {version} is available — you have {}", env!("CARGO_PKG_VERSION"))).color(p.text));
                     if let Some((name, _)) = &asset {
-                        ui.label(RichText::new(format!("({name})")).color(p.text_dim).size(11.0));
+                        ui.label(RichText::new(format!("({name})")).color(p.text_dim).size(12.0));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("Dismiss").clicked() {

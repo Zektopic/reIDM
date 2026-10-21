@@ -25,6 +25,7 @@ impl App {
         self.poll_grab();
         self.poll_refresh();
         self.poll_notifications();
+        self.poll_picker();
         // One check shortly after launch, so a new release is noticed without the user going
         // looking. It is a single GET to api.github.com and reports nothing back to us.
         if !self.checked_on_start && self.snap.connected {

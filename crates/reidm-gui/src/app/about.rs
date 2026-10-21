@@ -3,7 +3,7 @@
 use super::*;
 
 impl App {
-    pub(super) fn about_dialog(&mut self, ctx: &egui::Context) {
+    pub(super) fn about_dialog(&mut self, ctx: &egui::Context, p: &Palette) {
         if !self.about {
             return;
         }
@@ -17,18 +17,18 @@ impl App {
             ui.add_space(8.0);
             if let Some(u) = &self.update {
                 if u.checking {
-                    ui.label(RichText::new("Checking for updates…").color(egui::Color32::from_gray(140)).size(11.0));
+                    ui.label(RichText::new("Checking for updates…").color(p.text_dim).size(12.0));
                 } else if !u.version.is_empty() {
-                    ui.label(RichText::new(format!("Version {} is available.", u.version)).color(egui::Color32::from_rgb(0x2A, 0x84, 0xE0)).size(12.0));
+                    ui.label(RichText::new(format!("Version {} is available.", u.version)).color(p.accent_fg).size(12.0));
                 } else if let Some(e) = &u.error {
-                    ui.label(RichText::new(format!("Update check failed: {e}")).color(egui::Color32::from_rgb(0xB0, 0x6A, 0x00)).size(11.0));
+                    ui.label(RichText::new(format!("Update check failed: {e}")).color(p.warn).size(12.0));
                 }
             }
             if !self.snap.service.version.is_empty() && self.snap.service.version != env!("CARGO_PKG_VERSION") {
-                ui.label(RichText::new(format!("The download service running is version {}; restart it to use this one.", self.snap.service.version)).color(egui::Color32::from_rgb(0xB0, 0x6A, 0x00)).size(11.0));
+                ui.label(RichText::new(format!("The download service running is version {}; restart it to use this one.", self.snap.service.version)).color(p.warn).size(12.0));
             }
             ui.add_space(8.0);
-            ui.label(RichText::new("Not affiliated with, endorsed by, or derived from Tonec Inc.").color(egui::Color32::from_gray(140)).size(11.0));
+            ui.label(RichText::new("Not affiliated with, endorsed by, or derived from Tonec Inc.").color(p.text_dim).size(12.0));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button("Check for updates").clicked() {

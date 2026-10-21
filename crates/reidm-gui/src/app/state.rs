@@ -15,6 +15,17 @@ pub(super) struct UpdateOffer {
     pub(super) error: Option<String>,
 }
 
+/// What a file or folder picker was opened for.
+pub(super) enum PickFor {
+    AddDir,
+    DownloadDir,
+    CategoryDir(&'static str),
+    TempDir,
+    Import,
+    Export { ef2: bool },
+    ExportFound(Vec<String>),
+}
+
 /// The Add URL dialog.
 #[derive(Default)]
 pub(super) struct AddState {

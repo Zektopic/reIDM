@@ -67,6 +67,11 @@ impl App {
                 if show_place {
                     table = table.column(Column::exact(40.0));
                 }
+                if let Some(id) = self.scroll_to.take() {
+                    if let Some(i) = rows.iter().position(|&r| snap.items[r].id == id) {
+                        table = table.scroll_to_row(i, None);
+                    }
+                }
                 let places = &self.vm.places;
                 table
                     .column(Column::initial(300.0).at_least(160.0).clip(true)) // name
@@ -80,6 +85,7 @@ impl App {
                         header.col(|ui| {
                             let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::click());
                             icons::checkbox(ui.painter(), r, header_check, p.accent, p.border);
+                            accessible(ui, &resp, p, egui::WidgetType::Checkbox, "Select all shown", Some(header_check == Some(true)));
                             if resp.clicked() {
                                 toggle_all = true;
                             }
@@ -91,12 +97,19 @@ impl App {
                             header.col(|ui| {
                                 let (rect, resp) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
                                 let sorted = cur == k;
+                                let name = if label == "#" { "Place in the queue" } else { label };
+                                let spoken = match (sorted, desc) {
+                                    (true, false) => format!("{name}, sorted ascending"),
+                                    (true, true) => format!("{name}, sorted descending"),
+                                    _ => format!("Sort by {name}"),
+                                };
+                                accessible(ui, &resp, p, egui::WidgetType::Button, &spoken, None);
                                 ui.painter().text(
                                     rect.left_center() + Vec2::new(2.0, 0.0),
                                     egui::Align2::LEFT_CENTER,
                                     label,
                                     egui::FontId::proportional(12.0),
-                                    if sorted { p.accent } else { p.text },
+                                    if sorted { p.accent_fg } else { p.text },
                                 );
                                 if sorted {
                                     // Painted rather than a glyph: the default font has no
@@ -145,7 +158,11 @@ impl App {
                             row.col(|ui| {
                                 let (r, resp) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::click());
                                 icons::checkbox(ui.painter(), r, Some(is_sel), p.accent, p.border);
+                                accessible(ui, &resp, p, egui::WidgetType::Checkbox, &format!("Select {}", it.file_name()), Some(is_sel));
                                 if resp.clicked() {
+                                    // A click selects; the arrow keys then move through the
+                                    // list, not between the widgets in it.
+                                    resp.surrender_focus();
                                     check_click = Some(id);
                                 }
                             });
@@ -160,6 +177,11 @@ impl App {
                             row.col(|ui| {
                                 let resp = ui.allocate_response(ui.available_size(), egui::Sense::click());
                                 let rect = resp.rect;
+                                let spoken = match it.fraction() {
+                                    Some(f) if it.status != Status::Done => format!("{}, {}, {:.0}%", it.file_name(), it.status.label(), f * 100.0),
+                                    _ => format!("{}, {}", it.file_name(), it.status.label()),
+                                };
+                                accessible(ui, &resp, p, egui::WidgetType::SelectableLabel, &spoken, Some(is_sel));
                                 if is_sel {
                                     ui.painter().rect_filled(rect, 0.0, p.accent.gamma_multiply(0.20));
                                 }
@@ -181,11 +203,12 @@ impl App {
                                         egui::Pos2::new(bar.right(), bar.top() - 1.0),
                                         egui::Align2::RIGHT_BOTTOM,
                                         format!("{:.0}%", f * 100.0),
-                                        egui::FontId::proportional(10.0),
+                                        egui::FontId::proportional(12.0),
                                         p.text_dim,
                                     );
                                 }
                                 if resp.clicked() {
+                                    resp.surrender_focus();
                                     let (c, s) = ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
                                     click = Some((id, c, s));
                                 }
@@ -246,13 +269,13 @@ impl App {
                                     txt = if txt.is_empty() { format!("↑ {}", rate_human(u)) } else { format!("{txt}  ↑ {}", rate_human(u)) };
                                 }
                                 let active = it.status == Status::Running || up.is_some();
-                                ui.label(RichText::new(txt).size(12.0).color(if active { p.accent } else { p.text_dim }));
+                                ui.label(RichText::new(txt).size(12.0).color(if active { p.accent_fg } else { p.text_dim }));
                             });
 
                             // Last Try, as IDM shows it.
                             row.col(|ui| {
                                 let txt = it.last_try.map(|t| since_human(t, now)).unwrap_or_default();
-                                ui.label(RichText::new(txt).size(11.5).color(p.text_dim));
+                                ui.label(RichText::new(txt).size(12.0).color(p.text_dim));
                             });
 
                             row.col(|ui| {
@@ -269,7 +292,7 @@ impl App {
                                     tip.push_str(&format!("\nAdded {}", since_human(it.added, now)));
                                 }
                                 tip.push_str(&format!("\nSaved to {}", it.path.display()));
-                                ui.label(RichText::new(txt).size(11.0).color(col)).on_hover_text(tip);
+                                ui.label(RichText::new(txt).size(12.0).color(col)).on_hover_text(tip);
                             });
                         });
                     });
