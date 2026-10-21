@@ -502,9 +502,16 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 pub fn default_download_dir() -> PathBuf {
-    directories::UserDirs::new()
-        .and_then(|d| d.download_dir().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."))
+    let dirs = directories::UserDirs::new();
+    pick_download_dir(dirs.as_ref().and_then(|d| d.download_dir().map(Path::to_path_buf)), dirs.as_ref().map(|d| d.home_dir().to_path_buf()))
+}
+
+/// The system's Downloads folder; else `Downloads` in the home folder. A minimal Linux install
+/// often has no `user-dirs.dirs`, and then the system names no Downloads folder at all: the
+/// working directory (what this used to fall back to) is wherever the service happened to be
+/// started — `/` for a login item — so downloads landed somewhere nobody would look.
+fn pick_download_dir(system: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    system.or_else(|| home.map(|h| h.join("Downloads"))).unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Windows resolves these to devices whatever the extension, so a download named `NUL` would
@@ -2654,6 +2661,14 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn without_a_system_downloads_folder_downloads_go_to_the_home_folder_s() {
+        let home = PathBuf::from("/home/u");
+        assert_eq!(pick_download_dir(Some("/data/dl".into()), Some(home.clone())), PathBuf::from("/data/dl"));
+        assert_eq!(pick_download_dir(None, Some(home)), PathBuf::from("/home/u/Downloads"));
+        assert_eq!(pick_download_dir(None, None), PathBuf::from("."));
     }
 
     #[test]
