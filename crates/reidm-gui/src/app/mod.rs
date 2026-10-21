@@ -25,6 +25,7 @@ mod state;
 mod status_bar;
 mod table;
 mod toolbar;
+mod welcome;
 mod when_done;
 mod widgets;
 
@@ -316,6 +317,9 @@ impl App {
             self.about = false;
         } else if self.show_grabber {
             self.show_grabber = false;
+        } else if !self.prefs.welcomed {
+            self.prefs.welcomed = true;
+            self.prefs.save();
         } else {
             self.clip_offers.pop_front();
         }
@@ -463,6 +467,7 @@ impl eframe::App for App {
         self.integration_window(&ctx, &p);
         self.complete_window(&ctx, &p);
         self.countdown_window(&ctx, &p);
+        self.welcome_window(&ctx, &p);
         self.clipboard_prompt(&ctx, &p);
         self.drops(&ctx, &p);
 

@@ -169,6 +169,10 @@ impl App {
                             self.show_integration = true;
                             ui.close();
                         }
+                        if ui.button("Welcome…").on_hover_text("Where downloads go, and connecting the browser").clicked() {
+                            self.prefs.welcomed = false;
+                            ui.close();
+                        }
                         if ui.button("Check for updates").clicked() {
                             self.check_for_updates();
                             ui.close();

@@ -22,6 +22,10 @@ Opening the window starts the service if it isn't running.
 
 ![The reIDM window](images/main-window.png)
 
+**The first time** reIDM opens, a short welcome says where downloads go (*Change…* picks another
+folder) and whether the browser extension is connected, with a way to set it up. *Get started*
+or Esc closes it; Help › *Welcome…* shows it again.
+
 **Toolbar.** Add URL · Resume · Stop · Stop All · Delete · Delete Completed · Options · Scheduler ·
 Start Queue · Stop Queue · Site Grabber · Speed Limiter, and a search box that filters the list by
 name or address.

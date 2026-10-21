@@ -24,6 +24,8 @@ pub(super) enum PickFor {
     Import,
     Export { ef2: bool },
     ExportFound(Vec<String>),
+    /// The download folder, from the first-run welcome: saved at once.
+    WelcomeDir,
 }
 
 /// The Add URL dialog.

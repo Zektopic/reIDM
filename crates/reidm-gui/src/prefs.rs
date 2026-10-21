@@ -50,6 +50,10 @@ pub struct Prefs {
     /// The list shows each download's place in the queue.
     #[serde(default)]
     pub queue_column: bool,
+    /// The welcome has been seen (or skipped). A `gui.json` from before it existed means
+    /// reIDM has been used already, so it reads as seen.
+    #[serde(default = "yes")]
+    pub welcomed: bool,
 }
 
 impl Default for Prefs {
@@ -68,6 +72,8 @@ impl Default for Prefs {
             notify_failures: true,
             watch_clipboard: false,
             queue_column: false,
+            // Only when there is no gui.json at all: a first run.
+            welcomed: false,
         }
     }
 }
@@ -121,5 +127,7 @@ mod tests {
         let p = p.migrated();
         assert_eq!((p.on_finish(true), p.on_finish(false)), (OnFinish::Notification, OnFinish::Dialog), "the default follows the tray");
         assert!(!serde_json::to_string(&p).unwrap().contains("notify_complete"), "not written back");
+        assert!(p.welcomed, "someone who used 0.7 doesn't get the first-run welcome");
+        assert!(!Prefs::default().welcomed, "a first run does");
     }
 }

@@ -358,6 +358,11 @@ impl App {
                 }
             }
             PickFor::TempDir => self.options.form.temp = dir,
+            PickFor::WelcomeDir => self.save_settings(serde_json::json!({ "default_dir": dir }), |app, r| {
+                if let Err(e) = r {
+                    app.toast(format!("Could not change the download folder: {e}"));
+                }
+            }),
             PickFor::Import => self.import_path(&path),
             PickFor::Export { ef2 } => self.export_list_to(ef2, path),
             PickFor::ExportFound(urls) => match std::fs::write(&path, reidm_core::grabber::url_list_text(&urls)) {
