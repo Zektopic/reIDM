@@ -1020,7 +1020,17 @@ const MEDIA_MIME = /^(video|audio)\//i;
 const SKIP_MEDIA_HOST = /(^|\.)googlevideo\.com$/i;
 
 /** Counters for DevTools and the browser test: how often the network listeners run. */
-const stats = { sniffed: 0, manifestFetches: 0, statusWrites: 0 };
+const stats = { sniffed: 0, manifestFetches: 0, statusWrites: 0, lastSniffed: [] };
+// Counted for the browser test: how often pages make the network listeners run, and the last
+// few requests they saw (type, tab and address), so a failing check can say which it was. The
+// worker's own requests (tab -1: its pings to reIDM, its manifest fetches) are not a page's cost
+// and are counted elsewhere (`manifestFetches`).
+function sniffed(d) {
+  if (d.tabId < 0) return;
+  stats.sniffed++;
+  stats.lastSniffed.push(`${d.type} tab ${d.tabId} ${d.url}`);
+  if (stats.lastSniffed.length > 8) stats.lastSniffed.shift();
+}
 
 /** tabId -> Map(url -> {url, kind, at, mime?, size?, formats?}) */
 const mediaByTab = new Map();
@@ -1269,7 +1279,7 @@ function noteManifest(tabId, url, extra) {
 }
 
 function onMediaRequest(d) {
-  stats.sniffed++;
+  sniffed(d);
   if (d.tabId < 0 || SKIP_MEDIA_HOST.test(hostOf(d.url))) return;
   if (MANIFEST_EXT.test(d.url)) noteManifest(d.tabId, d.url);
   else if (MEDIA_EXT.test(d.url) && !SEGMENT.test(d.url)) record(d.tabId, d.url, 'media');
@@ -1278,7 +1288,7 @@ function onMediaRequest(d) {
 // Many players fetch media from addresses with no recognisable extension. The response's own
 // Content-Type says what it is, and Content-Length/Content-Range how big.
 function onMediaHeaders(d) {
-  stats.sniffed++;
+  sniffed(d);
   if (d.tabId < 0 || SKIP_MEDIA_HOST.test(hostOf(d.url))) return;
   if (d.statusCode >= 400 || SEGMENT.test(d.url)) return;
   let mime = '';

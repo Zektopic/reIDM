@@ -512,6 +512,14 @@ async function openPage(url) {
   await sleep(1500);
 }
 
+/** Close every test page (the extension's own pages stay), so none of them is still talking. */
+async function closeTestPages() {
+  const { targetInfos } = await cdp.send('Target.getTargets');
+  for (const t of targetInfos) {
+    if (t.type === 'page' && /^https?:\/\/127\.0\.0\.1/.test(t.url)) await cdp.send('Target.closeTarget', { targetId: t.targetId }).catch(() => {});
+  }
+}
+
 async function evalPage(expression) {
   const r = await cdp.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, page);
   return r.result.value;
@@ -884,7 +892,10 @@ async function refreshChecks() {
     const added = await waitFor('other in reIDM', async () => itemFor(await reidmItems(), '/dl/other'));
     const still = (await reidmItems()).find((x) => x.id === b.id);
     check('New download: reIDM adds it, and the waiting download keeps its address', !!added && !!still && still.request.url.endsWith('/files/rfb.zip'), JSON.stringify(still && still.request.url));
-    check('New download: the browser kept nothing', !(await browserDownloads()).some((x) => x.url.includes('/dl/other')));
+    // The worker lets go of the browser's copy after reIDM's answer reaches it, a moment after
+    // reIDM lists the download, so give it that moment.
+    const gone = await waitFor('the browser to let go of it', async () => !(await browserDownloads()).some((x) => x.url.includes('/dl/other')), 10000);
+    check('New download: the browser kept nothing', !!gone, gone ? '' : JSON.stringify((await browserDownloads()).filter((x) => x.url.includes('/dl/other'))));
     await deleteItem(added);
     await noDialog();
   } finally {
@@ -1038,10 +1049,15 @@ async function mediaChecks() {
   const yc = await hookAnswer();
   check('YouTube, a video not seen yet: no other video’s formats, "best" only', !!yc && yc.source === 'youtube' && yc.formats.length === 0 && yc.title === 'Video C' && /v=CCCCCCCCCCC$/.test(yc.page), JSON.stringify(yc));
 
-  // M5: images never reach the network listeners.
+  // M5: images never reach the network listeners. The earlier test pages are still open and
+  // some keep making requests of their own (the video fixtures fetch playlists), so close them
+  // first and count from a quiet browser.
+  await closeTestPages();
+  await sleep(500);
   const sniffed = await inWorker('reidm.stats.sniffed');
   await openPage(`${onRoot()}/busy`);
-  check('a page full of images costs the worker nothing', (await inWorker('reidm.stats.sniffed')) === sniffed, `${(await inWorker('reidm.stats.sniffed')) - sniffed} listener calls`);
+  await sleep(500);
+  check('a page full of images costs the worker nothing', (await inWorker('reidm.stats.sniffed')) === sniffed, `${(await inWorker('reidm.stats.sniffed')) - sniffed} listener calls: ${JSON.stringify(await inWorker('reidm.stats.lastSniffed'))}`);
 
   // M8, M9: with "Look for video and audio" off no page is hooked; inject.js is not reachable.
   check('the page hook runs before the page’s scripts', !(await evalPage('String(window.fetch).includes("[native code]")')));
