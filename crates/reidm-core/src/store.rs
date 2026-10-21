@@ -33,6 +33,13 @@ use std::time::{Duration, Instant};
 const DEBOUNCE: Duration = Duration::from_secs(2);
 /// After a failed save (a full disk, say), how long to wait before trying again.
 const RETRY: Duration = Duration::from_secs(5);
+/// A list so long that saving it takes a while waits longer between saves, so that saving
+/// takes at most about 1/SAVE_SHARE of a core: with 50,000 downloads and one running, saving
+/// every 2 s was most of what the service did. Urgent saves (adds, removals, status changes)
+/// never wait.
+const SAVE_SHARE: u32 = 25;
+/// ...but never longer than this.
+const LONGEST_WAIT: Duration = Duration::from_secs(30);
 
 /// A value shared copy-on-write: cloning it is a pointer copy, and changing it copies the value
 /// only while a save is still holding the old one.
@@ -383,7 +390,8 @@ impl DbCell {
                         continue;
                     }
                     let now = Instant::now();
-                    let mut due = if st.closing || st.urgent { now } else { st.dirty_since.unwrap_or(now) + DEBOUNCE };
+                    let wait = (st.last_took * SAVE_SHARE).clamp(DEBOUNCE, LONGEST_WAIT);
+                    let mut due = if st.closing || st.urgent { now } else { st.dirty_since.unwrap_or(now) + wait };
                     if let Some(r) = st.retry_at.filter(|_| !st.closing) {
                         due = due.max(r);
                     }
@@ -396,8 +404,10 @@ impl DbCell {
                 st.dirty_since = None;
                 st.wanted
             };
+            let started = Instant::now();
             let res = self.write_now();
             let mut st = s.state.lock().unwrap();
+            st.last_took = started.elapsed();
             match res {
                 Ok(()) => {
                     st.written = st.written.max(target);
@@ -445,6 +455,8 @@ struct SaveState {
     retry_at: Option<Instant>,
     error: Option<String>,
     closing: bool,
+    /// How long the last save took, which sets how long the next may wait for company.
+    last_took: Duration,
 }
 
 impl Saver {
@@ -672,6 +684,43 @@ mod tests {
         std::fs::write(sibling(&p, ".bak"), br#"{"n":4}"#).unwrap();
         assert_eq!(load::<V>(&p, "list", &mut w).unwrap(), Some(V { n: 4 }));
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn item(id: u64) -> Item {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "request": { "url": format!("http://h/{id}"), "referer": null, "cookie": null, "user_agent": null, "filename": null, "dir": null },
+            "path": format!("/tmp/{id}"), "size": null, "downloaded": 0, "status": { "state": "Paused" }, "segments": [], "resumable": false
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_record_of_changes_names_each_change_and_forgets_the_oldest() {
+        let d = dir("changes");
+        let rev = Arc::new(AtomicU64::new(1));
+        let cell = DbCell::start(Db::fresh(), d.join("l.json"), rev.clone());
+        cell.lock().unwrap().insert(item(1));
+        let r1 = rev.load(Ordering::SeqCst);
+        assert_eq!(cell.changed_since(1), Some(vec![1]));
+        assert_eq!(cell.changed_since(r1), Some(vec![]));
+        // Looking is not changing.
+        let _ = cell.lock().unwrap().items.get(&1).map(|i| i.id);
+        assert_eq!(rev.load(Ordering::SeqCst), r1);
+        cell.lock().unwrap().items.get_mut(&1).unwrap().downloaded = 5;
+        assert_eq!(cell.changed_since(r1), Some(vec![1]));
+        // More changes than are kept: the oldest are forgotten, and asking about them says so.
+        {
+            let mut db = cell.lock().unwrap();
+            for id in 2..(CHANGES_KEPT as u64 + 10) {
+                db.insert(item(id));
+            }
+        }
+        cell.lock().unwrap().items.get_mut(&1).unwrap().downloaded = 6;
+        assert_eq!(cell.changed_since(r1), None);
+        let now = rev.load(Ordering::SeqCst);
+        cell.lock().unwrap().items.get_mut(&2).unwrap().downloaded = 1;
+        assert_eq!(cell.changed_since(now), Some(vec![2]));
+        cell.close();
     }
 
     #[cfg(unix)]

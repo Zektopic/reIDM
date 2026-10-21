@@ -554,6 +554,92 @@ mod tests {
         assert_eq!(WhenDone::from_name("reboot"), None);
     }
 
+    struct FakeInhibitor {
+        held: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct Held(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Inhibitor for FakeInhibitor {
+        fn hold(&self, _why: &str) -> Result<Hold> {
+            self.held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Hold::new(Held(self.held.clone())))
+        }
+    }
+
+    #[derive(Default)]
+    struct FakePower(std::sync::Mutex<Vec<WhenDone>>);
+
+    impl PowerActions for FakePower {
+        fn act(&self, what: WhenDone) -> Result<()> {
+            self.0.lock().unwrap().push(what);
+            Ok(())
+        }
+    }
+
+    /// The service's side, with the system faked and time paused: a transfer holds the computer
+    /// awake, letting go 30 s after it ends, and the countdown then runs a minute and acts once.
+    #[tokio::test(start_paused = true)]
+    async fn the_service_keeps_the_computer_awake_and_acts_when_all_is_done() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("reidm-power-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = crate::Manager::open(&dir, dir.join("dl"), 2).unwrap();
+        let held = Arc::new(AtomicUsize::new(0));
+        let power = Arc::new(FakePower::default());
+        let exits = Arc::new(AtomicUsize::new(0));
+        let e = exits.clone();
+        m.spawn_power(Arc::new(FakeInhibitor { held: held.clone() }), power.clone(), Arc::new(move || {
+            e.fetch_add(1, Ordering::SeqCst);
+        }));
+        let secs = |n| tokio::time::sleep(Duration::from_secs(n));
+        let transfer = |on: bool| {
+            let mut live = m.0.live.lock().unwrap();
+            if on {
+                live.insert(1, crate::Live::new(0, None, &m.0.rev));
+            } else {
+                live.remove(&1);
+            }
+        };
+
+        m.set_when_done(WhenDone::Sleep);
+        secs(3).await;
+        assert_eq!(held.load(Ordering::SeqCst), 0, "nothing transfers");
+        assert_eq!(m.when_done(), (WhenDone::Sleep, None), "nothing has run: no countdown");
+        transfer(true);
+        secs(2).await;
+        assert_eq!(held.load(Ordering::SeqCst), 1, "held while a download transfers");
+        transfer(false);
+        secs(2).await;
+        assert!(m.when_done().1.is_some(), "the countdown runs");
+        assert_eq!(held.load(Ordering::SeqCst), 1, "still held: the next download may be a moment away");
+        secs(30).await;
+        assert_eq!(held.load(Ordering::SeqCst), 0, "let go 30 s after the last transfer");
+        assert!(power.0.lock().unwrap().is_empty());
+        secs(30).await;
+        assert_eq!(*power.0.lock().unwrap(), [WhenDone::Sleep], "a minute after everything was done");
+        assert_eq!(m.when_done(), (WhenDone::None, None), "once");
+
+        // Keep-awake switched off: no hold. Exit asks the service to stop.
+        m.update_settings(crate::SettingsPatch { keep_awake: Some(false), ..Default::default() }).unwrap();
+        m.set_when_done(WhenDone::Exit);
+        transfer(true);
+        secs(2).await;
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        transfer(false);
+        secs(62).await;
+        assert_eq!(exits.load(Ordering::SeqCst), 1);
+        assert_eq!(power.0.lock().unwrap().len(), 1, "exit is not a system action");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Only the helper's life is checked — with `cat` standing in for `systemd-inhibit`, so
     /// nothing is ever asked of the real power manager.
     #[cfg(unix)]

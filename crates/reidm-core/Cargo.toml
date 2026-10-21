@@ -25,3 +25,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Paused time, so a minute's countdown is tested in no time.
+tokio = { workspace = true, features = ["test-util"] }
