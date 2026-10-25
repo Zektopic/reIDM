@@ -43,16 +43,15 @@ the note explains the wait, and a removal during the move is still honoured afte
 
 **Evidence/tests.** The unit test `names_taken_on_disk_are_skipped_before_the_list_is_locked` pins
 the ordering of candidates; the existing same-name tests (`two_downloads_with_the_same_name_do_not
-_share_a_file` and the destination race in `tests/engine.rs`) still pass. A load test with a
-throw-away service measured 25 s of 10 Hz row polling beside an 8 GiB download, then 30 cycles of
-adding 300 links and purging them: worst rows request 7.8 ms, batch add 5–14 ms, purge 13–22 ms, a
-stalled-server Pause 3.7 ms, deleting a running 8 GiB download 1.5 ms, RSS 10→85 MB, no failures.
-The load test is not committed yet.
+_share_a_file` and the destination race in `tests/engine.rs`) still pass. `tools/stress-test.mjs`
+(run with `--soak 25 --cycles 30 --batch 300`) measured 25 s of 10 Hz row polling beside an 8 GiB
+download, then 30 cycles of adding 300 links and purging them: worst rows request 7.8 ms, batch
+add 5–14 ms, purge 13–22 ms, a stalled-server Pause 3.7 ms, deleting a running 8 GiB download
+1.5 ms, RSS 10→85 MB, no failures.
 
 **Follow-ups.** Torrent calls that wait on librqbit without a timeout (a slow delete or magnet can
 wedge that download's slot); Properties deep-clones its download every frame; a log file for
-support would shorten the next hang report (the competitor review's item 22); commit the load test
-as `tools/stress-test.mjs`.
+support would shorten the next hang report (the competitor review's item 22).
 
 ## 2026-10-26 — A disk-space pause says its shortfall, and the cross-drive test stops depending on free space (0.8.0, PR #10)
 

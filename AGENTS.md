@@ -43,6 +43,17 @@ It downloads from a local server and compares every file byte for byte, kills on
 SIGKILL part way and checks that it resumes intact, and measures speed, CPU per GiB, memory and
 idle cost with a long list. Record the table in the devlog when the numbers move.
 
+The service also has a load test for responsiveness: a large download polled like the window, repeated
+playlist-sized batch adds and purges, and a server that never answers (Linux; ports 61201/61202 and a
+local site on 61290):
+
+```sh
+node tools/stress-test.mjs                     # ~2 GiB download, ten 300-link cycles
+```
+
+It fails if a row poll takes over 2 s, Pause on a silent server over 3 s, a 300-item purge over
+30 s, or memory grows by more than 150 MB over the cycles.
+
 CI installs the **newest stable** Rust, which may be newer than yours, and a new deprecation then
 fails `-D warnings` there first. Before pushing, lint with CI's version as well (it is printed in
 the *Install Rust* step), in its own target folder so your normal build isn't redone:
