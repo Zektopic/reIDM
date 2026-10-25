@@ -149,6 +149,9 @@
 
 ### Improved
 
+* The service keeps a small log in its data folder (`reidm.log`, rotated at 5 MB into
+  `reidm.log.1`), so a hang or a failed download can be looked at afterwards even when the window
+  started it with no terminal. *Troubleshooting › Getting more detail* says where it is.
 * A long list costs far less while something downloads: with 50,000 downloads and one running, the
   service uses about 2–3% of a core instead of about 26%.
 * *Refresh download address* checks the new link before stopping the download.

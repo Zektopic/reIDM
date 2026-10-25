@@ -1,5 +1,6 @@
 mod install;
 mod launch;
+mod logfile;
 mod rows;
 mod web;
 mod session;
@@ -540,12 +541,29 @@ async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool)
     Ok(())
 }
 
+/// Stderr always. The daemon also keeps a small log beside its data, where a hang or a failed
+/// download can be looked at afterwards — started from the window or a login item, it has no
+/// terminal to print to.
+fn init_logging(daemon: bool) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "reidm=info,reidm_core=info".into());
+    if !daemon {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return;
+    }
+    let path = default_data_dir().join("reidm.log");
+    let log = logfile::LogFile::new(path);
+    let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    let file = tracing_subscriber::fmt::layer().with_writer(log).with_ansi(false);
+    tracing_subscriber::registry().with(filter).with(stderr).with(file).init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "reidm=info,reidm_core=info".into()))
-        .init();
-    match Cli::parse().cmd {
+    let cli = Cli::parse();
+    init_logging(matches!(&cli.cmd, Cmd::Daemon { .. }));
+    match cli.cmd {
         Cmd::Daemon { connections, dir, no_idm_port } => run_daemon(connections, dir, no_idm_port).await?,
         Cmd::Get { url, connections, dir, output, referer, cookie } => {
             let data = get_data_dir(&url, dir.as_deref());

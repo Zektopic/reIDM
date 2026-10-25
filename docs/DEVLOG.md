@@ -9,6 +9,29 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — A service log on disk, for the next report (0.8.0, PR #10)
+
+**Context.** The 0.7.0 hang report arrived with no logs: the service was started by the window (or
+a login item), so its `tracing` output had no terminal to go to. A recurrence on Windows or macOS
+would be as hard to diagnose.
+
+**Decision.** The daemon writes the same events to `reidm.log` in its data folder as it prints to
+stderr, through a small `MakeWriter` in `crates/reidm/src/logfile.rs`: opened lazily, 0600 on Unix
+(a log can hold addresses and paths), rotated at 5 MB into `reidm.log.1` (about 10 MB at most). The
+writer holds its lock for a whole event, so lines from different threads never interleave. CLI
+commands keep to stderr: several can run at once, and two processes appending to one file would mix
+their events. If the folder cannot be written, logging falls back to stderr and the daemon still
+starts.
+
+**Alternatives.** `tracing-appender` (rotates by time, not size, and adds a dependency). A log
+viewer in the window (a larger feature; the file can be attached to a report). Unbounded logging
+(rejected: fills disks).
+
+**Evidence/tests.** `logfile.rs`: the file stays at or below the cap, `.1` is kept, a new process
+appends, a missing folder is made on the first event, and the mode is 0600. A live daemon wrote its
+startup lines to `reidm.log` with mode 600. TROUBLESHOOTING's *Getting more detail* now says where
+the file is.
+
 ## 2026-10-26 — Hang report: no folder reads under the list's lock, and a moving note (0.8.0, PR #10)
 
 **Context.** The user reported that 0.7.0 on Windows and macOS freezes after a while — window and
@@ -58,8 +81,7 @@ under that load answered in 67 ms and started the download again. Deleting a vid
 downloads (`deleting_a_running_video_stops_ytdlp_and_removes_its_pieces`) takes its whole yt-dlp
 process group and work folder away at once.
 
-**Follow-ups.** Torrent session setup and `add`/`pause` still call librqbit without a timeout; a log
-file for support would shorten the next hang report (the competitor review's item 22).
+**Follow-ups.** Torrent session setup and `add`/`pause` still call librqbit without a timeout.
 
 ## 2026-10-26 — A disk-space pause says its shortfall, and the cross-drive test stops depending on free space (0.8.0, PR #10)
 

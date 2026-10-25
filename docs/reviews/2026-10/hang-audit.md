@@ -2,9 +2,10 @@
 > destination-folder `exists()` calls under the list lock while adding — is fixed in `c845b50`
 > (names chosen before the lock; a media leftover scan moved out; see the DEVLOG entry of the same
 > date). The restart, Properties and torrent-removal-wait items are also fixed (`313be73`,
-> `43e3f11`, `a955dc4`). The remaining findings are follow-ups: torrent session setup/add/pause
-> without timeouts, synchronous filesystem work left on the runtime in a few capture paths, and a
-> log file for support. Line numbers still refer to `4f36ab1`.
+> `43e3f11`, `a955dc4`), and a service log on disk was added (`crates/reidm/src/logfile.rs`). The
+> remaining findings are follow-ups: torrent session setup/add/pause without timeouts, and
+> synchronous filesystem work left on the runtime in a few capture paths. Line numbers still refer
+> to `4f36ab1`.
 
 # reIDM 0.8.0 (`feature/parity-and-polish`, HEAD 4f36ab1) — hang / stall audit
 

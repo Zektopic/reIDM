@@ -240,7 +240,11 @@ installs them.
 
 ## Getting more detail
 
-- **The service's log.** Stop reIDM and run it in a terminal:
+- **The service's log.** The service keeps one in its data folder as `reidm.log` (next to
+  `downloads.json`; [where](USER_GUIDE.md#where-reidm-keeps-things)), also when it was started by
+  the window and has no terminal. When it reaches 5 MB it becomes `reidm.log.1` and a new one
+  starts, so it never takes more than about 10 MB. Attach it to a hang or a failed-download
+  report. For more detail, stop reIDM and run it in a terminal:
 
   ```sh
   RUST_LOG=reidm=debug,reidm_core=debug reidm daemon
