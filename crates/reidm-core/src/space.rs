@@ -44,10 +44,14 @@ impl Manager {
         self.space_needs(it).into_iter().filter(|(_, need)| *need > 0).find_map(|(dir, need)| {
             let free = self.free_space_at(&dir)?;
             (free < need.saturating_add(keep)).then(|| {
+                // How much *more* free space the drive needs for the download to fit above
+                // the floor — not how many bytes the download still has to write, which with
+                // the size not known yet would read as "needs 1 B more".
+                let short = need.saturating_add(keep).saturating_sub(free);
                 format!(
-                    "not enough space on {}: needs {} more, {} free (reIDM keeps {} free; it carries on by itself when there is room)",
+                    "not enough space on {}: needs {} more free space, {} free (reIDM keeps {} free; it carries on by itself when there is room)",
                     dir.display(),
-                    human(need),
+                    human(short),
                     human(free),
                     human(keep)
                 )

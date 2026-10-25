@@ -310,8 +310,9 @@ not yet written (space already reserved for the part file counts as written), an
 folder's drive for the whole file when it is on another drive (the finished file is copied
 there). When it doesn't fit, the download stops — keeping everything it has — as `Paused` with
 `waiting_for_space: true` and a `note` such as `not enough space on /home/me/Downloads: needs
-1.2 GiB more, 900.0 MiB free (reIDM keeps 200.0 MiB free; it carries on by itself when there is
-room)`. Every 30 s reIDM looks again and starts those that now fit, first in the queue first,
+528.8 MiB more free space, 900.0 MiB free (reIDM keeps 200.0 MiB free; it carries on by itself
+when there is room)`. Every 30 s reIDM looks again and starts those that now fit, first in the
+queue first,
 counting each one started against its drive. Pausing such a download makes it wait for the user
 instead; resuming it checks again at once.
 

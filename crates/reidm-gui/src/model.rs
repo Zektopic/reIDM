@@ -627,8 +627,8 @@ mod tests {
             base.as_object_mut().unwrap().extend(v.as_object().unwrap().clone());
             serde_json::from_value(base).unwrap()
         };
-        let waiting = row(serde_json::json!({ "waiting_for_space": true, "note": "not enough space on /dl: needs 2.0 GB more, 1.0 GB free" }));
-        assert_eq!(waiting.state_text(), ("Waiting for disk space".to_string(), "not enough space on /dl: needs 2.0 GB more, 1.0 GB free".to_string()));
+        let waiting = row(serde_json::json!({ "waiting_for_space": true, "note": "not enough space on /dl: needs 2.0 GB more free space, 1.0 GB free" }));
+        assert_eq!(waiting.state_text(), ("Waiting for disk space".to_string(), "not enough space on /dl: needs 2.0 GB more free space, 1.0 GB free".to_string()));
         assert_eq!(row(serde_json::json!({})).state_text().0, "Paused", "paused by the user");
         let bad = row(serde_json::json!({ "status": { "state": "Failed", "error": "checksum mismatch: expected 00, got 11" } }));
         assert_eq!(bad.state_text().0, "Checksum mismatch");

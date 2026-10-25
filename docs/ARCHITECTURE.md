@@ -168,7 +168,7 @@ and torrents, whose writes reIDM doesn't see), `space.rs` checks that what is st
 fits on its drives above `min_free_space_mib` — space already reserved for the part file counts as
 written, and a download folder on another drive needs the whole file for the final copy. If not,
 the run stops like a Pause (everything written is kept and recorded), the download is `Paused`
-with `waiting_for_space` and a note saying how much it needs, and every 30 s the downloads waiting
+with `waiting_for_space` and a note saying how much more free space it needs, and every 30 s the downloads waiting
 for space that now fit — counted against each drive's free space in queue order — are queued
 again.
 

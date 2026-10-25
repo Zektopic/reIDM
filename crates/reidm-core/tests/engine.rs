@@ -950,7 +950,7 @@ async fn a_download_waits_for_space_and_carries_on_when_there_is_some() {
     let it = m.get(id).unwrap();
     assert_eq!(it.status, Status::Paused);
     assert!(it.note.as_deref().unwrap().starts_with("not enough space on "), "{:?}", it.note);
-    assert!(it.note.as_deref().unwrap().contains("free"));
+    assert!(it.note.as_deref().unwrap().contains("more free space"), "{:?}", it.note);
     // Still no room: it stays.
     assert_eq!(m.retry_waiting_for_space(), 0);
     m.update_settings(SettingsPatch { min_free_space_mib: Some(0), ..Default::default() }).unwrap();

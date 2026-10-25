@@ -19,7 +19,8 @@
 * **Keeps the computer awake** while downloads run (on by default), and lets it sleep again 30 s
   after the last one.
 * **Never fills the disk.** A download pauses, keeping everything, before a drive would drop below
-  200 MiB free, and carries on by itself when there is room. The status bar shows free space.
+  200 MiB free, and carries on by itself when there is room. A paused one says how much more free
+  space it needs, and the status bar shows free space.
 * **Proxy:** the system's (default), none, or an HTTP, HTTPS or SOCKS5 proxy with user name,
   password (never shown again) and exceptions. Videos use it too; torrents through SOCKS5 if asked.
 * **Queue order:** move downloads to the top, up, down or to the bottom (right-click, Ctrl+↑/↓);

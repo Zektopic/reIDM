@@ -2690,6 +2690,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_download_short_of_space_is_told_the_shortfall_not_its_own_size() {
+        // The note is what the window shows on hover. It used to say how many bytes the
+        // download still had to write — "needs 1 B more" while the size was unknown — which
+        // said nothing about the drive being short of the free space kept.
+        let dir = std::env::temp_dir().join(format!("reidm-space-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = Manager::open(&dir.join("data"), dir.join("dl"), 1).unwrap();
+        m.update_settings(SettingsPatch { min_free_space_mib: Some(200), ..Default::default() }).unwrap();
+        let id = m.add_with(Request { url: "http://127.0.0.1:9/f.bin".into(), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap().id;
+        // Every drive reports 100 MiB free; the size is not known yet, so it needs one byte.
+        m.0.faults.free_space.store((100 << 20) + 1, Ordering::SeqCst);
+        let note = m.space_shortage(&m.get(id).unwrap()).expect("short of space");
+        assert!(
+            note.contains("needs 100.0 MiB more free space, 100.0 MiB free (reIDM keeps 200.0 MiB free"),
+            "{note}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_write_never_leaves_counted_bytes_missing() {
         let data: Vec<u8> = (0..4_000_000u32).map(|i| (i % 251) as u8 ^ (i >> 13) as u8).collect();

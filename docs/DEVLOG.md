@@ -9,6 +9,37 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — A disk-space pause says its shortfall, and the cross-drive test stops depending on free space (0.8.0, PR #10)
+
+**Context.** CI on the self-hosted Linux runner failed one test, `a_finished_file_moves_across_drives`:
+it timed out waiting for *Done*. 0.8.0's free-space floor (200 MiB) can never be met on the
+runner's 64 MB `/dev/shm`, which the test uses as the temporary folder to force a
+cross-filesystem move, so the download correctly paused for space. Separately, the pause note
+said "needs 1 B more" while the size was unknown: it printed the bytes still to write, not the
+shortfall against the floor.
+
+**Decision.** The test turns the floor off (`min_free_space_mib: 0`) — it is about moving a
+finished file between drives, not about space policy — and its `wait_until` accepts `Paused`, so
+a pause fails at once with the note instead of after the 90 s timeout. The engine keeps the
+strict floor: silently capping or disabling it on a filesystem smaller than the floor could let
+a small mount (a tmpfs, a small container volume) fill to ENOSPC; pausing with a note and the
+Advanced setting is the safe, explained behaviour. The note now states the shortfall —
+`need + keep - free` — so it reads "needs 100.0 MiB more free space, 100.0 MiB free (reIDM keeps
+200.0 MiB free…)". A completed download's temporary drive counts as needing nothing
+(`unreserved` is 0), so the final move off it is never blocked by that drive's own floor.
+
+**Alternatives.** Disabling or capping the floor per filesystem (rejected: may fill the mount).
+Leaving the note (rejected: it named no actionable number). Deferring the wording to 0.8.1
+(rejected: it is one string, and 0.8.0 ships the note). Naming the volume's total capacity to
+flag a floor that can never fit (left as a follow-up: it needs another disk call, and the free
+and floor figures already show it).
+
+**Evidence/tests.** With a 1 TiB floor the compat test fails in 0.08 s naming the folder, the
+free space and the floor; with floor 0 all four compat tests pass. The new unit test
+`a_download_short_of_space_is_told_the_shortfall_not_its_own_size` pins the arithmetic (100 MiB
+free, 200 MiB floor, size unknown → 100.0 MiB more). The whole workspace's tests pass, and
+clippy with CI's 1.99.1 is clean for Linux and Windows.
+
 ## 2026-10-21 — Measured on imitated machines (0.8.0)
 
 **Context.** The request was for reIDM to be right on "potatoes" and on high-end PCs.
