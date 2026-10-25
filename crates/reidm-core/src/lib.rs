@@ -1520,7 +1520,10 @@ impl Manager {
         if !self.stop_and_wait(id).await {
             bail!("download {id} is still stopping; try again in a moment");
         }
-        self.redownload(id)
+        // `redownload` deletes the old file and part file, which on a slow or synced folder can
+        // take a while: not on the async runtime, whose workers serve every other request.
+        let me = self.clone();
+        tokio::task::spawn_blocking(move || me.redownload(id)).await.map_err(|e| anyhow!("cannot restart download {id}: {e}"))?
     }
 
     /// Stop a download: a running one stops its connections; a queued one stays where it is
