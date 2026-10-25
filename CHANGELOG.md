@@ -70,7 +70,8 @@
   six hours) or the connection drops.
 * The same torrent can't be added twice, whether its magnet link gives the hash in hex or base32 or
   it comes as a `.torrent` from another site. *Start again* on a torrent waits for its old files to
-  be removed first.
+  be removed first, and says so if they are still being removed after 30 s instead of waiting for
+  ever.
 * A video whose title isn't UTF-8 could hang; `reidm update-check` crashed.
 * A partially unpacked ffmpeg was taken for installed.
 * The site grabber's *include* filter keeps links containing any one of the patterns, as documented

@@ -14,6 +14,11 @@ use super::*;
 use librqbit::{AddTorrent, AddTorrentOptions, AddTorrentResponse, ListenerMode, ListenerOptions, Session, SessionOptions, SessionPersistenceConfig};
 use std::num::NonZeroU32;
 
+/// How long a torrent starting again waits for the old copy's removal. Long enough for a large
+/// torrent's files on a slow disk; if it is not done by then, starting would race the removal,
+/// so the start fails with an explanation rather than waiting for ever.
+const FORGET_WAIT: Duration = Duration::from_secs(30);
+
 /// What to download of a torrent; on [`Request::torrent`]. The request's URL is the magnet link,
 /// or the address of the `.torrent` file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -311,13 +316,17 @@ impl Manager {
     /// Wait until every torrent this manager is taking out of its session is gone. A torrent
     /// started again ("Start again", or a re-add after Remove) must not find the old one still
     /// there: it would carry on with that handle, whose files the pending removal then deletes
-    /// from under it.
-    async fn forgotten(&self) {
+    /// from under it. False when one is still being removed after [`FORGET_WAIT`].
+    async fn forgotten(&self) -> bool {
         let pending: Vec<tokio::sync::watch::Receiver<bool>> = FORGETTING.lock().unwrap().get(&self.manager_key()).cloned().unwrap_or_default();
+        let deadline = tokio::time::Instant::now() + FORGET_WAIT;
         for mut rx in pending {
             // An error means the removal's task ended (it was the last sender): done as well.
-            let _ = rx.wait_for(|done| *done).await;
+            if tokio::time::timeout_at(deadline, rx.wait_for(|done| *done)).await.is_err() {
+                return false;
+            }
         }
+        true
     }
 
     /// Download a torrent. Ok(true) when complete (it then goes on seeding, if it should),
@@ -325,7 +334,9 @@ impl Manager {
     pub(crate) async fn run_torrent(&self, id: u64, live: Live, item: Item) -> Result<bool> {
         self.set_note(id, Some("starting BitTorrent"));
         let s = self.session().await?;
-        self.forgotten().await;
+        if !self.forgotten().await {
+            bail!("the old copy of this torrent is still being removed; try again in a moment");
+        }
 
         let known = item.torrent.as_ref().and_then(|t| Self::handle(&s, &t.info_hash));
         let handle = match known {
