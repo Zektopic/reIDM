@@ -42,12 +42,16 @@ after it appeared). Making the cross-drive copy cancellable (a chunked copy — 
 the note explains the wait, and a removal during the move is still honoured afterwards).
 
 **Evidence/tests.** The unit test `names_taken_on_disk_are_skipped_before_the_list_is_locked` pins
-the ordering of candidates; the existing same-name tests (`two_downloads_with_the_same_name_do_not
-_share_a_file` and the destination race in `tests/engine.rs`) still pass. `tools/stress-test.mjs`
-(run with `--soak 25 --cycles 30 --batch 300`) measured 25 s of 10 Hz row polling beside an 8 GiB
-download, then 30 cycles of adding 300 links and purging them: worst rows request 7.8 ms, batch
-add 5–14 ms, purge 13–22 ms, a stalled-server Pause 3.7 ms, deleting a running 8 GiB download
-1.5 ms, RSS 10→85 MB, no failures.
+the ordering of candidates, and `many_links_with_one_name_get_one_name_each` the fallback past the
+eight; the existing same-name tests (`two_downloads_with_the_same_name_do_not_share_a_file` and the
+destination race in `tests/engine.rs`) still pass. `tools/stress-test.mjs` (run with `--soak 25
+--cycles 30 --batch 300`) measured 25 s of 10 Hz row polling beside an 8 GiB download, then 30
+cycles of adding 300 links and purging them: worst rows request 7.8 ms, batch add 5–14 ms, purge
+13–22 ms, a stalled-server Pause 3.7 ms, deleting a running 8 GiB download 1.5 ms, RSS 10→85 MB,
+no failures. On the imitated machines (`--profile potato` / `laptop`), half a core and 256 MB kept
+the worst poll at 8.9 ms and Pause at 3.1 ms; two cores and 1 GB, 6.7 ms and 3.0 ms. Deleting a
+video while it downloads (`deleting_a_running_video_stops_ytdlp_and_removes_its_pieces`) takes its
+whole yt-dlp process group and work folder away at once.
 
 **Follow-ups.** Torrent calls that wait on librqbit without a timeout (a slow delete or magnet can
 wedge that download's slot); Properties deep-clones its download every frame; a log file for

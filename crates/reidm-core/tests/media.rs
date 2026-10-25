@@ -142,6 +142,28 @@ async fn stopping_a_video_stops_ytdlp_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_running_video_stops_ytdlp_and_removes_its_pieces() {
+    // A playlist item deleted while it downloads: the run must stop yt-dlp (the whole process
+    // group), leave no pieces behind, and answer at once — the delete that used to hang.
+    let (m, dl, tools) = setup("remove", "slow");
+    let state = tools.parent().unwrap().to_path_buf();
+    let id = m.add(video(&dl, "18")).unwrap();
+    wait_for(&m, id, |_| m.get(id).is_some_and(|i| i.downloaded > 0)).await;
+    let work = state.join("parts").join(format!("video-{id}"));
+    assert!(work.exists(), "the work folder is there while it downloads");
+    let asked = Instant::now();
+    m.remove(id, true);
+    let end = Instant::now() + Duration::from_secs(5);
+    while work.exists() {
+        assert!(Instant::now() < end, "the work folder outlived the delete by 5 s");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(asked.elapsed() < Duration::from_secs(5), "took {:?}", asked.elapsed());
+    assert!(m.get(id).is_none(), "off the list");
+    assert!(std::fs::read_dir(&dl).unwrap().next().is_none(), "nothing left in the download folder");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn one_page_in_two_formats_is_two_downloads() {
     let (m, dl, _) = setup("dupes", "slow");
     let a = m.add_detailed(video(&dl, "18")).unwrap();
