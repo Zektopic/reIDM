@@ -1534,7 +1534,10 @@ mod tests {
         // The next video doesn't ask again (for an hour), and doesn't wait.
         let t = Instant::now();
         ytdlp_from(&http, &d, &repo).await.unwrap();
-        assert!(t.elapsed() < Duration::from_millis(500), "took {:?}", t.elapsed());
+        // Two seconds, not 500 ms: a loaded CI machine can take that long just to schedule the
+        // check. What matters is that it does not wait for the hour's back-off, and that the
+        // server hears nothing more.
+        assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
         assert_eq!(hits.load(Ordering::SeqCst), asked, "no second check");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1553,7 +1556,9 @@ mod tests {
         let asked = hits.load(Ordering::SeqCst);
         let t = Instant::now();
         let e = ytdlp_from(&http, &d, &repo).await.unwrap_err();
-        assert!(t.elapsed() < Duration::from_millis(500));
+        // See the test above: scheduling on a busy CI machine, not the remembered failure,
+        // sets the pace here.
+        assert!(t.elapsed() < Duration::from_secs(2), "took {:?}", t.elapsed());
         assert_eq!(hits.load(Ordering::SeqCst), asked, "no second attempt so soon");
         assert!(format!("{e:#}").contains("tries again"), "{e:#}");
     }
