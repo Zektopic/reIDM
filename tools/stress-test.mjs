@@ -191,7 +191,22 @@ try {
   record(`soak ${SOAK}s`, soakStats);
   check('no rows request over 2 s while soaking', soakStats.max < 2000, `${soakStats.max.toFixed(0)} ms`);
 
-  // 2. Cycles of a playlist-sized batch: one batch add, wait for all done, one bulk purge,
+  // 2. Restart it: the old part file is deleted on the blocking pool, so the answer must come
+  // back promptly and the download must start again by itself.
+  const tRestart = performance.now();
+  await api('POST', `/api/downloads/${bigId}/restart`, undefined, 30000);
+  const restartMs = performance.now() - tRestart;
+  let restartState = null;
+  for (let i = 0; i < 100; i++) {
+    restartState = (await api('GET', `/api/downloads/${bigId}`)).body.status.state;
+    if (['Running', 'Queued'].includes(restartState)) break;
+    await sleep(50);
+  }
+  record('restart the big download', { restartMs, state: restartState });
+  check('restart answers within 5 s', restartMs < 5000, `${restartMs.toFixed(0)} ms`);
+  check('the big download started again', ['Running', 'Queued'].includes(restartState), restartState);
+
+  // 3. Cycles of a playlist-sized batch: one batch add, wait for all done, one bulk purge,
   // while the large download is still running and the window keeps polling.
   let firstPurge = 0, lastPurge = 0, lastRss = 0;
   for (let c = 1; c <= CYCLES; c++) {
@@ -224,12 +239,12 @@ try {
   record('memory', { rssStart: before.rss, rssNow: lastRss, growthMB: lastRss - before.rss });
   check('memory growth under 150 MB', lastRss - before.rss < 150, `${(lastRss - before.rss).toFixed(0)} MB`);
 
-  // 3. The large download's own progress is not stalled by the cycles.
+  // 4. The large download's own progress is not stalled by the cycles.
   const bigNow = await api('GET', `/api/downloads/${bigId}`);
   record('big download after cycles', { state: bigNow.body.status.state, doneMiB: bigNow.body.downloaded / MiB });
-  check('the large download progressed', bigNow.body.downloaded > 64 * MiB, `${(bigNow.body.downloaded / MiB).toFixed(0)} MiB`);
+  check('the large download progressed after the restart', bigNow.body.downloaded > 16 * MiB, `${(bigNow.body.downloaded / MiB).toFixed(0)} MiB`);
 
-  // 4. A server that never answers: Pause and delete must not wait for it.
+  // 5. A server that never answers: Pause and delete must not wait for it.
   const hangAdd = await api('POST', '/api/downloads', { url: `http://127.0.0.1:${SITE}/hang.bin` });
   const hangId = hangAdd.body.id;
   await sleep(2000);
@@ -251,7 +266,7 @@ try {
   record('delete a stalled download', { deleteMs: delMs });
   check('delete answers at once', delMs < 3000, `${delMs.toFixed(0)} ms`);
 
-  // 5. Clean up the large download too (it is still running).
+  // 6. Clean up the large download too (it is still running).
   const t2 = performance.now();
   await api('DELETE', `/api/downloads/${bigId}?purge=true`, undefined, 30000);
   record('delete a running large download', { deleteMs: performance.now() - t2 });

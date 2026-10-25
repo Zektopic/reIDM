@@ -53,9 +53,10 @@ destination race in `tests/engine.rs`) still pass. `tools/stress-test.mjs` (run 
 cycles of adding 300 links and purging them: worst rows request 7.8 ms, batch add 5–14 ms, purge
 13–22 ms, a stalled-server Pause 3.7 ms, deleting a running 8 GiB download 1.5 ms, RSS 10→85 MB,
 no failures. On the imitated machines (`--profile potato` / `laptop`), half a core and 256 MB kept
-the worst poll at 8.9 ms and Pause at 3.1 ms; two cores and 1 GB, 6.7 ms and 3.0 ms. Deleting a
-video while it downloads (`deleting_a_running_video_stops_ytdlp_and_removes_its_pieces`) takes its
-whole yt-dlp process group and work folder away at once.
+the worst poll at 8.9 ms and Pause at 3.1 ms; two cores and 1 GB, 6.7 ms and 3.0 ms. A restart
+under that load answered in 67 ms and started the download again. Deleting a video while it
+downloads (`deleting_a_running_video_stops_ytdlp_and_removes_its_pieces`) takes its whole yt-dlp
+process group and work folder away at once.
 
 **Follow-ups.** Torrent session setup and `add`/`pause` still call librqbit without a timeout; a log
 file for support would shorten the next hang report (the competitor review's item 22).

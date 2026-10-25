@@ -43,9 +43,9 @@ It downloads from a local server and compares every file byte for byte, kills on
 SIGKILL part way and checks that it resumes intact, and measures speed, CPU per GiB, memory and
 idle cost with a long list. Record the table in the devlog when the numbers move.
 
-The service also has a load test for responsiveness: a large download polled like the window, repeated
-playlist-sized batch adds and purges, and a server that never answers (Linux; ports 61201/61202 and a
-local site on 61290):
+The service also has a load test for responsiveness: a large download polled like the window and
+restarted, repeated playlist-sized batch adds and purges, and a server that never answers (Linux;
+ports 61201/61202 and a local site on 61290):
 
 ```sh
 node tools/stress-test.mjs                     # ~2 GiB download, ten 300-link cycles
