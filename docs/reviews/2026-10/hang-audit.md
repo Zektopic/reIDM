@@ -4,9 +4,9 @@
 > date). The restart, Properties and torrent-removal-wait items are also fixed (`313be73`,
 > `43e3f11`, `a955dc4`), and a service log on disk was added (`crates/reidm/src/logfile.rs`).
 > The browser-capture paths (the WebSocket add, `/ext/add?verify`) now queue downloads on the
-> blocking pool too. The remaining findings are follow-ups: torrent session setup/add/pause without
-> timeouts, and small metadata/tool filesystem reads and writes in torrent/media setup that still
-> run on the runtime. Line numbers still refer to `4f36ab1`.
+> blocking pool too. Torrent folder placement reads the folder before the lock, and every torrent
+> engine call is bounded at two minutes. The remaining findings are follow-ups: a few small
+> synchronous reads and writes in media tool setup. Line numbers still refer to `4f36ab1`.
 
 # reIDM 0.8.0 (`feature/parity-and-polish`, HEAD 4f36ab1) — hang / stall audit
 

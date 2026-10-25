@@ -71,7 +71,8 @@
 * The same torrent can't be added twice, whether its magnet link gives the hash in hex or base32 or
   it comes as a `.torrent` from another site. *Start again* on a torrent waits for its old files to
   be removed first, and says so if they are still being removed after 30 s instead of waiting for
-  ever.
+  ever. Starting, pausing, stopping or removing a torrent that the torrent engine does not answer
+  fails with an explanation after two minutes instead of keeping the download's slot for ever.
 * A video whose title isn't UTF-8 could hang; `reidm update-check` crashed.
 * A partially unpacked ffmpeg was taken for installed.
 * The site grabber's *include* filter keeps links containing any one of the patterns, as documented
@@ -96,6 +97,7 @@
   Quitting saves the list first. Problems with the list's storage show as a banner.
 * Adding a playlist or a large batch no longer stalls on a slow or synced download folder
   (OneDrive, iCloud, a network share): names are checked before the service takes the list's lock.
+  A torrent's folder is chosen the same way.
 * A finished download being copied to another drive says *moving the finished file to the download
   folder* instead of sitting at 100% with no explanation.
 * Properties no longer re-copies the whole download — its segments, a torrent's hundreds of files —

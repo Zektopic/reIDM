@@ -19,6 +19,10 @@ use std::num::NonZeroU32;
 /// so the start fails with an explanation rather than waiting for ever.
 const FORGET_WAIT: Duration = Duration::from_secs(30);
 
+/// How long the engine may take to start, add, pause or stop a torrent before the download says
+/// so instead of waiting for ever. Generous: a large torrent's files can take a while to check.
+const OP_WAIT: Duration = Duration::from_secs(120);
+
 /// What to download of a torrent; on [`Request::torrent`]. The request's URL is the magnet link,
 /// or the address of the `.torrent` file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -201,11 +205,10 @@ impl Manager {
 
     /// The torrent session, started the first time a torrent needs it.
     pub(crate) async fn session(&self) -> Result<Arc<Session>> {
-        let s = self
+        let init = self
             .0
             .torrents
-            .get_or_try_init(|| async {
-                let settings = self.settings();
+            .get_or_try_init(|| async {                let settings = self.settings();
                 let dir = self.data_dir().join("torrents");
                 std::fs::create_dir_all(&dir)?;
                 let dht = || librqbit::DhtSessionConfig {
@@ -247,8 +250,13 @@ impl Manager {
                 let me = Arc::downgrade(&self.0);
                 tokio::spawn(async move { share_the_limit(me).await });
                 anyhow::Ok(session)
-            })
-            .await?;
+            });
+        // Nothing else in reIDM can cancel this; without a limit a network stack that never
+        // finishes starting would keep every torrent (and the API calls waiting on them) stuck.
+        // The cell is left unset, so the next try starts again.
+        let s = tokio::time::timeout(OP_WAIT, init)
+            .await
+            .map_err(|_| anyhow!("the torrent engine did not start within {}s", OP_WAIT.as_secs()))??;
         Ok(s.clone())
     }
 
@@ -265,12 +273,12 @@ impl Manager {
                 }
                 Some((Status::Done, true)) => {
                     if h.is_paused() {
-                        let _ = s.unpause(&h).await;
+                        let _ = bounded(s.unpause(&h)).await;
                     }
                 }
                 Some(_) => {
                     if !h.is_paused() {
-                        let _ = s.pause(&h).await;
+                        let _ = bounded(s.pause(&h)).await;
                     }
                 }
             }
@@ -343,7 +351,7 @@ impl Manager {
             // One that failed (its disk filled, say) is added again over its files: the engine
             // would otherwise reopen them under the rules it was first added with.
             Some(h) if matches!(h.stats().state, librqbit::TorrentStatsState::Error) => {
-                let _ = s.delete(librqbit::api::TorrentIdOrHash::Id(h.id()), false).await;
+                let _ = bounded(s.delete(librqbit::api::TorrentIdOrHash::Id(h.id()), false)).await;
                 match self.add_to_session(id, &live, &s, &item).await? {
                     Some(h) => h,
                     None => return Ok(false),
@@ -351,7 +359,7 @@ impl Manager {
             }
             Some(h) => {
                 if h.is_paused() {
-                    s.unpause(&h).await?;
+                    bounded(s.unpause(&h)).await?;
                 }
                 h
             }
@@ -374,7 +382,7 @@ impl Manager {
                 }
             }
             if live.cancel.load(Ordering::SeqCst) {
-                let _ = s.pause(&handle).await;
+                let _ = bounded(s.pause(&handle)).await;
                 if let Some(t) = self.0.db.lock().unwrap().items.get_mut(&id).and_then(|i| i.torrent.as_mut()) {
                     t.peers = 0;
                 }
@@ -389,7 +397,7 @@ impl Manager {
             // checking its files leaves it paused once the check ends, after the unpause above
             // has already looked. So: whenever it is found paused, start it again.
             if matches!(st.state, librqbit::TorrentStatsState::Paused) {
-                s.unpause(&handle).await?;
+                bounded(s.unpause(&handle)).await?;
             }
             self.record(id, &st);
             live.progress.store(st.progress_bytes, Ordering::Relaxed);
@@ -403,7 +411,7 @@ impl Manager {
                 // 0: not at all; above 0: until that ratio; below 0: for as long as reIDM runs.
                 let seed = self.0.settings.lock().unwrap().seed_ratio != 0.0;
                 if !seed {
-                    let _ = s.pause(&handle).await;
+                    let _ = bounded(s.pause(&handle)).await;
                 }
                 if let Some(t) = self.0.db.lock().unwrap().items.get_mut(&id).and_then(|i| i.torrent.as_mut()) {
                     t.seeding = seed;
@@ -441,7 +449,10 @@ impl Manager {
         // Its description first. A magnet link's comes from peers, which can take a while; it
         // is then kept as a .torrent, so this is asked of them only once.
         let bytes = match &req.file {
-            Some(f) => Some(read_torrent_file(f)?),
+            Some(f) => {
+                let f = f.clone();
+                Some(tokio::task::spawn_blocking(move || read_torrent_file(&f)).await.map_err(|e| anyhow!("cannot read the torrent file: {e}"))??)
+            }
             None if url.to_ascii_lowercase().starts_with("magnet:") => None,
             None => {
                 self.set_note(id, Some("reading the torrent"));
@@ -455,9 +466,10 @@ impl Manager {
                 AddTorrent::from_url(url.to_string())
             }
         };
-        let describe = s.add_torrent(add, Some(AddTorrentOptions { list_only: true, initial_peers: (!peers.is_empty()).then(|| peers.clone()), ..Default::default() }));
+        let describe = tokio::time::timeout(OP_WAIT, s.add_torrent(add, Some(AddTorrentOptions { list_only: true, initial_peers: (!peers.is_empty()).then(|| peers.clone()), ..Default::default() })));
         let Some(described) = unless_stopped(&live.cancel, describe).await else { return Ok(None) };
-        let AddTorrentResponse::ListOnly(l) = described? else { bail!("the torrent could not be read") };
+        let described = described.map_err(|_| anyhow!("the torrent engine did not answer within {}s", OP_WAIT.as_secs()))??;
+        let AddTorrentResponse::ListOnly(l) = described else { bail!("the torrent could not be read") };
         let hash = hash_hex(&l.info_hash);
         let bytes = l.torrent_bytes.to_vec();
 
@@ -471,7 +483,10 @@ impl Manager {
 
         let file = match &req.file {
             Some(f) => f.clone(),
-            None => self.keep_torrent_file(&hash, &bytes)?,
+            None => {
+                let (me, h, b) = (self.clone(), hash.clone(), bytes.clone());
+                tokio::task::spawn_blocking(move || me.keep_torrent_file(&h, &b)).await.map_err(|e| anyhow!("cannot keep the torrent file: {e}"))??
+            }
         };
         let name = l.info.name().map(|n| n.to_string()).unwrap_or_default();
         let details: Vec<(PathBuf, u64)> = l.info.iter_file_details().map(|f| (f.filename.to_pathbuf(), f.len)).collect();
@@ -484,11 +499,27 @@ impl Manager {
 
         // Where: recorded, and saved, before the engine creates a single file — so that from
         // then on the files there are known to be this torrent's own.
+        //
+        // The folder is read here, before the list is locked (see `free_names`): a stat on a
+        // slow or synced folder must not hold up the window and every other download.
+        let dir = {
+            let db = self.0.db.lock().unwrap();
+            db.items.get(&id).context("the download was removed")?.path.parent().context("download has no folder")?.to_path_buf()
+        };
+        let safe = sanitize_filename(if name.is_empty() { hash.as_str() } else { name.as_str() });
+        let stem = Path::new(&safe).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or(&safe).to_string();
+        let (file_free, folders) = match details.as_slice() {
+            [(file, _)] => {
+                let path = dir.join(file);
+                (!path.exists(), free_names(&dir, &stem, 8))
+            }
+            _ => (false, free_names(&dir, &safe, 8)),
+        };
         let target = {
             let mut db = self.0.db.lock().unwrap();
             let claimed: HashSet<PathBuf> = db.items.values().filter(|i| i.id != id).map(|i| i.path.clone()).collect();
             let it = db.items.get_mut(&id).context("the download was removed")?;
-            let target = choose_target(it, &hash, &name, &details, &claimed)?;
+            let target = choose_target(it, &hash, &name, &details, &claimed, file_free, &folders)?;
             it.path = target.path.clone();
             if let Some(r) = it.request.torrent.as_mut() {
                 r.file = Some(file);
@@ -501,7 +532,7 @@ impl Manager {
             target
         };
         self.save();
-        std::fs::create_dir_all(&target.folder)?;
+        tokio::fs::create_dir_all(&target.folder).await?;
 
         let opts = AddTorrentOptions {
             output_folder: Some(target.folder.to_string_lossy().into_owned()),
@@ -514,8 +545,9 @@ impl Manager {
             ratelimits: librqbit::limits::LimitsConfig { upload_bps: None, download_bps: limit(item.speed_limit.unwrap_or(0)) },
             ..Default::default()
         };
-        let adding = s.add_torrent(AddTorrent::from_bytes(bytes), Some(opts));
+        let adding = tokio::time::timeout(OP_WAIT, s.add_torrent(AddTorrent::from_bytes(bytes), Some(opts)));
         let Some(added) = unless_stopped(&live.cancel, adding).await else { return Ok(None) };
+        let added = added.map_err(|_| anyhow!("the torrent engine did not answer within {}s", OP_WAIT.as_secs()))?;
         let added = added.map_err(|e| {
             if format!("{e:#}").contains("allow_overwrite") {
                 anyhow!("a file this torrent would create already exists in {}; reIDM won't write over it. Move it away and resume", target.folder.display())
@@ -571,14 +603,14 @@ impl Manager {
                 };
                 let folder = t.folder.clone().or_else(|| it.path.parent().map(Path::to_path_buf)).context("no folder")?;
                 let opts = AddTorrentOptions { output_folder: Some(folder.to_string_lossy().into_owned()), only_files: req.files.clone(), overwrite: true, ..Default::default() };
-                s.add_torrent(add, Some(opts)).await?.into_handle().context("the torrent could not be added")?
+                bounded(s.add_torrent(add, Some(opts))).await?.into_handle().context("the torrent could not be added")?
             }
             None => return Ok(()),
         };
         if on {
-            s.unpause(&h).await?;
+            bounded(s.unpause(&h)).await?;
         } else {
-            s.pause(&h).await?;
+            bounded(s.pause(&h)).await?;
         }
         if let Some(t) = self.0.db.lock().unwrap().items.get_mut(&id).and_then(|i| i.torrent.as_mut()) {
             t.seeding = on;
@@ -605,7 +637,7 @@ impl Manager {
         tokio::spawn(async move {
             if Self::handle(&s, &hash).is_some() {
                 let id = librqbit::api::TorrentIdOrHash::Hash(librqbit::dht::Id20::from_str(&hash).unwrap_or_default());
-                if let Err(e) = s.delete(id, delete_files).await {
+                if let Err(e) = bounded(s.delete(id, delete_files)).await {
                     tracing::warn!("could not remove torrent {hash}: {e:#}");
                 }
             }
@@ -638,7 +670,15 @@ impl Manager {
 /// or the user's own: a torrent of several files gets a folder of its own named after it
 /// (`Name (1)` when `Name` is taken), and a torrent of one file goes into the download's folder,
 /// or, when a file of that name is already there, into a folder of its own beside it.
-fn choose_target(it: &Item, hash: &str, name: &str, details: &[(PathBuf, u64)], claimed: &HashSet<PathBuf>) -> Result<Target> {
+fn choose_target(
+    it: &Item,
+    hash: &str,
+    name: &str,
+    details: &[(PathBuf, u64)],
+    claimed: &HashSet<PathBuf>,
+    file_free: bool,
+    folders: &[PathBuf],
+) -> Result<Target> {
     if let Some(t) = it.torrent.as_ref().filter(|t| t.info_hash == hash) {
         // Begun by reIDM 0.7.0, which recorded no folder: its files are beside its path.
         let folder = t.folder.clone().or_else(|| it.path.parent().map(Path::to_path_buf)).context("download has no folder")?;
@@ -650,15 +690,15 @@ fn choose_target(it: &Item, hash: &str, name: &str, details: &[(PathBuf, u64)], 
     match details {
         [(file, _)] => {
             let path = dir.join(file);
-            if !path.exists() && !taken(&path) {
+            if file_free && !taken(&path) {
                 return Ok(Target { folder: dir, path, resuming: false });
             }
             let stem = Path::new(&safe_name).file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).unwrap_or(&safe_name).to_string();
-            let folder = unique_path(&dir, &stem, taken);
+            let folder = folders.iter().find(|f| !taken(f)).cloned().unwrap_or_else(|| unique_path(&dir, &stem, taken));
             Ok(Target { path: folder.join(file), folder, resuming: false })
         }
         _ => {
-            let folder = unique_path(&dir, &safe_name, taken);
+            let folder = folders.iter().find(|f| !taken(f)).cloned().unwrap_or_else(|| unique_path(&dir, &safe_name, taken));
             Ok(Target { path: folder.clone(), folder, resuming: false })
         }
     }
@@ -704,7 +744,7 @@ async fn watch_seeding(me: std::sync::Weak<Inner>) {
             changed |= m.record(id, &st);
             let reached = ratio >= 0.0 && st.total_bytes > 0 && st.uploaded_bytes as f64 >= ratio * st.total_bytes as f64;
             if reached {
-                let _ = s.pause(&h).await;
+                let _ = bounded(s.pause(&h)).await;
                 if let Some(t) = m.0.db.lock().unwrap().items.get_mut(&id).and_then(|i| i.torrent.as_mut()) {
                     t.seeding = false;
                     t.peers = 0;
@@ -755,6 +795,15 @@ async fn unless_stopped<T>(cancel: &AtomicBool, fut: impl std::future::Future<Ou
         v = fut => Some(v),
         _ = async { while !cancel.load(Ordering::SeqCst) { tokio::time::sleep(Duration::from_millis(100)).await } } => None,
     }
+}
+
+/// Run an engine call, but an engine that never answers becomes an error instead of a download
+/// (and a slot, and the API calls waiting on it) stuck for ever.
+async fn bounded<T, E: Into<anyhow::Error>>(fut: impl std::future::Future<Output = std::result::Result<T, E>>) -> Result<T> {
+    tokio::time::timeout(OP_WAIT, fut)
+        .await
+        .map_err(|_| anyhow!("the torrent engine did not answer within {}s", OP_WAIT.as_secs()))?
+        .map_err(Into::into)
 }
 
 /// A magnet link's info hash, the way the list knows it: 40 lower-case hex digits. Magnet links
