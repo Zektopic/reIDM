@@ -2863,6 +2863,26 @@ mod tests {
     }
 
     #[test]
+    fn many_links_with_one_name_get_one_name_each() {
+        // Only eight names are checked before the list is locked. A batch larger than that
+        // falls back to choosing under the lock, and must still give every download its own
+        // name.
+        let dir = std::env::temp_dir().join(format!("reidm-many-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = Manager::open(&dir.join("data"), dir.join("dl"), 2).unwrap();
+        let reqs: Vec<Request> = (0..12)
+            .map(|i| Request { url: format!("http://127.0.0.1:9/f{i}.bin"), filename: Some("report.pdf".into()), ..Default::default() })
+            .collect();
+        let out = m.add_many_with(reqs, AddOptions { later: true, ..Default::default() });
+        let paths: Vec<PathBuf> = out.iter().filter_map(|(_, r)| r.as_ref().ok()).map(|o| m.get(o.id).unwrap().path.clone()).collect();
+        assert_eq!(paths.len(), 12, "{out:?}");
+        let unique: HashSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(unique.len(), 12, "{paths:?}");
+        assert_eq!(paths[0].file_name().unwrap(), "report.pdf");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn disposition() {
         assert_eq!(filename_from_disposition("attachment; filename=\"a b.zip\"").as_deref(), Some("a b.zip"));
         assert_eq!(filename_from_disposition("attachment; filename*=UTF-8''%E2%82%AC.txt").as_deref(), Some("€.txt"));
