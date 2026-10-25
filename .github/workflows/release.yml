@@ -45,7 +45,12 @@ jobs:
         shell: pwsh
         run: |
           # A manual run on a branch builds a test installer; only tags are versioned releases.
-          $v = "${{ github.ref_name }}".TrimStart("v"); if ("${{ github.ref_type }}" -ne "tag") { $v = "0.0.0" }
+          # Name the test build after the workspace version, as the macOS job does.
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          if ("${{ github.ref_type }}" -ne "tag") {
+            $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"$' | Select-Object -First 1).Matches[0].Groups[1].Value
+            $v = "$ver-dev"
+          }
           $iscc = Get-Command iscc -ErrorAction SilentlyContinue
           if (-not $iscc) { choco install innosetup -y --no-progress; $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" } else { $iscc = $iscc.Source }
           & $iscc "/DAppVersion=$v" packaging\windows\reidm.iss
