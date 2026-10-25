@@ -82,7 +82,10 @@ no failures. On the imitated machines (`--profile potato` / `laptop`), half a co
 the worst poll at 8.9 ms and Pause at 3.1 ms; two cores and 1 GB, 6.7 ms and 3.0 ms. A restart
 under that load answered in 67 ms and started the download again. Deleting a video while it
 downloads (`deleting_a_running_video_stops_ytdlp_and_removes_its_pieces`) takes its whole yt-dlp
-process group and work folder away at once.
+process group and work folder away at once. `tools/api-test.mjs` runs 27 checks through the live
+API and CLI: checksums (right and wrong), an HTTP proxy end to end, queue order and moving to the
+top, the free-space pause and carry-on, restart, removing with and without files, and `reidm
+list`/`add --later`/`rm`.
 
 **Follow-ups.** A few small synchronous reads and writes remain in media tool setup.
 

@@ -56,6 +56,15 @@ It fails if a row poll takes over 2 s, Pause on a silent server over 3 s, a 300-
 30 s, or memory grows by more than 150 MB over the cycles. `--profile laptop` caps it at two
 cores and 1 GB; the site stays unlimited, so the cap is on reIDM, as on a real machine.
 
+The API and CLI have a live permutation test: checksums (right and wrong), an HTTP proxy end to
+end, queue order and moving to the top, the free-space pause and carry-on, restart, remove with and
+without files, and `reidm list`/`add --later`/`rm` (Linux; ports 61401/61402, a site on 61490, a
+proxy on 61491):
+
+```sh
+node tools/api-test.mjs
+```
+
 CI installs the **newest stable** Rust, which may be newer than yours, and a new deprecation then
 fails `-D warnings` there first. Before pushing, lint with CI's version as well (it is printed in
 the *Install Rust* step), in its own target folder so your normal build isn't redone:
