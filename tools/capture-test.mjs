@@ -1072,6 +1072,13 @@ async function mediaChecks() {
 }
 
 async function main() {
+  // Never test against somebody else's reIDM: a service already on these ports would answer
+  // for ours, and the run would prove nothing (or the start would fail halfway).
+  for (const port of [61001, 61002]) {
+    if (await portOpen(port)) {
+      throw new Error(`port ${port} is already in use: stop the running reIDM (or another test) first`);
+    }
+  }
   await new Promise((r) => site.listen(SITE_PORT, '127.0.0.1', r));
   await startDaemon();
   await launchChrome();
