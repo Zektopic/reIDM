@@ -220,13 +220,17 @@ async fn a_finished_file_moves_across_drives() {
     let dl = dir.join("dl");
     let parts = shm.join(format!("reidm-xdev-{}", std::process::id()));
     let m = Manager::open(&dir.join("state"), dl.clone(), 2).unwrap();
-    m.update_settings(SettingsPatch { temp_dir: Some(parts.clone()), ..Default::default() }).unwrap();
+    // No free-space floor: this is about moving across file systems, and /dev/shm is often far
+    // smaller than the default floor (64 MB in a container), where the download would rightly
+    // wait for space instead.
+    m.update_settings(SettingsPatch { temp_dir: Some(parts.clone()), min_free_space_mib: Some(0), ..Default::default() }).unwrap();
     let id = m.add(reidm_core::Request { url: format!("http://127.0.0.1:{port}/x.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
     // Taken while it downloads: it must survive.
     std::fs::create_dir_all(&dl).unwrap();
     std::fs::write(dl.join("x.bin"), b"keep me").unwrap();
-    wait_until("done", || matches!(m.get(id).unwrap().status, Status::Done | Status::Failed(_)));
-    assert_eq!(m.get(id).unwrap().status, Status::Done);
+    wait_until("done", || matches!(m.get(id).unwrap().status, Status::Done | Status::Failed(_) | Status::Paused));
+    let it = m.get(id).unwrap();
+    assert_eq!(it.status, Status::Done, "{:?}", it.note);
     assert_eq!(std::fs::read(dl.join("x.bin")).unwrap(), b"keep me");
     assert!(std::fs::read(m.get(id).unwrap().path).unwrap() == data);
     let left: Vec<_> = std::fs::read_dir(&dl).unwrap().map(|e| e.unwrap().file_name()).collect();
