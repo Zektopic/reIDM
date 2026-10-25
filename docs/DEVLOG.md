@@ -31,10 +31,12 @@ claimed all eight (many downloads of one file name). The same is done when the s
 arrives on a download's first run. A media re-download's leftover scan (`read_dir`) moved out of
 `reset_item`, which runs under the lock, into `Effects`, applied after the lock is released. The
 cross-drive final copy now sets a row note, *moving the finished file to the download folder*: a
-multi-GB copy can take minutes and otherwise looks like a hang at 100%. Accepted for now: the
-"finished but its file was deleted" re-add still stats one path under the lock to decide between
-*Already complete* and downloading again — one stat, and the browser hand-off needs the answer
-before it drops its own copy.
+multi-GB copy can take minutes and otherwise looks like a hang at 100%. Two smaller blockers of the
+same kind moved too: a restart's file deletion now runs on the blocking pool, not a runtime worker,
+and the Properties window shares its row and its full detail (`Arc`) instead of cloning them on
+every frame. Accepted for now: the "finished but its file was deleted" re-add still stats one path
+under the lock to decide between *Already complete* and downloading again — one stat, and the
+browser hand-off needs the answer before it drops its own copy.
 
 **Alternatives.** Running every add on the blocking pool (the API already does; the problem was the
 lock, not the thread). Picking names after inserting and renaming later (the row would change name
@@ -54,8 +56,8 @@ video while it downloads (`deleting_a_running_video_stops_ytdlp_and_removes_its_
 whole yt-dlp process group and work folder away at once.
 
 **Follow-ups.** Torrent calls that wait on librqbit without a timeout (a slow delete or magnet can
-wedge that download's slot); Properties deep-clones its download every frame; a log file for
-support would shorten the next hang report (the competitor review's item 22).
+wedge that download's slot); a log file for support would shorten the next hang report (the
+competitor review's item 22).
 
 ## 2026-10-26 — A disk-space pause says its shortfall, and the cross-drive test stops depending on free space (0.8.0, PR #10)
 

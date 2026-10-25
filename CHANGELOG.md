@@ -97,6 +97,8 @@
   (OneDrive, iCloud, a network share): names are checked before the service takes the list's lock.
 * A finished download being copied to another drive says *moving the finished file to the download
   folder* instead of sitting at 100% with no explanation.
+* Properties no longer re-copies the whole download — its segments, a torrent's hundreds of files —
+  on every frame, so it stays smooth while it is open.
 * API: `GET /api/downloads/rows` (rows and deltas), `GET /api/downloads/{id}`,
   `POST /api/downloads/bulk`, `POST /api/shutdown`; `ETag`/`304` on `GET /api/downloads`;
   `warnings` in `/api/status`; `404` for unknown downloads.
