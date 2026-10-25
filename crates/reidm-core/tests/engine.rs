@@ -989,7 +989,9 @@ async fn running_out_of_space_part_way_keeps_everything_downloaded() {
     if std::fs::metadata(&parts).map(|a| std::os::unix::fs::MetadataExt::dev(&a)).ok() == std::fs::metadata(&dl).map(|b| std::os::unix::fs::MetadataExt::dev(&b)).ok() {
         return;
     }
-    m.update_settings(SettingsPatch { temp_dir: Some(parts.clone()), ..Default::default() }).unwrap();
+    // Start with no free-space floor (/dev/shm is often far smaller than the default 200 MiB
+    // in a container); the floor is raised below, once there is progress, to force the pause.
+    m.update_settings(SettingsPatch { temp_dir: Some(parts.clone()), min_free_space_mib: Some(0), ..Default::default() }).unwrap();
     let id = m.add(Request { url: srv.url("/big.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
     wait_until("some progress", || m.get(id).unwrap().downloaded > 300_000);
     m.update_settings(SettingsPatch { min_free_space_mib: Some(1 << 40), ..Default::default() }).unwrap();
