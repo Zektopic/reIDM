@@ -68,7 +68,7 @@ async fn serve_conn(stream: TcpStream, mgr: Manager) -> Result<()> {
             match Message::decode(rest) {
                 Ok((m, n)) => {
                     rest = &rest[n..];
-                    for out in session.handle(&m) {
+                    for out in session.handle(&m).await {
                         // The extension reads replies as Blobs, so always send binary frames.
                         tx.send(Ws::Binary(out.encode().into_bytes())).await?;
                     }

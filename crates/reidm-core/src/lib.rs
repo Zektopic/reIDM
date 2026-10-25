@@ -1138,6 +1138,19 @@ impl Manager {
     ///
     /// What the check learns (size, name, range support) is kept, so the transfer does not ask
     /// the server a second time.
+    /// Add a download whose check is already done, off the async runtime: choosing its name and
+    /// deleting a re-download's old files read the download folder, which on a slow or synced
+    /// one can take a while.
+    async fn add_off_runtime(&self, req: Request, opts: AddOptions, probe: Option<Probe>) -> Result<AddOutcome> {
+        let me = self.clone();
+        tokio::task::spawn_blocking(move || me.add_inner(req, opts, probe)).await.map_err(|e| anyhow!("cannot add the download: {e}"))?
+    }
+
+    async fn add_torrent_off_runtime(&self, bytes: Vec<u8>, later: bool) -> Result<AddOutcome> {
+        let me = self.clone();
+        tokio::task::spawn_blocking(move || me.add_torrent_file(&bytes, None, later)).await.map_err(|e| anyhow!("cannot add the torrent: {e}"))?
+    }
+
     pub async fn add_checked(&self, req: Request, opts: AddOptions) -> Result<AddOutcome> {
         // The browser lets go of its own copy once this answers, so what is added must be on
         // disk before it does: a crash a moment later must not lose the download entirely.
@@ -1153,10 +1166,10 @@ impl Manager {
         let named_torrent = req.filename.as_deref().is_some_and(|f| f.to_ascii_lowercase().ends_with(".torrent"));
         if req.torrent.is_none() && req.media.is_none() && req.url.starts_with("http") && (named_torrent || torrent::is_torrent_url(&req.url)) {
             let bytes = self.fetch_torrent_file(&req).await?;
-            return self.add_torrent_file(&bytes, None, opts.later);
+            return self.add_torrent_off_runtime(bytes, opts.later).await;
         }
         if req.torrent.is_some() || torrent::is_torrent_url(&req.url) {
-            return self.add_inner(req, opts, None);
+            return self.add_off_runtime(req, opts, None).await;
         }
         let u = url::Url::parse(&req.url).context("invalid URL")?;
         if !matches!(u.scheme(), "http" | "https") {
@@ -1167,7 +1180,7 @@ impl Manager {
         // A video page is not a file to check: yt-dlp resolves it when the download runs.
         if known || req.media.is_some() {
             // Already in the list: re-adding resumes it, which needs no new check.
-            return self.add_with(req, opts);
+            return self.add_off_runtime(req, opts, None).await;
         }
         let p = match tokio::time::timeout(PROBE_LIMIT, self.probe(&req.url, &Self::headers(&req))).await {
             Ok(r) => r?,
@@ -1182,7 +1195,7 @@ impl Manager {
                 bail!("the link answers with a web page, not a file");
             }
         }
-        self.add_inner(req, opts, Some(p))
+        self.add_off_runtime(req, opts, Some(p)).await
     }
 
     /// Check a request and work out where it goes, before the list is locked.

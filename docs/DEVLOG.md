@@ -81,7 +81,9 @@ under that load answered in 67 ms and started the download again. Deleting a vid
 downloads (`deleting_a_running_video_stops_ytdlp_and_removes_its_pieces`) takes its whole yt-dlp
 process group and work folder away at once.
 
-**Follow-ups.** Torrent session setup and `add`/`pause` still call librqbit without a timeout.
+**Follow-ups.** Torrent session setup and `add`/`pause` still call librqbit without a timeout
+(cancelling those can leave a half-started session, and the calls are quick); a few small
+metadata/tool reads in torrent and media setup still run on the runtime.
 
 ## 2026-10-26 — A disk-space pause says its shortfall, and the cross-drive test stops depending on free space (0.8.0, PR #10)
 

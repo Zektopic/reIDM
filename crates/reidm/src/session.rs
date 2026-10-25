@@ -115,7 +115,27 @@ impl Session {
     }
 
     /// Handle one inbound message and return the messages to send back.
-    pub fn handle(&mut self, m: &Message) -> Vec<Message> {
+    /// Queue one download off the async runtime: choosing its name reads the download folder,
+    /// which on a synced or slow one can take a while.
+    async fn queue(&self, r: Request) -> bool {
+        let mgr = self.mgr.clone();
+        match tokio::task::spawn_blocking(move || mgr.add(r)).await {
+            Ok(Ok(id)) => {
+                tracing::info!("queued download #{id}");
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("rejected download: {e:#}");
+                false
+            }
+            Err(e) => {
+                tracing::warn!("the download could not be queued: {e}");
+                false
+            }
+        }
+    }
+
+    pub async fn handle(&mut self, m: &Message) -> Vec<Message> {
         let wants_reply = m.flags & 1 != 0;
         match m.ty {
             T_HELLO => {
@@ -128,16 +148,7 @@ impl Session {
                 // The reply tells the extension whether we took the download. Answering "taken"
                 // when we could not queue anything would make the browser silently drop it.
                 let taken = match Self::request_from(m) {
-                    Some(r) => match self.mgr.add(r) {
-                        Ok(id) => {
-                            tracing::info!("queued download #{id}");
-                            true
-                        }
-                        Err(e) => {
-                            tracing::warn!("rejected download: {e:#}");
-                            false
-                        }
-                    },
+                    Some(r) => self.queue(r).await,
                     None => {
                         tracing::debug!("type 14 without URL");
                         false
@@ -151,15 +162,8 @@ impl Session {
             }
             T_INTERCEPT if m.flags & 128 != 0 => {
                 // The browser is about to save a file itself; claim it if it is plain http(s).
-                let taken = match Self::request_from(m).map(|r| self.mgr.add(r)) {
-                    Some(Ok(id)) => {
-                        tracing::info!("captured browser download as #{id}");
-                        true
-                    }
-                    Some(Err(e)) => {
-                        tracing::info!("not capturing: {e:#}");
-                        false
-                    }
+                let taken = match Self::request_from(m) {
+                    Some(r) => self.queue(r).await,
                     None => false,
                 };
                 vec![Self::reply(m, &[if taken { R_TAKEN } else { R_IGNORE }])]
@@ -192,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn hello_gets_ack_and_settings() {
         let mut s = Session::new(mgr());
-        let out = s.handle(&Message::new(1, T_HELLO, 5, 0).with_args([113, 93]));
+        let out = s.handle(&Message::new(1, T_HELLO, 5, 0).with_args([113, 93])).await;
         assert_eq!(out.iter().map(|m| m.ty).collect::<Vec<_>>(), vec![T_HELLO_ACK, T_SETTINGS]);
         // encodes to something the parser accepts
         for m in &out {
@@ -203,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn settings_enable_idms_alt_and_insert_keys() {
         let mut s = Session::new(mgr());
-        let out = s.handle(&Message::new(1, T_HELLO, 5, 0).with_args([113, 93]));
+        let out = s.handle(&Message::new(1, T_HELLO, 5, 0).with_args([113, 93])).await;
         let settings = out.iter().find(|m| m.ty == T_SETTINGS).unwrap();
         assert_eq!(settings.arg(0), Some(8), "Insert forces a capture");
         assert_eq!(settings.arg(1), Some(4), "Alt lets the browser keep a download");
@@ -213,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn keepalive_is_answered() {
         let mut s = Session::new(mgr());
-        let out = s.handle(&Message::new(9, T_KEEPALIVE, 1, 1));
+        let out = s.handle(&Message::new(9, T_KEEPALIVE, 1, 1)).await;
         assert_eq!(out[0].ty, T_REPLY);
         assert_eq!(out[0].arg(0), Some(9));
     }
@@ -227,7 +231,7 @@ mod tests {
         let mut s = Session::new(mgr.clone());
         for ty in [1001, 1002, 1003] {
             // `1003 id 1` used to remove the download and delete its file.
-            let out = s.handle(&Message::new(1, ty, 1, 1).with_args([id as i64, 1]));
+            let out = s.handle(&Message::new(1, ty, 1, 1).with_args([id as i64, 1])).await;
             assert!(out.is_empty(), "type {ty} must get no answer that it was done");
         }
         assert!(mgr.get(id).is_some(), "the download is still listed");
