@@ -499,7 +499,7 @@ impl App {
                     st.fetching = false;
                     st.fetched = Some(Instant::now());
                     if d.is_some() {
-                        st.detail = d;
+                        st.detail = d.map(std::sync::Arc::new);
                     }
                 }
             })

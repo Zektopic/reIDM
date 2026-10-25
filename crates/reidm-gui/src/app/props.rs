@@ -14,7 +14,8 @@ impl App {
         }
         let Some(st) = &self.props else { return };
         let id = st.id;
-        let Some(it) = self.item(id).cloned() else {
+        // Shared, not cloned every frame: the row and the detail can both be long.
+        let Some(it) = self.snap.item_arc(id) else {
             self.props = None;
             return;
         };

@@ -158,8 +158,9 @@ pub(super) struct PropsState {
     pub(super) limit_on: bool,
     pub(super) limit_kb: u32,
     /// Every field of the download (its segments, a torrent's files), which list rows leave
-    /// out; refreshed about once a second while the window is open.
-    pub(super) detail: Option<Detail>,
+    /// out; refreshed about once a second while the window is open. Shared rather than cloned:
+    /// the window draws many frames between refreshes, and a torrent's file list can be long.
+    pub(super) detail: Option<std::sync::Arc<Detail>>,
     pub(super) fetched: Option<Instant>,
     pub(super) fetching: bool,
     /// *Integrity*: the algorithm to compute, a value to compare with, and the computation

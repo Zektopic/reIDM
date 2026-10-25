@@ -52,6 +52,12 @@ impl Snapshot {
     pub fn item(&self, id: u64) -> Option<&Item> {
         self.index.get(&id).and_then(|i| self.items.get(*i)).map(|a| a.as_ref())
     }
+
+    /// The row itself, shared: for code that must keep it while the window's state changes.
+    /// Cloning the `Arc` is free; cloning the row is not.
+    pub fn item_arc(&self, id: u64) -> Option<Arc<Item>> {
+        self.index.get(&id).and_then(|i| self.items.get(*i)).cloned()
+    }
 }
 
 /// The slower-changing half of the daemon's state.
