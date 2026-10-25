@@ -49,10 +49,12 @@ local site on 61290):
 
 ```sh
 node tools/stress-test.mjs                     # ~2 GiB download, ten 300-link cycles
+node tools/stress-test.mjs --profile potato    # the same under half a core and 256 MB
 ```
 
 It fails if a row poll takes over 2 s, Pause on a silent server over 3 s, a 300-item purge over
-30 s, or memory grows by more than 150 MB over the cycles.
+30 s, or memory grows by more than 150 MB over the cycles. `--profile laptop` caps it at two
+cores and 1 GB; the site stays unlimited, so the cap is on reIDM, as on a real machine.
 
 CI installs the **newest stable** Rust, which may be newer than yours, and a new deprecation then
 fails `-D warnings` there first. Before pushing, lint with CI's version as well (it is printed in

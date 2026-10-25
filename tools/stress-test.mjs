@@ -5,6 +5,7 @@
 //
 //   cargo build --release --locked -p reidm
 //   node tools/stress-test.mjs [--big-mib 2048] [--batch 300] [--cycles 10] [--soak 10]
+//                              [--profile none|potato|laptop]
 //
 // Linux only (reads /proc for memory). Throw-away service: own data folder, own HOME,
 // ports 61201/61202, and a local site on 61290 — never the real reIDM.
@@ -20,6 +21,12 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
 const BIN = opt('bin', path.join(ROOT, 'target', 'release', 'reidm'));
+const PROFILE = opt('profile', 'none');
+// The same imitated machines profile-test uses: the service is capped, the site is not.
+const LIMITS = {
+  potato: ['-p', 'CPUQuota=50%', '-p', 'MemoryMax=256M', '-p', 'MemorySwapMax=0'],
+  laptop: ['-p', 'CPUQuota=200%', '-p', 'MemoryMax=1G', '-p', 'MemorySwapMax=0'],
+};
 if (!fs.existsSync(BIN)) {
   console.error(`no release build at ${BIN}: run  cargo build --release --locked -p reidm`);
   process.exit(2);
@@ -103,7 +110,15 @@ const env = {
   REIDM_LOCAL_PORT: String(LOCAL),
   RUST_LOG: 'reidm=warn,reidm_core=warn',
 };
-const svc = spawn(BIN, ['daemon', '--no-idm-port', '--dir', dl], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+const launch = [BIN, 'daemon', '--no-idm-port', '--dir', dl];
+const [cmd, cmdArgs] = PROFILE === 'none'
+  ? [BIN, launch.slice(1)]
+  : ['systemd-run', ['--user', '--scope', '--quiet', '--collect', `--unit=reidm-stress-${process.pid}-${Date.now()}`, ...(LIMITS[PROFILE] ?? []), '--', ...launch]];
+if (PROFILE !== 'none' && !LIMITS[PROFILE]) {
+  console.error(`unknown profile ${PROFILE}: use potato, laptop or none`);
+  process.exit(2);
+}
+const svc = spawn(cmd, cmdArgs, { env, stdio: ['ignore', 'ignore', 'pipe'] });
 let svcErr = '';
 svc.stderr.on('data', (d) => (svcErr += d));
 let token = null;
@@ -118,7 +133,8 @@ async function api(method, p, body, timeout = 30000) {
   });
   const text = await r.text();
   const ms = performance.now() - t0;
-  if (!r.ok) throw new Error(`${method} ${p}: ${r.status} ${text}`);
+  // 304 is the list saying "nothing changed", as the window's poll expects; an empty body.
+  if (!r.ok && r.status !== 304) throw new Error(`${method} ${p}: ${r.status} ${text}`);
   return { ms, body: text ? JSON.parse(text) : null };
 }
 const rss = () => Number(/VmRSS:\s+(\d+) kB/.exec(fs.readFileSync(`/proc/${svc.pid}/status`, 'utf8'))[1]) / 1024;
