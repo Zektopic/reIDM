@@ -18,11 +18,11 @@ confirms four causes, all already fixed on this branch: `save()` held the list l
 pretty-print and disk write every 3 s and on every add/remove; the window called the API
 synchronously on its UI thread, one DELETE per selected item; the HTTP client had no
 response-header or read timeout, and Pause could not wake a waiting request; stopping yt-dlp waited
-without a deadline. A separate review of the current code found one residual of the same kind:
-adding downloads read the destination folder — `exists()` twice per name, more on collisions —
-**while holding the list and live locks**. On a slow or synced folder (OneDrive, iCloud, a network
-share) every checkpoint, torrent progress update and API handler then waits on that lock: the same
-class of freeze.
+without a deadline. A [separate review](reviews/2026-10/hang-audit.md) of the current code found
+one residual of the same kind: adding downloads read the destination folder — `exists()` twice per
+name, more on collisions — **while holding the list and live locks**. On a slow or synced folder
+(OneDrive, iCloud, a network share) every checkpoint, torrent progress update and API handler then
+waits on that lock: the same class of freeze.
 
 **Decision.** Names for new downloads are worked out before the locks: `free_names` reads the
 folder and returns up to eight free names, and under the lock `place` takes the first one the list
