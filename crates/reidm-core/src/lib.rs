@@ -651,6 +651,37 @@ fn unique_path(dir: &Path, name: &str, claimed: impl Fn(&Path) -> bool) -> PathB
     p
 }
 
+/// Up to `want` names for a download that are free on disk — neither the file nor its part
+/// file exists — best first. The list's own claims are checked later, under its lock; this is
+/// here because it reads the folder, and on a slow or synced folder (OneDrive, iCloud, a
+/// network share) one stat can take a long time: doing that under the list's lock would hold up
+/// every task that needs the list, the window's polls among them.
+fn free_names(dir: &Path, name: &str, want: usize) -> Vec<PathBuf> {
+    let free = |p: &Path| !p.exists() && !part_path(p).exists();
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    let mut out = Vec::with_capacity(want);
+    let mut p = dir.join(name);
+    if free(&p) {
+        out.push(p);
+    }
+    // Enough names for the usual case (many downloads of one file name, or none), but not a
+    // thousand stats for a folder where every name is taken: the caller then chooses under the
+    // lock, as it always used to.
+    for n in 1..=1_000 {
+        if out.len() >= want {
+            break;
+        }
+        p = dir.join(format!("{stem} ({n}){ext}"));
+        if free(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 fn part_path(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".reidm");
@@ -801,6 +832,9 @@ struct Prepared {
     /// The file name it will most likely have.
     hint: String,
     probe: Option<Probe>,
+    /// Names that are free on disk, best first (see [`free_names`]): chosen before the list is
+    /// locked. The first one no other download has claimed is the one used.
+    candidates: Vec<PathBuf>,
 }
 
 /// What a change to the list leaves to do once the list is unlocked: file system work, which
@@ -810,6 +844,9 @@ struct Effects {
     pump: bool,
     delete: Vec<PathBuf>,
     delete_dirs: Vec<PathBuf>,
+    /// Media downloads whose old pieces are to be found and deleted with their file. The scan
+    /// reads the download folder, so it happens in `apply`, after the list is unlocked.
+    leftovers_of: Vec<PathBuf>,
     /// Torrents (by info hash) to take out of the torrent engine, with their files.
     forget: Vec<String>,
 }
@@ -1196,13 +1233,15 @@ impl Manager {
                 _ => s.folder_for(&hint),
             }
         });
-        Ok(Prepared { key: url_key(&u), req, dir, hint, probe })
+        // Checked here, before the list is locked (see `free_names`).
+        let candidates = free_names(&dir, &hint, 8);
+        Ok(Prepared { key: url_key(&u), req, dir, hint, probe, candidates })
     }
 
     /// Put one prepared request into the list, or recognise it as one already there. The caller
     /// holds the list and the live set; `claimed` is every path the list's downloads use.
     fn place(&self, db: &mut Db, live: &BTreeMap<u64, Live>, p: Prepared, opts: AddOptions, claimed: &mut HashSet<PathBuf>, fx: &mut Effects) -> AddOutcome {
-        let Prepared { mut req, key, dir, hint, probe } = p;
+        let Prepared { mut req, key, dir, hint, probe, candidates } = p;
         let existing = db.with_key(&key).find(|i| same_media(i, req.media.as_ref())).map(|i| i.id);
         if let Some(id) = existing {
             let running = live.get(&id);
@@ -1257,7 +1296,9 @@ impl Manager {
 
         let id = db.next_id;
         db.next_id += 1;
-        let path = unique_path(&dir, &hint, |p| claimed.contains(p));
+        // The disk was read before the lock; an unusual list that has claimed all of the names
+        // checked falls back to reading it here.
+        let path = candidates.into_iter().find(|c| !claimed.contains(c)).unwrap_or_else(|| unique_path(&dir, &hint, |p| claimed.contains(p)));
         claimed.insert(path.clone());
         let mut item = Item {
             id,
@@ -1350,6 +1391,13 @@ impl Manager {
     fn apply(&self, fx: Effects) {
         for f in &fx.delete {
             let _ = std::fs::remove_file(f);
+        }
+        for p in &fx.leftovers_of {
+            // Scanned here, not while the list was locked: a slow or synced folder must not
+            // hold up everything waiting for the list.
+            for f in media::leftovers(p) {
+                let _ = std::fs::remove_file(f);
+            }
         }
         for d in &fx.delete_dirs {
             let _ = std::fs::remove_dir_all(d);
@@ -1458,7 +1506,7 @@ impl Manager {
         if it.request.media.is_some() {
             // yt-dlp would otherwise find the finished file and its pieces and stop there.
             fx.delete.push(it.path.clone());
-            fx.delete.extend(media::leftovers(&it.path));
+            fx.leftovers_of.push(it.path.clone());
             fx.delete_dirs.push(media::work_dir(&self.temp_dir(), it.id));
         }
         fx.pump = true;
@@ -1990,6 +2038,13 @@ impl Manager {
             if let Some(d) = &dir {
                 std::fs::create_dir_all(d)?;
             }
+            // Read the folder before the lock (see `free_names`): the server's name may land in
+            // a synced or slow folder, and the window's polls and the other downloads need the
+            // list while this runs.
+            let candidates = match (&dir, &server_name) {
+                (Some(d), Some(name)) => free_names(d, name, 8),
+                _ => Vec::new(),
+            };
             let n = self.0.settings.lock().unwrap().connections as u64;
             // The name is chosen and recorded under one lock: two downloads whose servers give
             // the same name must not both take it.
@@ -2000,7 +2055,7 @@ impl Manager {
                 // the probe was in flight, and re-inserting would resurrect it.
                 let Some(slot) = db.items.get_mut(&id) else { return Ok(false) };
                 if let (Some(d), Some(name)) = (&dir, &server_name) {
-                    slot.path = unique_path(d, name, |p| claimed.contains(p));
+                    slot.path = candidates.into_iter().find(|c| !claimed.contains(c)).unwrap_or_else(|| unique_path(d, name, |p| claimed.contains(p)));
                 }
                 slot.size = p.size;
                 slot.resumable = p.resumable;
@@ -2238,7 +2293,9 @@ impl Manager {
                     // The temporary folder is on another drive: copy into the destination's
                     // folder under a temporary name, then rename that into place as above. A
                     // failed copy leaves no half-file under the real name, and the part file
-                    // stays until the move has finished.
+                    // stays until the move has finished. A whole-file copy can take a while on
+                    // a slow drive, so say what the 100% download is doing.
+                    self.set_note(id, Some("moving the finished file to the download folder"));
                     let staging = dest.with_file_name(format!(".{id}.reidm-move"));
                     let (from, to) = (src.clone(), staging.clone());
                     let copied = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -2786,6 +2843,23 @@ mod tests {
         // A part file's name ("<id>-<name>.reidm") must still fit in 255 bytes.
         assert!(format!("{}-{s}.reidm", u64::MAX).len() <= 255);
         assert_eq!(sanitize_filename("short.zip"), "short.zip");
+    }
+
+    #[test]
+    fn names_taken_on_disk_are_skipped_before_the_list_is_locked() {
+        // The candidates are worked out without the list's lock, so a stat on a slow or synced
+        // folder cannot hold up the window and the other downloads.
+        let d = std::env::temp_dir().join(format!("reidm-free-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.bin"), b"x").unwrap();
+        // A part file of an earlier run counts as taken too.
+        std::fs::write(d.join("f (1).bin.reidm"), b"x").unwrap();
+        assert_eq!(free_names(&d, "f.bin", 2), vec![d.join("f (2).bin"), d.join("f (3).bin")]);
+        // Once its file is gone, the plain name is free again.
+        std::fs::remove_file(d.join("f.bin")).unwrap();
+        assert_eq!(free_names(&d, "f.bin", 2), vec![d.join("f.bin"), d.join("f (2).bin")]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -78,6 +78,9 @@
 
 ### The window and the service
 
+* **The window and the service no longer freeze** during a long download or a large batch: waits
+  that used to have no limit now time out, Pause takes effect at once, and the service no longer
+  reads the download folder while it holds the list.
 * **Very long lists work**: the window no longer stops with "Service unavailable" past about 7,000
   downloads, and it fetches only what changed — nothing at all while the list is idle. Idle CPU
   drops from about 20% of a core to near zero (measured with 5,000 downloads; 50,000 load fine).
@@ -90,6 +93,10 @@
   that downloads continue, with *Quit reIDM completely* (also in the File menu).
 * Only one service runs per data folder, and it stops with a clear message if its ports are taken.
   Quitting saves the list first. Problems with the list's storage show as a banner.
+* Adding a playlist or a large batch no longer stalls on a slow or synced download folder
+  (OneDrive, iCloud, a network share): names are checked before the service takes the list's lock.
+* A finished download being copied to another drive says *moving the finished file to the download
+  folder* instead of sitting at 100% with no explanation.
 * API: `GET /api/downloads/rows` (rows and deltas), `GET /api/downloads/{id}`,
   `POST /api/downloads/bulk`, `POST /api/shutdown`; `ETag`/`304` on `GET /api/downloads`;
   `warnings` in `/api/status`; `404` for unknown downloads.

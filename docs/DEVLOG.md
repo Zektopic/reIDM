@@ -9,6 +9,51 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — Hang report: no folder reads under the list's lock, and a moving note (0.8.0, PR #10)
+
+**Context.** The user reported that 0.7.0 on Windows and macOS freezes after a while — window and
+service, a beach ball on the Mac, fewer than 100 downloads, mostly with large downloads and after
+downloading a playlist then deleting it — and only a restart recovers. Reading tag `v0.7.0`
+confirms four causes, all already fixed on this branch: `save()` held the list lock across a
+pretty-print and disk write every 3 s and on every add/remove; the window called the API
+synchronously on its UI thread, one DELETE per selected item; the HTTP client had no
+response-header or read timeout, and Pause could not wake a waiting request; stopping yt-dlp waited
+without a deadline. A separate review of the current code found one residual of the same kind:
+adding downloads read the destination folder — `exists()` twice per name, more on collisions —
+**while holding the list and live locks**. On a slow or synced folder (OneDrive, iCloud, a network
+share) every checkpoint, torrent progress update and API handler then waits on that lock: the same
+class of freeze.
+
+**Decision.** Names for new downloads are worked out before the locks: `free_names` reads the
+folder and returns up to eight free names, and under the lock `place` takes the first one the list
+has not already claimed. The old in-lock search remains only as the fallback when the list has
+claimed all eight (many downloads of one file name). The same is done when the server's name
+arrives on a download's first run. A media re-download's leftover scan (`read_dir`) moved out of
+`reset_item`, which runs under the lock, into `Effects`, applied after the lock is released. The
+cross-drive final copy now sets a row note, *moving the finished file to the download folder*: a
+multi-GB copy can take minutes and otherwise looks like a hang at 100%. Accepted for now: the
+"finished but its file was deleted" re-add still stats one path under the lock to decide between
+*Already complete* and downloading again — one stat, and the browser hand-off needs the answer
+before it drops its own copy.
+
+**Alternatives.** Running every add on the blocking pool (the API already does; the problem was the
+lock, not the thread). Picking names after inserting and renaming later (the row would change name
+after it appeared). Making the cross-drive copy cancellable (a chunked copy — left as a follow-up;
+the note explains the wait, and a removal during the move is still honoured afterwards).
+
+**Evidence/tests.** The unit test `names_taken_on_disk_are_skipped_before_the_list_is_locked` pins
+the ordering of candidates; the existing same-name tests (`two_downloads_with_the_same_name_do_not
+_share_a_file` and the destination race in `tests/engine.rs`) still pass. A load test with a
+throw-away service measured 25 s of 10 Hz row polling beside an 8 GiB download, then 30 cycles of
+adding 300 links and purging them: worst rows request 7.8 ms, batch add 5–14 ms, purge 13–22 ms, a
+stalled-server Pause 3.7 ms, deleting a running 8 GiB download 1.5 ms, RSS 10→85 MB, no failures.
+The load test is not committed yet.
+
+**Follow-ups.** Torrent calls that wait on librqbit without a timeout (a slow delete or magnet can
+wedge that download's slot); Properties deep-clones its download every frame; a log file for
+support would shorten the next hang report (the competitor review's item 22); commit the load test
+as `tools/stress-test.mjs`.
+
 ## 2026-10-26 — A disk-space pause says its shortfall, and the cross-drive test stops depending on free space (0.8.0, PR #10)
 
 **Context.** CI on the self-hosted Linux runner failed one test, `a_finished_file_moves_across_drives`:
