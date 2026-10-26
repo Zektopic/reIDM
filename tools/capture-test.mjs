@@ -33,8 +33,8 @@
 //      SPA manifests, YouTube SPA navigation, images never wake the worker, and the page hook
 //      exists only while media detection is on;
 //  13b. the "Download with reIDM" button over a video: it appears inside the video, its picker
-//      lists the video the page plays, a row hands it to reIDM, and a video inside an open
-//      shadow root is found too;
+//      lists the video the page plays, a row hands it to reIDM, a video inside an open shadow
+//      root is found too, and a YouTube page lists the player's qualities, Best first;
 //  14. while reIDM waits for a new address, a captured link asks "Use this link to refresh …?":
 //      Refresh moves the waiting download to the link, New download adds the link as its own
 //      (at once with the dialog off). Skipped, saying so, against a service that doesn't report
@@ -201,7 +201,7 @@ const YT = `<!doctype html><title>Video A - YouTube</title><script>
 window.ytInitialPlayerResponse = ${JSON.stringify(ytPlayer('AAAAAAAAAAA', 'Video A', 18))};
 window.toB = () => { history.pushState({}, '', '/yt?v=BBBBBBBBBBB'); document.title = 'Video B - YouTube'; return fetch('/youtubei/v1/player', { method: 'POST' }).then(r => r.json()); };
 window.toC = () => { history.pushState({}, '', '/yt?v=CCCCCCCCCCC'); document.title = 'Video C - YouTube'; };
-</script>`;
+</script><video id="player" style="display:block;width:640px;height:360px"></video>`;
 // Lots of images and scripts, none of them media (M5).
 const BUSY = `<!doctype html><title>busy</title>${Array.from({ length: 60 }, (_, i) => `<img src="/img/icon.svg?${i}" width=4>`).join('')}`;
 
@@ -1176,6 +1176,22 @@ async function videoButtonChecks() {
     return r && r.panelHidden === false && r.rows.length ? r : null;
   }, 20000);
   check('the picker lists a video inside a shadow root', !!shList && shList.rows.some((t) => /progressive|\?/.test(t)), JSON.stringify(shList && shList.rows));
+
+  // YouTube's shape: the button sits on the player, and its picker lists the qualities the
+  // player response offers, Best first.
+  await openPage(`${onRoot()}/yt?v=AAAAAAAAAAA`);
+  await sleep(1500);
+  const yv = await waitFor('the button on a YouTube page', async () => {
+    const r = await look();
+    return r && r.shown && r.button && r.button.w > 80 ? r : null;
+  }, 20000);
+  check('a YouTube page gets the “Download with reIDM” button', !!yv && yv.text === 'Download with reIDM', JSON.stringify(yv));
+  await inContentScript(`(() => { const h = [...document.documentElement.children].find((e) => e.__wrap); h.__wrap.querySelector('.btn').click(); return true; })()`);
+  const ytRows = await waitFor('the YouTube qualities in the picker', async () => {
+    const r = await look();
+    return r && r.panelHidden === false && r.rows.length ? r : null;
+  }, 20000);
+  check('the picker lists the YouTube qualities, Best first', !!ytRows && /Best/.test(ytRows.rows[0]) && ytRows.rows.some((t) => /360p/.test(t)), JSON.stringify(ytRows && ytRows.rows));
 }
 
 async function main() {
