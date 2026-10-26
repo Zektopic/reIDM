@@ -9,6 +9,31 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — The video button, proved end to end; and shadow roots (0.7.1-rc4, extension 1.9.0)
+
+**Context.** The user asked for the extension to detect a video and show it in *Download with
+reIDM*. The button, its closed-shadow UI and the picker already existed, but the browser suite
+only checked the data behind them (the page hook's answers and the per-tab media store), never the
+visible flow — and the page scan and the picker used `document.querySelectorAll`, which cannot see
+a `<video>` inside a web component's shadow root; media events from one do not reach the document
+either. That is a real detection gap on sites whose player is a custom element.
+
+**Decision.** `content.js` scans open shadow roots (to depth 8) and observes each one it finds, so
+changes inside it are seen as well as its current contents; the MAIN-world hook's on-demand answer
+walks the same roots, so the picker lists a shadow-root video. Closed roots stay out of reach by
+design. The browser suite gained the end-to-end button checks — the button appears inside the
+video's box, opens, lists the video the page plays, asks, and reIDM receives the file — plus a
+web-component fixture. The hand-over check turns the dialog on for its one hand-over because the
+rest of the suite runs with it off.
+
+**Alternatives.** Asking sites to keep their player in the light DOM (not theirs to do); walking
+every element on every mutation (costly on a busy page — the shadow walk is limited to the tree
+being scanned, and the scan is already debounced and run in idle time).
+
+**Evidence.** 107/107 browser checks, including the new button and shadow-root checks. The
+shadow-root fixture's video is reachable only through `shadowRoot`, so its passing check is the
+new walk working; the gallery check covers the whole hand-over from the button to reIDM.
+
 ## 2026-10-26 — A magnet's description waits for peers, not two minutes (0.7.1-rc3)
 
 **Context.** On the user's Windows PC a magnet download showed *Failed* with "the torrent engine

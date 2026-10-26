@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.1-rc4
+
+### Extension 1.9.0
+
+* **The *Download with reIDM* button now finds videos inside web components.** A player that keeps
+  its `<video>` in an open shadow root was invisible to the page scan and to the quality picker;
+  both now look inside open shadow roots (a closed one cannot be reached by any extension). The
+  browser suite now checks the whole button flow — it appears over the video, the picker lists
+  what the page is playing, the dialog asks, and reIDM receives the file — including a shadow-root
+  player.
+
 ## 0.7.1-rc3
 
 ### Fixed

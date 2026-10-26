@@ -195,7 +195,9 @@ listed separately.
 
 When a video plays, a **Download with reIDM** button appears over it. It opens a list of what the
 player actually offers — resolution, codec, frame rate, bitrate and size, best first, audio-only
-tracks last. It understands YouTube's player data, HLS master playlists and DASH manifests.
+tracks last. It understands YouTube's player data, HLS master playlists and DASH manifests. A
+player inside a web component is found too when its shadow root is open; a closed one is invisible
+to every extension.
 
 ### YouTube
 

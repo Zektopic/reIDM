@@ -32,6 +32,9 @@
 //  13. finding media: a live stream is not re-fetched in a loop, per-tab badges, relative and
 //      SPA manifests, YouTube SPA navigation, images never wake the worker, and the page hook
 //      exists only while media detection is on;
+//  13b. the "Download with reIDM" button over a video: it appears inside the video, its picker
+//      lists the video the page plays, a row hands it to reIDM, and a video inside an open
+//      shadow root is found too;
 //  14. while reIDM waits for a new address, a captured link asks "Use this link to refresh …?":
 //      Refresh moves the waiting download to the link, New download adds the link as its own
 //      (at once with the dialog off). Skipped, saying so, against a service that doesn't report
@@ -176,6 +179,21 @@ const MEDIA_PLAYLIST = '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nseg1.ts\n'
 const hlsBody = (n) => '#EXTM3U\n' + Array.from({ length: n }, (_, i) => `#EXT-X-STREAM-INF:BANDWIDTH=${(i + 1) * 500000},RESOLUTION=${(i + 1) * 320}x${(i + 1) * 180}\nv${i}.m3u8\n`).join('');
 const SPA = `<!doctype html><title>spa</title><script>fetch('hls/a.m3u8');
 window.next = () => { history.pushState({}, '', '/spa/two'); return fetch('hls/b.m3u8').then(r => r.text()); };</script>`;
+// A web-component player: its <video> lives in an open shadow root, where the document's own
+// querySelectorAll cannot see it.
+const SHADOW = `<!doctype html><title>shadow player</title>
+<video-player></video-player>
+<script>
+customElements.define('video-player', class extends HTMLElement {
+  connectedCallback() {
+    const r = this.attachShadow({ mode: 'open' });
+    const v = document.createElement('video');
+    v.src = '/media/clip.mp4';
+    v.style.cssText = 'display:block;width:640px;height:360px';
+    r.appendChild(v);
+  }
+});
+</script>`;
 // YouTube's shape, on the test site: the global describes the first video, the player API the
 // next one (H6).
 const ytPlayer = (id, title, itag) => ({ videoDetails: { videoId: id, title }, streamingData: { formats: [{ itag, mimeType: 'video/mp4; codecs="avc1.42001E, mp4a.40.2"', qualityLabel: '360p', height: 360, url: `https://example.invalid/${id}` }] } });
@@ -221,7 +239,7 @@ const site = http.createServer((req, res) => {
     return res.end(data);
   }
   log.push({ method: req.method, path: u.pathname, range: req.headers.range, cookie: req.headers.cookie || '', mode: req.headers['sec-fetch-mode'] || '', site: req.headers['sec-fetch-site'] || '' });
-  const page = { '/live': LIVE, '/spa/one': SPA, '/yt': YT, '/busy': BUSY, '/watch': '<!doctype html><title>a video page</title>' }[u.pathname];
+  const page = { '/live': LIVE, '/spa/one': SPA, '/yt': YT, '/busy': BUSY, '/shadow': SHADOW, '/watch': '<!doctype html><title>a video page</title>' }[u.pathname];
   if (page) {
     res.writeHead(200, { 'Content-Type': 'text/html' });
     return res.end(page);
@@ -1071,6 +1089,95 @@ async function mediaChecks() {
   check('media detection back on: pages are hooked again', !(await evalPage('String(window.fetch).includes("[native code]")')));
 }
 
+/** The "Download with reIDM" button over a video, end to end: it appears on the video, its
+ *  picker lists the video the page is playing, and a row hands it to reIDM. */
+async function videoButtonChecks() {
+  await openPage(`${onRoot()}/gallery`);
+  // The gallery's video is below the images; bring it into view, as a user would.
+  await evalPage(`document.querySelector('video').scrollIntoView({ block: 'center' }); true`);
+  await evalPage(`document.querySelector('video').play().catch(() => {}); true`);
+  await sleep(1200);
+
+  /** The button and panel, read from the content script's world (the shadow root is closed to
+   *  the page). */
+  const look = () => inContentScript(`(() => {
+    const host = [...document.documentElement.children].find((e) => e.__wrap);
+    if (!host) return null;
+    const w = host.__wrap;
+    const b = w.querySelector('.btn');
+    const p = w.querySelector('.panel');
+    const findVideo = (r) => {
+      const v = r.querySelector && r.querySelector('video');
+      if (v) return v;
+      for (const e of r.querySelectorAll ? r.querySelectorAll('*') : []) {
+        if (e.shadowRoot) { const f = findVideo(e.shadowRoot); if (f) return f; }
+      }
+      return null;
+    };
+    const v = findVideo(document);
+    const rb = b && b.getBoundingClientRect();
+    const rv = v && v.getBoundingClientRect();
+    const rect = (r) => r ? { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height), right: Math.round(r.right) } : null;
+    return {
+      text: b ? b.textContent : null,
+      shown: w.style.display !== 'none',
+      button: rect(rb),
+      video: rect(rv),
+      panelHidden: p ? p.hidden : null,
+      rows: p ? [...p.querySelectorAll('.row')].map((r) => r.textContent) : [],
+    };
+  })()`);
+
+  const seen = await waitFor('the Download with reIDM button', async () => {
+    const r = await look();
+    return r && r.shown && r.button && r.button.w > 80 ? r : null;
+  }, 20000);
+  check('a video on the page gets the “Download with reIDM” button', !!seen && seen.text === 'Download with reIDM', JSON.stringify(seen));
+  check('the button sits inside the video’s box', !!seen && seen.button.x >= seen.video.x - 1 && seen.button.right <= seen.video.right + 1 && seen.button.y >= seen.video.y - 1, JSON.stringify(seen && { button: seen.button, video: seen.video }));
+  shot('video-button');
+
+  // Opening it lists what the page is actually playing; the hook answers with the element's
+  // own source.
+  await inContentScript(`(() => { const h = [...document.documentElement.children].find((e) => e.__wrap); h.__wrap.querySelector('.btn').click(); return true; })()`);
+  const listed = await waitFor('the video in the picker', async () => {
+    const r = await look();
+    return r && r.panelHidden === false && r.rows.length ? r : null;
+  }, 20000);
+  check('the picker lists the video the page plays', !!listed && listed.rows.some((t) => /progressive|\?/.test(t)), JSON.stringify(listed && listed.rows));
+
+  // Choosing it hands the video over. The suite has the dialog off from the quiet checks on;
+  // turn it back on for this hand-over, the way most users have it.
+  await inWorker('chrome.storage.sync.set({ askBeforeDownload: true })');
+  await sleep(300);
+  await inContentScript(`(() => { const h = [...document.documentElement.children].find((e) => e.__wrap); h.__wrap.querySelector('.row').click(); return true; })()`);
+  const d = await dialog();
+  const shown = d && (await dialogShowing(d, /\/media\/clip\.mp4/));
+  check('the picker asks before handing the video over', !!shown, JSON.stringify(shown));
+  if (d) await press(d, 'later');
+  await inWorker('chrome.storage.sync.set({ askBeforeDownload: false })');
+  const got = await waitFor('the video in reIDM', async () => itemFor(await reidmItems(), '/media/clip.mp4'), 20000);
+  check('the picker hands the video to reIDM', !!got);
+  await deleteItem(got);
+  await noDialog();
+
+  // A web-component player: its <video> is in an open shadow root, invisible to the document's
+  // querySelectorAll. The button and the picker have to find it there too.
+  await openPage(`${onRoot()}/shadow`);
+  await evalPage(`document.querySelector('video-player').shadowRoot.querySelector('video').play().catch(() => {}); true`);
+  await sleep(1200);
+  const sh = await waitFor('the button on a shadow-root video', async () => {
+    const r = await look();
+    return r && r.shown && r.button && r.button.w > 80 ? r : null;
+  }, 20000);
+  check('a video inside an open shadow root is detected', !!sh && sh.text === 'Download with reIDM', JSON.stringify(sh));
+  await inContentScript(`(() => { const h = [...document.documentElement.children].find((e) => e.__wrap); h.__wrap.querySelector('.btn').click(); return true; })()`);
+  const shList = await waitFor('the shadow video in the picker', async () => {
+    const r = await look();
+    return r && r.panelHidden === false && r.rows.length ? r : null;
+  }, 20000);
+  check('the picker lists a video inside a shadow root', !!shList && shList.rows.some((t) => /progressive|\?/.test(t)), JSON.stringify(shList && shList.rows));
+}
+
 async function main() {
   // Never test against somebody else's reIDM: a service already on these ports would answer
   // for ours, and the run would prove nothing (or the start would fail halfway).
@@ -1206,6 +1313,7 @@ async function main() {
 
   await requestIdChecks();
   await mediaChecks();
+  await videoButtonChecks();
   await openPage(`http://127.0.0.1:${SITE_PORT}/`);
 
   // 7. reIDM stopped; the native host starts it

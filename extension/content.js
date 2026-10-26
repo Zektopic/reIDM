@@ -292,8 +292,16 @@
   }
 
   // ── DOM scan: only what changed ───────────────────────────────────────
+  //
+  // A player in a web component keeps its <video> inside a shadow root, which the document's
+  // querySelectorAll does not see — and media events from it do not reach the document. Open
+  // shadow roots are walked too, to a sane depth. Closed ones are the component's own business
+  // and cannot be reached at all.
 
-  function scanRoot(root, items) {
+  const SHADOW_DEPTH = 8;
+  const WATCH = { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href'] };
+
+  function scanRoot(root, items, depth = 0) {
     const push = (url, kind) => {
       const u = absolute(url);
       if (u && isHttp(u)) items.push({ url: u, kind });
@@ -308,12 +316,23 @@
       const href = a.getAttribute('href') || '';
       if (LINK_EXT.test(href)) push(href, 'link');
     };
-    if (root.nodeType !== 1 && root !== document) return;
+    if (root.nodeType !== 1 && root.nodeType !== 11 && root !== document) return;
     if (root.matches && root.matches(MEDIA_SEL)) media(root);
     else if (root.matches && root.matches('a[href]')) link(root);
-    if (!root.firstElementChild && root !== document) return;
+    // The node itself may be a web component whose player lives in its shadow root.
+    if (root.shadowRoot && depth < SHADOW_DEPTH) {
+      if (observer) observer.observe(root.shadowRoot, WATCH);
+      scanRoot(root.shadowRoot, items, depth + 1);
+    }
     for (const el of root.querySelectorAll(MEDIA_SEL)) media(el);
     for (const a of root.querySelectorAll('a[href]')) link(a);
+    if (depth >= SHADOW_DEPTH) return;
+    for (const el of root.querySelectorAll('*')) {
+      if (!el.shadowRoot) continue;
+      // Its own changes are invisible from out here: watch it as well as scan it.
+      if (observer) observer.observe(el.shadowRoot, WATCH);
+      scanRoot(el.shadowRoot, items, depth + 1);
+    }
   }
 
   /** Nodes added or changed since the last scan; `document` means everything. */

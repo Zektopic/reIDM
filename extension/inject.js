@@ -319,6 +319,20 @@
 
   // ── on-demand: the formats for whatever is playing right now ───────────
 
+  /** The first video on the page, looking inside open shadow roots: a web-component player
+   *  keeps its <video> where document.querySelector cannot see it. */
+  function findVideo(root = document, depth = 0) {
+    const v = root.querySelector('video');
+    if (v) return v;
+    if (depth >= 8) return null;
+    for (const el of root.querySelectorAll('*')) {
+      if (!el.shadowRoot) continue;
+      const found = findVideo(el.shadowRoot, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
   /** Everything the picker can offer for the current page. */
   function currentFormats() {
     // 1. YouTube: the player response for this video holds the full per-codec list.
@@ -341,7 +355,7 @@
 
     // 3. A <video> element with a plain source. Kept alongside the manifest rather than
     //    instead of it: an unlabelled progressive file is still worth offering.
-    const v = document.querySelector('video');
+    const v = findVideo();
     if (v) {
       const src = v.currentSrc || v.src;
       if (src && /^https?:/i.test(src)) {
