@@ -9,9 +9,9 @@
 //      popup and the quality picker can offer them, including inside cross-origin iframes.
 //   4. Answer the popup, the resource grabber page and the context menus.
 //
-// How a browser download is taken over (the same mechanism Tonec's own extension uses; see
-// `background.js` 6.43.1: `onCreated` pauses, `onDeterminingFilename` decides, then
-// `downloads.cancel()` for "taken", `downloads.resume()` otherwise):
+// How a browser download is taken over (Chrome's download events: `onCreated` pauses,
+// `onDeterminingFilename` decides, then `downloads.cancel()` for "taken", `downloads.resume()`
+// otherwise):
 //
 //   * Chrome does not show a download in its download bubble or shelf, does not open a "Save as"
 //     dialog, and cannot finish writing the file, until the file name has been decided. An
@@ -134,6 +134,17 @@ const baseName = (p) => (p ? String(p).split(/[\\/]/).pop() || null : null);
 /** The last thing we know about reIDM, mirrored to `storage.local` so content scripts can
  *  decide synchronously whether to intercept a click. */
 let status = { up: false, version: null };
+
+/** Seed from the stored copy: a worker that starts with reIDM down must be able to correct a
+ *  stored "up" left by the previous session. Without this, `publishStatus` compares against an
+ *  in-memory status that is already `false` and never writes the correction. */
+const statusSeeded = chrome.storage.local
+  .get('reidm-status')
+  .then((o) => {
+    const saved = o['reidm-status'];
+    if (saved && typeof saved.up === 'boolean') status = { ...status, ...saved };
+  })
+  .catch(() => {});
 
 /** Every write to `storage.local` wakes the `storage.onChanged` listener of every content
  *  script in every frame of every tab, so the status is written only when it changes. */
@@ -303,11 +314,12 @@ async function cookieHeader(url, storeId) {
 }
 
 /** Where an action from the popup, the grabber or a menu came from: the tab, whether it is
- *  incognito, and its cookie store. */
-async function tabContext(tabOrId) {
+ *  incognito, and its cookie store. `fallbackIncognito` matters when the source tab has been
+ *  closed since: the window the action came from still knows, and the cookies must follow it. */
+async function tabContext(tabOrId, fallbackIncognito = false) {
   let tab = tabOrId && typeof tabOrId === 'object' ? tabOrId : null;
   if (!tab && Number.isInteger(tabOrId) && tabOrId >= 0) tab = await chrome.tabs.get(tabOrId).catch(() => null);
-  const incognito = !!(tab && tab.incognito);
+  const incognito = !!((tab && tab.incognito) || (!tab && fallbackIncognito));
   return { tab, incognito, url: tab ? tab.url : undefined, storeId: await cookieStoreFor(tab ? tab.id : null, incognito) };
 }
 
@@ -447,7 +459,7 @@ async function takeOver(item, suggest) {
       refresh: armed,
     });
     if (choice.action === 'cancel') {
-      // IDM's Cancel: nobody downloads it, neither reIDM nor the browser.
+      // Cancel: nobody downloads it, neither reIDM nor the browser.
       await cancelAndErase(item.id);
       release();
       await pendingDelete(item.id);
@@ -711,6 +723,7 @@ function settle(q, choice) {
 
 /** Show the next request, or close the window when none is left. */
 function advance() {
+  if (dialog.current) clearTimeout(dialog.current.timer);
   dialog.current = null;
   const next = dialog.queue.shift();
   if (!next) {
@@ -722,6 +735,7 @@ function advance() {
     return;
   }
   dialog.current = next;
+  armDialogTimer(next);
   const r = next.req;
   const probing = !(r.size > 0) && r.probe !== false && !r.incognito && isHttp(r.url);
   dialogPost({
@@ -780,7 +794,7 @@ function dialogGone() {
   const shown = !!dialog.port;
   const cur = dialog.current;
   Object.assign(dialog, { windowId: null, port: null, current: null });
-  // Closing the window while it shows a download is Cancel, as in IDM.
+  // Closing the window while it shows a download is Cancel.
   if (cur && !cur.answered) settle(cur, { action: 'cancel', filename: cur.req.filename, report: () => {} });
   if (!dialog.queue.length) return;
   if (shown) {
@@ -854,19 +868,27 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name === 'confirm') onDialogConnect(port);
 });
 
+/** How long the request now on screen waits for an answer. Armed when it is shown, not when it
+ *  was queued: a deep queue would otherwise have every timer expire together, settling requests
+ *  that were never displayed. */
+function armDialogTimer(q) {
+  clearTimeout(q.timer);
+  q.timer = setTimeout(() => {
+    // The user is away. A held download goes back to the browser (whose server may drop a
+    // connection paused for this long); anything else is simply not downloaded.
+    const i = dialog.queue.indexOf(q);
+    if (i >= 0) dialog.queue.splice(i, 1);
+    settle(q, { action: 'release', reason: 'nobody answered the download dialog', report: () => {} });
+    if (dialog.current === q) {
+      dialogPost({ type: 'error', id: q.id, text: `Nobody answered for ${DIALOG_TIMEOUT_MS / 60000} minutes. ${FALLBACK_TEXT[q.req.fallback] || FALLBACK_TEXT.none}`, waiting: dialog.queue.length });
+    } else if (dialog.current) dialogPost({ type: 'waiting', waiting: dialog.queue.length });
+  }, DIALOG_TIMEOUT_MS);
+}
+
 /** Queue a request in the dialog. Resolves to `{action, filename, reason?, report(result)}`. */
 function askUser(req) {
   return new Promise((resolve) => {
     const q = { id: ++dialog.seq, req, resolve, answered: false, timer: null };
-    q.timer = setTimeout(() => {
-      // The user is away. A held download goes back to the browser (whose server may drop a
-      // connection paused for this long); anything else is simply not downloaded.
-      const i = dialog.queue.indexOf(q);
-      if (i >= 0) dialog.queue.splice(i, 1);
-      settle(q, { action: 'release', reason: 'nobody answered the download dialog', report: () => {} });
-      if (dialog.current === q) dialogPost({ type: 'error', id: q.id, text: `Nobody answered for ${DIALOG_TIMEOUT_MS / 60000} minutes. ${FALLBACK_TEXT[req.fallback] || FALLBACK_TEXT.none}`, waiting: dialog.queue.length });
-      else if (dialog.current) dialogPost({ type: 'waiting', waiting: dialog.queue.length });
-    }, DIALOG_TIMEOUT_MS);
     dialog.queue.push(q);
     if (dialog.port && !dialog.current) advance();
     else if (dialog.port) dialogPost({ type: 'waiting', waiting: dialog.queue.length });
@@ -915,7 +937,9 @@ async function captureLink(msg, sender) {
   const incognito = !!(sender.tab && sender.tab.incognito);
   if (incognito && !settings.captureIncognito) return { ok: false, error: 'incognito' };
   let filename = msg.filename || nameFromUrl(url) || undefined;
-  const referer = (sender.tab && sender.tab.url) || undefined;
+  // The frame the click came from, not the top-level page: a Referer-checking host wants
+  // the page hosting the link, and in an iframe that is `sender.url`.
+  const referer = sender.url || (sender.tab && sender.tab.url) || undefined;
   const armed = await refreshArmed(url);
   const choice = await maybeAsk({ url, from: referer, filename, incognito, nameFromServer: !msg.filename, fallback: 'browser', program: isProgram(filename), refresh: armed });
   // Cancelled: the click is used up and nothing downloads. `ok` so the page doesn't hand the
@@ -968,7 +992,7 @@ async function captureMagnet(msg, sender) {
   }
   if (choice.action === 'release') return { ok: false, error: choice.reason };
   // The name is the torrent's own; an edited one is not sent, as reIDM names it from the torrent.
-  const r = await deliver(choice, () => send({ url: msg.url, referer: (sender.tab && sender.tab.url) || undefined, later: choice.action === 'later' }));
+  const r = await deliver(choice, () => send({ url: msg.url, referer: sender.url || (sender.tab && sender.tab.url) || undefined, later: choice.action === 'later' }));
   if (r.ok) {
     recordCapture({ url: msg.url, filename: name, outcome: r.outcome, id: r.id });
     flashBadge('✓', '#2ea053', 2500);
@@ -1034,8 +1058,11 @@ function sniffed(d) {
 
 /** tabId -> Map(url -> {url, kind, at, mime?, size?, formats?}) */
 const mediaByTab = new Map();
-/** tabId -> Set of manifest addresses (without their query) already re-fetched. */
+/** tabId -> Map(manifest address without its query -> when it may be fetched again). A
+ *  successful fetch never is; a failed one (an expired token, a network error) is retried after
+ *  a pause, instead of being skipped for the tab's whole life. */
 const manifestsFetched = new Map();
+const MANIFEST_RETRY_MS = 30_000;
 
 // What a page may report, and how much of it. A page — any script on it, an advert included —
 // can post messages to the content script, so nothing it says is stored unchecked.
@@ -1208,15 +1235,15 @@ function parseDASH(body, baseUrl) {
 /** Re-fetch a manifest and return its variants. Resolves to [] on anything unexpected. */
 async function formatsForManifest(url) {
   stats.manifestFetches++;
-  try {
-    const r = await fetch(url, { credentials: 'include', cache: 'no-store' });
-    if (!r.ok || Number(r.headers.get('content-length')) > 2 * 1024 * 1024) return [];
-    const body = (await r.text()).slice(0, 2 * 1024 * 1024);
-    if (body.includes('#EXTM3U')) return parseHLS(body, url);
-    if (body.includes('<MPD') || body.includes('<Representation')) return parseDASH(body, url);
-  } catch {
-    /* a signed, POST-only or otherwise unfetchable URL; the page hook may still have it */
-  }
+  // A rejected promise means the fetch failed (a network error, a 403 from an expired token),
+  // which `noteManifest` retries later. An OK answer with nothing to parse — a media playlist,
+  // say — is a real answer and must not be retried.
+  const r = await fetch(url, { credentials: 'include', cache: 'no-store' });
+  if (!r.ok) throw new Error(`manifest answered HTTP ${r.status}`);
+  if (Number(r.headers.get('content-length')) > 2 * 1024 * 1024) return [];
+  const body = (await r.text()).slice(0, 2 * 1024 * 1024);
+  if (body.includes('#EXTM3U')) return parseHLS(body, url);
+  if (body.includes('<MPD') || body.includes('<Representation')) return parseDASH(body, url);
   return [];
 }
 
@@ -1264,18 +1291,23 @@ function noteManifest(tabId, url, extra) {
   if (tabId === undefined || tabId < 0) return;
   record(tabId, url, 'stream', extra);
   const key = manifestKey(url);
-  if (!manifestsFetched.has(tabId)) manifestsFetched.set(tabId, new Set());
+  if (!manifestsFetched.has(tabId)) manifestsFetched.set(tabId, new Map());
   const done = manifestsFetched.get(tabId);
   const entry = (mediaByTab.get(tabId) || new Map()).get(url);
-  if (done.has(key) || (entry && entry.formats && entry.formats.length)) return;
-  done.add(key);
+  if (entry && entry.formats && entry.formats.length) return;
+  const retryAt = done.get(key);
+  if (retryAt !== undefined && Date.now() < retryAt) return;
+  // Infinity: one successful fetch is enough, even when it held no variants (a media playlist).
+  done.set(key, Infinity);
   // Fetch and parse it out-of-band; the picker can then offer real variants even if the page
   // fetched the manifest where the hook could not see it.
-  formatsForManifest(url).then(async (formats) => {
-    if (!formats.length) return;
-    await mediaReady;
-    record(tabId, url, 'stream', { formats: cleanFormats(formats) });
-  });
+  formatsForManifest(url)
+    .then(async (formats) => {
+      if (!formats.length) return;
+      await mediaReady;
+      record(tabId, url, 'stream', { formats: cleanFormats(formats) });
+    })
+    .catch(() => done.set(key, Date.now() + MANIFEST_RETRY_MS));
 }
 
 function onMediaRequest(d) {
@@ -1527,8 +1559,8 @@ async function downloadFormat(msg, sender) {
 /** The popup's "Download selected": handled here rather than in the popup, because the popup
  *  closes as soon as the dialog takes the focus, and its loop would die with it. All the
  *  dialogs queue up in the one window. */
-async function queueMedia(items, tabId) {
-  const ctx = await tabContext(tabId);
+async function queueMedia(items, tabId, incognito = false) {
+  const ctx = await tabContext(tabId, incognito);
   const list = (Array.isArray(items) ? items : []).slice(0, MAX_ITEMS_PER_MESSAGE).filter((it) => it && okUrl(it.url));
   const results = await Promise.all(list.map((it) => (it.video
     ? downloadVideoPage(it.url, short(it.title), null, ctx)
@@ -1546,7 +1578,7 @@ async function queueMedia(items, tabId) {
 
 /** What a content script — and so, in the worst case, a compromised page — may ask for.
  *  Everything else is for the extension's own pages: the popup, the grabber, the options. */
-const FROM_PAGES = new Set(['media', 'formats-for-tab', 'capture-link', 'bypass', 'open-tab', 'download-format']);
+const FROM_PAGES = new Set(['media', 'formats-for-tab', 'capture-link', 'bypass', 'open-tab', 'download-format', 'page-navigated']);
 
 /** Answer with the handler's result, or with its error: the sender always hears back. */
 const answer = (reply, p) => {
@@ -1589,6 +1621,15 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       showCount(tabId);
       reply({ ok: true });
       return false;
+    case 'page-navigated':
+      // A single-page site moved to another video: the old page's manifests and media are not
+      // this page's. The content script reports the new ones from here on.
+      if (tabId != null) {
+        forgetTab(tabId);
+        showCount(tabId);
+      }
+      reply({ ok: true });
+      return false;
     case 'capture-link':
       return answer(reply, captureLink(msg, sender));
     case 'bypass':
@@ -1612,11 +1653,11 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       return true;
     }
     case 'queue-media':
-      return answer(reply, queueMedia(msg.items, tabId));
+      return answer(reply, queueMedia(msg.items, tabId, msg.incognito === true));
     case 'add-batch':
       return answer(reply, (async () => {
         await settingsReady;
-        const ctx = await tabContext(tabId);
+        const ctx = await tabContext(tabId, msg.incognito === true);
         if (ctx.incognito && !settings.captureIncognito) return { ok: false, error: INCOGNITO_OFF };
         const items = (Array.isArray(msg.items) ? msg.items : []).filter((it) => it && okUrl(it.url)).map((it) => ({ url: it.url, filename: short(it.filename) || undefined }));
         const r = await sendBatch(items, ctx.url || msg.referer, msg.later, ctx.storeId);
@@ -1636,7 +1677,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     case 'recent-captures':
       return answer(reply, chrome.storage.session.get(CAPTURES_KEY).then((o) => ({ items: o[CAPTURES_KEY] || [] }), () => ({ items: [] })));
     case 'open-grabber':
-      return answer(reply, openGrabber(tabId, msg.select).then(() => ({ ok: true })));
+      return answer(reply, tabContext(tabId).then((ctx) => openGrabber(tabId, msg.select, ctx.incognito)).then(() => ({ ok: true })));
     case 'wake':
       // A dialog whose worker stopped: starting this one has already settled what it held.
       return answer(reply, reconciled.then(() => ({ ok: true })));
@@ -1668,10 +1709,13 @@ chrome.runtime.onInstalled.addListener(() => {
 
 /** The grabber, for a tab. `select: 'files'` ticks the links to files, so "all links" is one
  *  look and one press rather than hundreds of pages queued blind. */
-async function openGrabber(tabId, select) {
+async function openGrabber(tabId, select, incognito = false) {
   if (!Number.isInteger(tabId)) return;
   const q = new URLSearchParams({ tab: String(tabId) });
   if (select === 'files') q.set('select', 'files');
+  // The source tab may be closed before the grabber hands anything over; carry its window's
+  // incognito state along so the cookies still come from the right store.
+  if (incognito) q.set('inc', '1');
   await chrome.tabs.create({ url: chrome.runtime.getURL(`grabber.html?${q}`) });
 }
 
@@ -1692,7 +1736,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   }
 
   if (info.menuItemId === MENU.grab || info.menuItemId === MENU.page) {
-    if (tab) openGrabber(tab.id, info.menuItemId === MENU.page ? 'files' : undefined);
+    if (tab) openGrabber(tab.id, info.menuItemId === MENU.page ? 'files' : undefined, ctx.incognito);
   }
 });
 
@@ -1714,7 +1758,8 @@ chrome.runtime.onStartup.addListener(() => {
 // Once per worker start — a module service worker is woken by events without `onStartup`: settle
 // whatever a stopped worker left held, and see whether reIDM is there.
 const reconciled = reconcilePending();
-ping();
+// After the stored status is known, so a failed ping can correct it.
+statusSeeded.then(() => ping());
 
 // For DevTools and `tools/capture-test.mjs`: a module worker's functions are not globals.
 globalThis.reidm = { ping, launchReidm, send, status: () => status, stats, ytdlpFormat, cookieStoreFor, syncPageHook: () => syncPageHook() };

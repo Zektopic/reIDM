@@ -150,9 +150,15 @@ fn read_torrent_file(f: &Path) -> Result<Vec<u8>> {
 
 /// The torrents being taken out of each manager's session right now (see
 /// [`Manager::forget_torrent`]): each flips to `true` once its removal, files and all, is over.
-/// Keyed by the manager, so tests that run several managers in one process don't wait on each
-/// other.
-static FORGETTING: std::sync::Mutex<BTreeMap<usize, Vec<tokio::sync::watch::Receiver<bool>>>> = std::sync::Mutex::new(BTreeMap::new());
+/// Keyed by the manager and the info hash, so a torrent added again while its old copy is still
+/// being removed waits for that copy — and tests that run several managers in one process don't
+/// wait on each other.
+struct Pending {
+    tx: tokio::sync::watch::Sender<bool>,
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+static FORGETTING: std::sync::Mutex<BTreeMap<usize, BTreeMap<String, Pending>>> = std::sync::Mutex::new(BTreeMap::new());
 
 /// What [`Manager::add_to_session`] decided: where the torrent's files go, and whether that is
 /// reIDM carrying on its own files there.
@@ -334,7 +340,7 @@ impl Manager {
     /// there: it would carry on with that handle, whose files the pending removal then deletes
     /// from under it. False when one is still being removed after [`FORGET_WAIT`].
     async fn forgotten(&self) -> bool {
-        let pending: Vec<tokio::sync::watch::Receiver<bool>> = FORGETTING.lock().unwrap().get(&self.manager_key()).cloned().unwrap_or_default();
+        let pending: Vec<tokio::sync::watch::Receiver<bool>> = FORGETTING.lock().unwrap().get(&self.manager_key()).map(|m| m.values().map(|p| p.rx.clone()).collect()).unwrap_or_default();
         let deadline = tokio::time::Instant::now() + FORGET_WAIT;
         for mut rx in pending {
             // An error means the removal's task ended (it was the last sender): done as well.
@@ -343,6 +349,22 @@ impl Manager {
             }
         }
         true
+    }
+
+    /// Register that this torrent is being taken out, and return the switch that ends the wait
+    /// once it is gone. Called when the removal starts — before the running copy has drained —
+    /// so a torrent added again right then cannot slip in and adopt the handle being removed.
+    pub(crate) fn mark_forgetting(&self, hash: &str) -> tokio::sync::watch::Sender<bool> {
+        let mut all = FORGETTING.lock().unwrap();
+        let list = all.entry(self.manager_key()).or_default();
+        // Those already over need no waiting for; dropping them keeps the list short.
+        list.retain(|_, p| !*p.rx.borrow());
+        if let Some(p) = list.get(hash) {
+            return p.tx.clone();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        list.insert(hash.to_string(), Pending { tx: tx.clone(), rx });
+        tx
     }
 
     /// Download a torrent. Ok(true) when complete (it then goes on seeding, if it should),
@@ -529,6 +551,14 @@ impl Manager {
         };
         let target = {
             let mut db = self.0.db.lock().unwrap();
+            // Checked again, now that the awaits and disk work above are done: two adds of the
+            // same torrent can both pass the first check, and the first to reach this lock takes
+            // the hash. Without this, the second silently adopted the first's engine handle and
+            // folder, and removing either with its files deleted the shared data.
+            let twin = db.items.values().find(|i| i.id != id && i.torrent.as_ref().is_some_and(|t| t.info_hash == hash)).map(|i| i.id);
+            if let Some(other) = twin {
+                bail!("this torrent is already in the list (download {other}); remove one of the two");
+            }
             let claimed: HashSet<PathBuf> = db.items.values().filter(|i| i.id != id).map(|i| i.path.clone()).collect();
             let it = db.items.get_mut(&id).context("the download was removed")?;
             let target = choose_target(it, &hash, &name, &details, &claimed, file_free, &folders)?;
@@ -561,7 +591,10 @@ impl Manager {
         let Some(added) = unless_stopped(&live.cancel, adding).await else { return Ok(None) };
         let added = added.map_err(|_| anyhow!("the torrent engine did not answer within {}s", OP_WAIT.as_secs()))?;
         let added = added.map_err(|e| {
-            if format!("{e:#}").contains("allow_overwrite") {
+            // Only a file that is already there (the engine's create_new) gets the advice; a
+            // permission error, a full disk or a bad name keeps its own explanation.
+            let exists = e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists));
+            if exists {
                 anyhow!("a file this torrent would create already exists in {}; reIDM won't write over it. Move it away and resume", target.folder.display())
             } else {
                 e
@@ -635,19 +668,25 @@ impl Manager {
     }
 
     /// Take a torrent out of the session, with its files or without. It happens in the
-    /// background; [`Manager::run_torrent`] waits for it before adding a torrent again.
-    pub(crate) fn forget_torrent(&self, hash: String, delete_files: bool) {
-        let Some(s) = self.0.torrents.get().cloned() else { return };
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        {
-            let mut all = FORGETTING.lock().unwrap();
-            let list = all.entry(self.manager_key()).or_default();
-            // Those already over need no waiting for; dropping them keeps the list short.
-            list.retain(|r| !*r.borrow() && r.has_changed().is_ok());
-            list.push(rx);
+    /// background; [`Manager::run_torrent`] waits for it before adding a torrent again. With no
+    /// session or no copy of it in the engine there is nothing to ask: the files recorded in the
+    /// list are deleted directly, so a torrent finished before a restart does not keep its files.
+    pub(crate) fn forget_torrent(&self, t: TorrentStatus, item_path: PathBuf, delete_files: bool) {
+        let hash = t.info_hash.clone();
+        let tx = self.mark_forgetting(&hash);
+        let Some(s) = self.0.torrents.get().cloned() else {
+            if delete_files {
+                delete_recorded_files(&t, &item_path);
+            }
+            let _ = tx.send(true);
+            return;
+        };
+        let present = Self::handle(&s, &hash).is_some();
+        if !present && delete_files {
+            delete_recorded_files(&t, &item_path);
         }
         tokio::spawn(async move {
-            if Self::handle(&s, &hash).is_some() {
+            if present {
                 let id = librqbit::api::TorrentIdOrHash::Hash(librqbit::dht::Id20::from_str(&hash).unwrap_or_default());
                 if let Err(e) = bounded(s.delete(id, delete_files)).await {
                     tracing::warn!("could not remove torrent {hash}: {e:#}");
@@ -672,8 +711,16 @@ impl Manager {
             let torrents = live.keys().filter(|id| db.items.get(id).is_some_and(|i| i.request.torrent.is_some())).count();
             (torrents, live.len())
         };
-        s.ratelimits.set_upload_bps(limit(up));
-        s.ratelimits.set_download_bps(limit(torrent_share(global, torrents, all)));
+        let down = torrent_share(global, torrents, all);
+        // Only when it changed: librqbit's set_* rebuilds the limiter with a full burst, and
+        // `share_the_limit` calls this every 500 ms — resetting it there let torrents run
+        // two to three times over their share.
+        if self.0.torrent_up_bps.swap(up, Ordering::Relaxed) != up {
+            s.ratelimits.set_upload_bps(limit(up));
+        }
+        if self.0.torrent_down_bps.swap(down, Ordering::Relaxed) != down {
+            s.ratelimits.set_download_bps(limit(down));
+        }
     }
 }
 
@@ -713,6 +760,44 @@ fn choose_target(
             let folder = folders.iter().find(|f| !taken(f)).cloned().unwrap_or_else(|| unique_path(&dir, &safe_name, taken));
             Ok(Target { path: folder.clone(), folder, resuming: false })
         }
+    }
+}
+
+/// Delete the files a torrent's status records, and the directories that become empty — used
+/// when the engine has no copy of the torrent to delete (one finished before a restart). Anything
+/// else in the folder (another download's file, the user's) stays, and so does a folder that
+/// still holds something.
+fn delete_recorded_files(t: &TorrentStatus, item_path: &Path) {
+    let Some(folder) = &t.folder else { return };
+    for f in t.files.iter().filter(|f| f.selected) {
+        let from = folder.join(f.path.replace('\\', "/"));
+        if let Err(e) = std::fs::remove_file(&from) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("could not delete {}: {e}", from.display());
+            }
+        }
+    }
+    fn prune(dir: &Path, depth: usize) {
+        if depth > 64 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let dirs: Vec<PathBuf> = rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect();
+        for d in dirs {
+            prune(&d, depth + 1);
+        }
+        let _ = std::fs::remove_dir(dir);
+    }
+    if let Ok(rd) = std::fs::read_dir(folder) {
+        let dirs: Vec<PathBuf> = rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect();
+        for d in dirs {
+            prune(&d, 0);
+        }
+    }
+    // The torrent's own folder (its path is the folder) goes when nothing is left in it; a
+    // single file's folder is the download folder, which is not ours to remove.
+    if item_path == folder {
+        let _ = std::fs::remove_dir(folder);
     }
 }
 

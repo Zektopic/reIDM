@@ -1,4 +1,4 @@
-//! Visual style: a modernised version of the classic IDM window — light chrome, blue selection,
+//! Visual style: a modernised classic download-manager window — light chrome, blue selection,
 //! a dense bordered table. Colours are defined once here so the whole app stays consistent.
 
 use egui::{Color32, CornerRadius, Stroke, Visuals};

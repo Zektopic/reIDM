@@ -6,8 +6,7 @@ and the resource grabber, and what to check when it doesn't connect.
 
 It works in Chromium-based browsers — **Google Chrome, Microsoft Edge, Brave, Vivaldi, Opera and
 Chromium** — and from extension 1.8 in **Firefox 128 and later**, on Windows, macOS and Linux
-alike. (Tonec's own "IDM Integration Module" can also talk to reIDM — see
-[EXTENSION.md](EXTENSION.md) — but reIDM's extension is the one to use.)
+alike.
 
 ## Install
 
@@ -77,7 +76,7 @@ them from there — before anything is saved:
 
 1. Chrome decides a download's file name before it shows the download, opens a *Save as* dialog,
    or writes the file. The extension holds that decision.
-2. It pauses the transfer and shows reIDM's **Download file info** dialog, as IDM does: the
+2. It pauses the transfer and shows reIDM's **Download file info** dialog: the
    address, the file name (which you can change), the folder it will be saved in and its size.
    **Start download** carries on; **Download later** puts it in reIDM's scheduled queue;
    **Cancel** (or Escape, or closing the dialog) means nobody downloads it — neither reIDM nor
@@ -153,7 +152,7 @@ hook needs Firefox 128 or later (older versions fall back to the manifests `webR
 | Files a page builds itself (`blob:`, `data:`) | they exist only inside the page |
 | Downloads started by other extensions | they asked for the browser's downloader specifically |
 | Downloads the browser flags as dangerous | the browser's own warning applies |
-| Alt+click | IDM's convention for "let the browser have this one" |
+| Alt+click | "let the browser have this one" |
 | Sites on your never-capture list | your choice |
 | Incognito windows, unless enabled | reIDM keeps a history of what it downloaded |
 | Anything smaller than the minimum size, if you set one | your choice |
@@ -277,7 +276,7 @@ default; so are links to other web pages). **Get sizes** asks each server for it
 only for addresses that name a file, never for plain page links.
 Then **Download with reIDM** sends the selection in one batch, with the page as the referrer and
 your cookies for each site — or **Download later** to put it in the scheduled queue, **Copy
-addresses**, or **Export** as an IDM `.ef2` list.
+addresses**, or **Export** as a URL list.
 
 ## Capture rules
 
@@ -289,7 +288,7 @@ most people need are at the top; the rest are under **Advanced**.
 | Take over browser downloads | on | The master switch. |
 | Take file links before the browser opens them | on | Click interception, for links whose address names a type on the list. |
 | Every download, whatever its type | on | Off: only downloads whose name has one of the listed types. |
-| File types | IDM's list | Space-separated extensions; `R0*` style wildcards work. |
+| File types | The built-in list | Space-separated extensions; `R0*` style wildcards work. |
 | Leave downloads smaller than (KB) | 0 | 0 takes everything. |
 | Never take downloads from these sites | — | One host per line; subdomains are included. |
 | Also in incognito windows | off | Also needs *Allow in incognito* on the extension's details page. While off, reIDM does nothing in incognito windows — the right-click menu, the popup and the grabber included. When on, the incognito window's own cookies are used, never the normal profile's. |
@@ -342,5 +341,5 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#browser-integration). The usual caus
   minute, or open the popup, which checks immediately.
 - **Downloads still go to the browser.** Check the popup: is takeover on, and is the site on the
   never-capture list? The popup's *Just now* list says why the browser kept a download.
-- **Tonec's IDM extension is installed too.** Two extensions both taking over downloads will fight;
-  disable one of them.
+- **Another extension takes over downloads too.** Two extensions both taking over downloads will
+  fight; disable one of them.

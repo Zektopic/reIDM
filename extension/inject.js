@@ -319,22 +319,29 @@
 
   // ── on-demand: the formats for whatever is playing right now ───────────
 
-  /** The first video on the page, looking inside open shadow roots: a web-component player
-   *  keeps its <video> where document.querySelector cannot see it. */
-  function findVideo(root = document, depth = 0) {
-    const v = root.querySelector('video');
-    if (v) return v;
+  /** The first video on the page. `deep` also looks inside open shadow roots — a web-component
+   *  player keeps its <video> where document.querySelector cannot see it — but that walk reads
+   *  every element, so only the picker's on-demand query asks for it. */
+  function findVideo(deep = false) {
+    const v = document.querySelector('video');
+    if (v || !deep) return v;
+    return findVideoInShadows(document, 0);
+  }
+
+  function findVideoInShadows(root, depth) {
     if (depth >= 8) return null;
     for (const el of root.querySelectorAll('*')) {
       if (!el.shadowRoot) continue;
-      const found = findVideo(el.shadowRoot, depth + 1);
+      const v = el.shadowRoot.querySelector('video');
+      if (v) return v;
+      const found = findVideoInShadows(el.shadowRoot, depth + 1);
       if (found) return found;
     }
     return null;
   }
 
   /** Everything the picker can offer for the current page. */
-  function currentFormats() {
+  function currentFormats(deep = false) {
     // 1. YouTube: the player response for this video holds the full per-codec list.
     const yt = currentYouTube();
     if (yt) return yt;
@@ -355,7 +362,7 @@
 
     // 3. A <video> element with a plain source. Kept alongside the manifest rather than
     //    instead of it: an unlabelled progressive file is still worth offering.
-    const v = findVideo();
+    const v = findVideo(deep);
     if (v) {
       const src = v.currentSrc || v.src;
       if (src && /^https?:/i.test(src)) {
@@ -379,7 +386,7 @@
     if (e.source !== window || !e.data || e.data.__reidmQuery !== true) return;
     let payload;
     try {
-      payload = currentFormats();
+      payload = currentFormats(true);
     } catch (err) {
       payload = { source: null, formats: [], error: String(err && err.message) };
     }

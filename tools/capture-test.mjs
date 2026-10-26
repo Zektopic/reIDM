@@ -320,7 +320,7 @@ const site = http.createServer((req, res) => {
 const env = { ...process.env, REIDM_DATA_DIR: DATA, RUST_LOG: 'reidm=info,reidm_core=info' };
 let daemon = null;
 async function startDaemon() {
-  daemon = spawn(path.join(BIN, `reidm${EXE}`), ['daemon', '--no-idm-port', '--dir', REIDM_DL], { env, stdio: ['ignore', 'ignore', 'inherit'] });
+  daemon = spawn(path.join(BIN, `reidm${EXE}`), ['daemon', '--dir', REIDM_DL], { env, stdio: ['ignore', 'ignore', 'inherit'] });
   for (let i = 0; i < 100; i++) {
     if (await apiUp()) return;
     await sleep(100);

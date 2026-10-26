@@ -1,10 +1,10 @@
 //! What to do with something dropped on the window, and which copied text is a download link.
 //!
-//! Dropping: a `.torrent` file opens *Add torrent*; a `.txt`, `.list` or IDM `.ef2` list is
-//! imported; a link — or a shortcut file holding one (`.url` on Windows, `.webloc` on macOS, a
-//! `.desktop` link on Linux) — opens *Add URL* with it filled in. The window system hands over
-//! files only, never bare text, so a link dragged straight out of a browser arrives as such a
-//! shortcut, or not at all.
+//! Dropping: a `.torrent` file opens *Add torrent*; a `.txt` or `.list` list is imported; a
+//! link — or a shortcut file holding one (`.url` on Windows, `.webloc` on macOS, a `.desktop`
+//! link on Linux) — opens *Add URL* with it filled in. The window system hands over files only,
+//! never bare text, so a link dragged straight out of a browser arrives as such a shortcut, or
+//! not at all.
 //!
 //! Copying: *Watch the clipboard* offers a copied link when it points at a file of a type
 //! reIDM catches from the browser, or is a magnet link — not every copied web address.
@@ -59,7 +59,7 @@ pub fn classify(items: &[PathBuf], read: impl Fn(&Path) -> Option<String>) -> Ve
         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| s.into_owned());
         match extension(&name).as_str() {
             "torrent" => out.push(Dropped::Torrent(p.clone())),
-            "txt" | "list" | "ef2" => out.push(Dropped::Import(p.clone())),
+            "txt" | "list" => out.push(Dropped::Import(p.clone())),
             "url" | "webloc" | "desktop" => match read(p).as_deref().and_then(shortcut_link) {
                 Some(u) => urls.push(u),
                 None => out.push(Dropped::Unsupported(name)),
@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn drops_are_sorted_by_what_they_are() {
-        let files: Vec<PathBuf> = ["/tmp/debian.torrent", "/tmp/links.TXT", "/tmp/idm.ef2", "/tmp/Ubuntu.url", "/tmp/photo.jpg", "https://example.com/a.zip"].iter().map(PathBuf::from).collect();
+        let files: Vec<PathBuf> = ["/tmp/debian.torrent", "/tmp/links.TXT", "/tmp/Ubuntu.url", "/tmp/photo.jpg", "https://example.com/a.zip"].iter().map(PathBuf::from).collect();
         let read = |p: &Path| (p.extension()? == "url").then(|| "[InternetShortcut]\r\nURL=https://example.com/ubuntu.iso\r\n".to_string());
         assert_eq!(
             classify(&files, read),
@@ -144,7 +144,6 @@ mod tests {
                 Dropped::Urls(vec!["https://example.com/ubuntu.iso".into(), "https://example.com/a.zip".into()]),
                 Dropped::Torrent("/tmp/debian.torrent".into()),
                 Dropped::Import("/tmp/links.TXT".into()),
-                Dropped::Import("/tmp/idm.ef2".into()),
                 Dropped::Unsupported("photo.jpg".into()),
             ]
         );

@@ -7,7 +7,7 @@
 //
 // Linux only: each service runs in its own `systemd-run --user --scope`, whose cgroup both
 // limits it and reports what it used (CPU time, peak memory). Nothing touches the real reIDM:
-// the service gets its own data folder, its own ports (REIDM_UI_PORT / REIDM_LOCAL_PORT) and a
+// the service gets its own data folder, its own ports (REIDM_UI_PORT) and a
 // throw-away HOME, so it registers no browser helpers.
 //
 // For each profile:
@@ -190,12 +190,11 @@ class Service {
       XDG_CACHE_HOME: path.join(this.home, '.cache'),
       REIDM_DATA_DIR: this.data,
       REIDM_UI_PORT: String(this.ui),
-      REIDM_LOCAL_PORT: String(this.local),
       RUST_LOG: 'reidm=warn,reidm_core=warn',
     };
     // The unit name is reused after a crash, so the cgroup's counters start again with the
     // restarted service; `cpu` and `peak` are therefore per run of the service.
-    this.proc = spawn('systemd-run', ['--user', '--scope', '--quiet', '--collect', `--unit=${this.unit}-${Date.now()}`, ...props, '--', BIN, 'daemon', '--no-idm-port', '--dir', this.dl], {
+    this.proc = spawn('systemd-run', ['--user', '--scope', '--quiet', '--collect', `--unit=${this.unit}-${Date.now()}`, ...props, '--', BIN, 'daemon', '--dir', this.dl], {
       env,
       stdio: ['ignore', 'ignore', 'pipe'],
     });

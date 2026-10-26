@@ -283,7 +283,7 @@ impl App {
         }
         caption(ui, p, match current {
             OnFinish::Notification => "A notification from the desktop. Where they are switched off, the Download complete window shows instead.",
-            OnFinish::Dialog => "IDM's small window, with buttons to open the file or its folder.",
+            OnFinish::Dialog => "The small Download complete window, with buttons to open the file or its folder.",
             OnFinish::Nothing => "The list still shows it as complete.",
         });
 
@@ -333,7 +333,7 @@ impl App {
         caption(ui, p, "Where finished downloads go, unless one is given a folder of its own.");
 
         ui.checkbox(&mut self.options.form.sort, "Save each download in the folder for its type");
-        caption(ui, p, "As IDM does: videos in Video, archives in Compressed, installers in Programs… A folder left empty is the one under the download folder shown in grey.");
+        caption(ui, p, "By type: videos in Video, archives in Compressed, installers in Programs… A folder left empty is the one under the download folder shown in grey.");
         let defaults: Vec<String> = self.options.form.folders.iter().map(|(n, _)| self.default_folder(n)).collect();
         let sort = self.options.form.sort;
         let mut pick: Option<(&'static str, String)> = None;
@@ -398,7 +398,7 @@ impl App {
         caption(ui, p, "Starts and stops the scheduled queue (Download later) at set times, such as overnight.");
 
         section(ui, "Asking before each download");
-        label(ui, p, "Whether the browser asks before handing a download to reIDM (IDM's Download File Info window) is set in the reIDM extension's options.");
+        label(ui, p, "Whether the browser asks before handing a download to reIDM (the extension's Download file info dialog) is set in the reIDM extension's options.");
     }
 
     /// Options › Network: the proxy.

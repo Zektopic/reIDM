@@ -63,8 +63,6 @@ impl Snapshot {
 /// The slower-changing half of the daemon's state.
 #[derive(Default, Clone, PartialEq)]
 pub struct Service {
-    /// Owns the port the official IDM extension dials first.
-    pub idm_port: bool,
     pub platform: String,
     pub version: String,
     pub settings: Option<Settings>,
@@ -184,17 +182,28 @@ fn is_reidm(pid: &str) -> bool {
     }
 }
 
+/// Where to quit a service the window could not stop, in that system's own words.
+fn quit_advice() -> &'static str {
+    if cfg!(windows) {
+        "end reidm.exe in Task Manager's Details tab"
+    } else if cfg!(target_os = "macos") {
+        "quit it in Activity Monitor, or run `pkill -x reidm`"
+    } else {
+        "run `pkill -x reidm`"
+    }
+}
+
 /// Stop a service of another reIDM version that holds the port. It is signalled (`SIGTERM`,
 /// which a 0.8 service answers by flushing its list before it exits), and killed only if it does
 /// not go. Its list is on disk either way, and the service this window starts carries on from it.
 fn replace_service(stale: &str) -> Result<(), String> {
     let port = ui_port();
     let pids = listening_pids(port).map_err(|e| {
-        format!("an older reIDM service ({stale}) is running and could not be stopped automatically ({e}); quit it in Activity Monitor, or run `pkill -x reidm`, and open reIDM again — its downloads carry on")
+        format!("an older reIDM service ({stale}) is running and could not be stopped automatically ({e}); {}, and open reIDM again — its downloads carry on", quit_advice())
     })?;
     let pids: Vec<String> = pids.into_iter().filter(|p| is_reidm(p)).collect();
     if pids.is_empty() {
-        return Err(format!("reIDM {stale} is running but its process could not be found; quit it in Activity Monitor, or run `pkill -x reidm`, and open reIDM again — its downloads carry on"));
+        return Err(format!("reIDM {stale} is running but its process could not be found; {}, and open reIDM again — its downloads carry on", quit_advice()));
     }
     for pid in &pids {
         stop_pid(pid, false);
@@ -214,7 +223,7 @@ fn replace_service(stale: &str) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(format!("the older reIDM service ({stale}) is still running; quit it in Activity Monitor, or run `pkill -x reidm`, and open reIDM again — its downloads carry on"))
+    Err(format!("the older reIDM service ({stale}) is still running; {}, and open reIDM again — its downloads carry on", quit_advice()))
 }
 
 /// Make sure the service this window belongs to is running, starting it if needed. A service of
@@ -408,9 +417,12 @@ impl Client {
     pub fn bulk(&self, ids: &[u64], action: &str) -> Result<(usize, Option<String>), String> {
         let mut done = 0;
         let mut first_error = None;
+        // A bulk action is applied one download at a time; 10,000 of them take much longer than
+        // the command client's 10 seconds, and a timeout there invites a destructive retry.
+        let client = self.with_timeout(Duration::from_secs(300));
         // The service takes at most 10,000 per request.
         for chunk in ids.chunks(10_000) {
-            let v: serde_json::Value = self.post_json("/api/downloads/bulk", serde_json::json!({ "ids": chunk, "action": action }))?;
+            let v: serde_json::Value = client.post_json("/api/downloads/bulk", serde_json::json!({ "ids": chunk, "action": action }))?;
             done += v["ok"].as_u64().unwrap_or(0) as usize;
             if first_error.is_none() {
                 first_error = v["results"].as_array().into_iter().flatten().find_map(|r| r["error"].as_str().map(str::to_string));
@@ -438,7 +450,6 @@ impl Client {
     fn service(&self) -> Option<Service> {
         let v: serde_json::Value = serde_json::from_str(&self.get("/api/status").ok()?).ok()?;
         Some(Service {
-            idm_port: v["idm_port"].as_bool().unwrap_or(false),
             platform: v["platform"].as_str().unwrap_or_default().to_string(),
             version: v["version"].as_str().unwrap_or_default().to_string(),
             extension: serde_json::from_value(v["extension"].clone()).ok(),
@@ -785,7 +796,7 @@ fn poll_loop(client: Client, tx: Sender<Snapshot>, pace: Pace, poked: Receiver<(
                 } else if r.status == 405 {
                     // What an older service answers to `GET /api/downloads/rows` (its only
                     // route below `/api/downloads` answers DELETE).
-                    "the background service is an older reIDM and this window can't use it. Quit it in Activity Monitor, or run `pkill -x reidm`, and open reIDM again — its downloads carry on".to_string()
+                    format!("the background service is an older reIDM and this window can't use it. {}, and open reIDM again — its downloads carry on", quit_advice())
                 } else {
                     r.into_result().err().unwrap_or_default()
                 };

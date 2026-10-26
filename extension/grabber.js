@@ -15,6 +15,9 @@ const TAB_ID = Number(params.get('tab'));
 /** `select=files`: opened as "Download all links on this page" — the links to files come
  *  ticked, so the user confirms one list instead of reIDM queueing every page link blind. */
 const PRESELECT_FILES = params.get('select') === 'files';
+/** The source tab's window was incognito. Kept in the URL because that tab may be closed by
+ *  the time the selection is handed over, and the cookies must still come from its store. */
+const INCOGNITO = params.get('inc') === '1';
 const FILE_CATS = new Set(['video', 'audio', 'document', 'archive', 'program']);
 
 const CATEGORIES = [
@@ -451,6 +454,7 @@ async function queue(later) {
   const r = await chrome.runtime.sendMessage({
     type: 'add-batch',
     tabId: TAB_ID,
+    incognito: INCOGNITO,
     referer: pageInfo.url,
     later,
     items: list.map((it) => ({ url: it.url, filename: it.download || undefined })),
@@ -539,12 +543,10 @@ $('copy').addEventListener('click', async () => {
   setMsg(`Copied ${chosen().length} address(es)`, 'ok');
 });
 $('export').addEventListener('click', () => {
-  // IDM's .ef2, which IDM and reIDM both import; the page goes along as the referer.
-  const ef2 = chosen()
-    .map((it) => `<\r\n${it.url}\r\n${pageInfo.url ? `referer: ${pageInfo.url}\r\n` : ''}>\r\n`)
-    .join('');
-  download('reidm-grabbed.ef2', ef2);
-  setMsg(`Exported ${chosen().length} address(es) as an IDM/reIDM .ef2 list`, 'ok');
+  // A plain list of addresses, one per line, which reIDM and its import both understand.
+  const list = chosen().map((it) => it.url).join('\n') + '\n';
+  download('reidm-grabbed.txt', list);
+  setMsg(`Exported ${chosen().length} address(es) as a URL list`, 'ok');
 });
 $('all').addEventListener('change', (e) => {
   for (const it of visible()) {

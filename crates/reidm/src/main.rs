@@ -3,8 +3,6 @@ mod launch;
 mod logfile;
 mod rows;
 mod web;
-mod session;
-mod ws;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "reidm", version, about = "reIDM - cross-platform download manager with IDM browser-extension support")]
+#[command(name = "reidm", version, about = "reIDM - a cross-platform download manager")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -29,9 +27,6 @@ enum Cmd {
         /// Download directory (default: your Downloads folder).
         #[arg(short, long)]
         dir: Option<PathBuf>,
-        /// Do not try to bind the IDM-compatible privileged port 1001.
-        #[arg(long)]
-        no_idm_port: bool,
     },
     /// Download a URL right now in this terminal (no daemon needed).
     Get {
@@ -64,7 +59,7 @@ enum Cmd {
         /// File name to save as (a single address only).
         #[arg(short, long)]
         output: Option<String>,
-        /// Add to the scheduled queue without starting (IDM's "Download Later").
+        /// Add to the scheduled queue without starting.
         #[arg(long)]
         later: bool,
         /// The addresses are pages with a video (YouTube and the many other sites yt-dlp
@@ -104,10 +99,9 @@ enum Cmd {
         #[arg(long)]
         later: bool,
     },
-    /// Queue every URL in a text file (one per line, `#` comments) or an IDM `.ef2` export;
-    /// `-` reads stdin.
+    /// Queue every URL in a text file (one per line, `#` comments); `-` reads stdin.
     Import {
-        /// The list or `.ef2` file; `-` reads stdin.
+        /// The list file; `-` reads stdin.
         file: String,
         /// Folder to save into (default: reIDM's download folder).
         #[arg(short, long)]
@@ -116,14 +110,11 @@ enum Cmd {
         #[arg(long)]
         later: bool,
     },
-    /// Write the current list to a file (`-` for stdout): plain URLs, or IDM's `.ef2` format.
+    /// Write the current list to a file (`-` for stdout): one URL per line.
     Export {
         /// Where to write; `-` writes to stdout.
         #[arg(default_value = "-")]
         file: String,
-        /// `txt` or `ef2`; by default taken from the file's extension.
-        #[arg(long)]
-        format: Option<String>,
     },
     /// Show or set the global speed limit: `reidm limit 500K`, `reidm limit off`.
     Limit {
@@ -201,18 +192,10 @@ enum Cmd {
     Ui,
     /// Check GitHub for a newer release.
     UpdateCheck,
-    /// Register the native-messaging hosts (com.zektopic.reidm for reIDM's extension,
-    /// com.tonec.idm for Tonec's) with the installed browsers.
+    /// Register the native-messaging host (com.zektopic.reidm) with the installed browsers.
     InstallHost,
     /// Remove the native-messaging host registrations.
     UninstallHost,
-    /// Make a local copy of the official IDM extension usable on this OS (see docs/EXTENSION.md).
-    PatchExtension {
-        /// The unpacked official extension.
-        src: PathBuf,
-        /// Where to write the patched copy (a new folder).
-        dst: PathBuf,
-    },
 }
 
 /// The time now, as unix seconds.
@@ -301,7 +284,7 @@ async fn api_post_empty(path: &str, body: serde_json::Value) -> Result<()> {
 }
 
 /// `500K`, `2M`, `1.5MB`, `1.5MiB`, `800kb/s`, `1048576` -> bytes per second. Units are binary
-/// (K = 1024), as IDM uses. A lowercase `b` before `ps` (`8Mbps`, `500kbps`) means bits, the way
+/// (K = 1024). A lowercase `b` before `ps` (`8Mbps`, `500kbps`) means bits, the way
 /// connection speeds are quoted, and is divided by eight.
 fn parse_rate(s: &str) -> Result<u64> {
     let raw = s.trim();
@@ -397,10 +380,13 @@ fn print_list(mut items: Vec<serde_json::Value>) {
 
 /// Where `reidm get` keeps its list for one address: the same folder for the same address and
 /// destination, so running the same command again after an interruption resumes it.
-fn get_data_dir(url: &str, dir: Option<&std::path::Path>) -> PathBuf {
-    // FNV-1a: stable across builds, unlike the standard library's hasher.
+fn get_data_dir(url: &str, dir: Option<&std::path::Path>, output: Option<&str>) -> PathBuf {
+    // FNV-1a: stable across builds, unlike the standard library's hasher. The requested name is
+    // part of the key: resuming an interrupted `-o first.bin` as `-o second.bin` must not carry
+    // on into the first one's file.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in url.bytes().chain([0]).chain(dir.map(|d| d.to_string_lossy().into_owned()).unwrap_or_default().into_bytes()) {
+    let name = output.unwrap_or_default().as_bytes().to_vec();
+    for b in url.bytes().chain([0]).chain(dir.map(|d| d.to_string_lossy().into_owned()).unwrap_or_default().into_bytes()).chain([0]).chain(name) {
         h ^= b as u64;
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
@@ -413,14 +399,21 @@ fn get_data_dir(url: &str, dir: Option<&std::path::Path>) -> PathBuf {
 fn single_instance(data: &std::path::Path) -> Result<std::fs::File> {
     let path = data.join("daemon.lock");
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).with_context(|| format!("cannot create {}", path.display()))?;
-    match f.try_lock() {
-        Ok(()) => Ok(f),
-        Err(std::fs::TryLockError::WouldBlock) => bail!(
-            "reIDM's service is already running for {} (it holds {}). Use that one, or stop it first.",
-            data.display(),
-            path.display()
-        ),
-        Err(std::fs::TryLockError::Error(e)) => Err(e).with_context(|| format!("cannot lock {}", path.display())),
+    // A service that was just asked to stop may still be flushing its list; a window opened
+    // right after (Quit, then reopen) starts one, and that one must wait instead of exiting at
+    // once and leaving the window without a service.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match f.try_lock() {
+            Ok(()) => return Ok(f),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Err(std::fs::TryLockError::WouldBlock) => bail!(
+                "reIDM's service is already running for {} (it holds {}). Use that one, or stop it first.",
+                data.display(),
+                path.display()
+            ),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("cannot lock {}", path.display())),
+        }
     }
 }
 
@@ -436,21 +429,17 @@ async fn terminated() {
     std::future::pending::<()>().await
 }
 
-async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool) -> Result<()> {
+async fn run_daemon(connections: usize, dir: Option<PathBuf>) -> Result<()> {
     let data = default_data_dir();
     std::fs::create_dir_all(&data).with_context(|| format!("cannot create reIDM's data folder {}", data.display()))?;
     let _lock = single_instance(&data)?;
 
-    // Both ports before anything else: a service without its API is invisible to the window
-    // and the extension, which would wait for it forever, so losing either is fatal.
+    // The API port before anything else: a service without it is invisible to the window and
+    // the extension, which would wait for it forever, so losing it is fatal.
     let ui_port = web::ui_port();
     let ui = tokio::net::TcpListener::bind(("127.0.0.1", ui_port)).await.with_context(|| {
         format!("cannot serve reIDM's API on 127.0.0.1:{ui_port}: another program is using that port. Close it, then start reIDM again")
     })?;
-    let local_port = ws::local_port();
-    let local = ws::bind(&format!("127.0.0.1:{local_port}"))
-        .await
-        .with_context(|| format!("cannot serve the extension socket on 127.0.0.1:{local_port}: another program is using that port"))?;
 
     let mgr = Manager::open(&data, dir.unwrap_or_else(default_download_dir), connections)?;
     mgr.spawn_scheduler();
@@ -478,40 +467,10 @@ async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool)
             Err(e) => tracing::debug!("native host not registered: {e:#}"),
         }
     });
-    let idm_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if !no_idm_port {
-        let m = mgr.clone();
-        let bound = idm_port.clone();
-        tokio::spawn(async move {
-            match ws::bind(&format!("127.0.0.1:{}", ws::IDM_PORT)).await {
-                Ok(l) => {
-                    bound.store(true, std::sync::atomic::Ordering::Relaxed);
-                    if let Err(e) = ws::serve(l, m).await {
-                        tracing::error!("extension port {} stopped: {e:#}", ws::IDM_PORT);
-                    }
-                }
-                Err(e) => {
-                    // On Unix 1001 is privileged, so the usual cause there is the port
-                    // number itself rather than a competing download manager.
-                    let hint = if e.to_string().contains("os error 13") {
-                        "ports below 1024 need privileges on this system"
-                    } else {
-                        "another download manager may be using it"
-                    };
-                    tracing::warn!(
-                        "not serving the extension's default port {}: {e} ({hint}). \
-                         The native-messaging host and `reidm patch-extension` still work — \
-                         see docs/EXTENSION.md.",
-                        ws::IDM_PORT
-                    );
-                }
-            }
-        });
-    }
 
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
     let stop = std::sync::Arc::new(stop);
-    let app = web::App::new(mgr.clone(), ui_port, idm_port, stop.clone());
+    let app = web::App::new(mgr.clone(), ui_port, stop.clone());
     // Keep the computer awake while downloads run, and do the when-done action; *exit* stops
     // the service the way the window's Quit does, after telling the window.
     let exit_app = app.clone();
@@ -521,13 +480,11 @@ async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool)
         std::sync::Arc::new(move || exit_app.begin_exit()),
     );
     let mut web = tokio::spawn(web::serve(ui, app));
-    let mut socket = tokio::spawn(ws::serve(local, mgr.clone()));
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminated() => {}
         _ = stopped.wait_for(|s| *s) => {}
         r = &mut web => bail!("reIDM's API stopped: {}", r.map_err(anyhow::Error::from).and_then(|r| r).err().map(|e| format!("{e:#}")).unwrap_or_default()),
-        r = &mut socket => bail!("the extension socket stopped: {}", r.map_err(anyhow::Error::from).and_then(|r| r).err().map(|e| format!("{e:#}")).unwrap_or_default()),
     }
     tracing::info!("shutting down");
     // Stop serving and take the token file away; downloads carry on from their last checkpoint
@@ -564,9 +521,19 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(matches!(&cli.cmd, Cmd::Daemon { .. }));
     match cli.cmd {
-        Cmd::Daemon { connections, dir, no_idm_port } => run_daemon(connections, dir, no_idm_port).await?,
+        Cmd::Daemon { connections, dir } => run_daemon(connections, dir).await?,
         Cmd::Get { url, connections, dir, output, referer, cookie } => {
-            let data = get_data_dir(&url, dir.as_deref());
+            let data = get_data_dir(&url, dir.as_deref(), output.as_deref());
+            std::fs::create_dir_all(&data)?;
+            // A second `get` for the same address and name would share this folder's list and
+            // part file; the first to finish deletes the folder from under the other.
+            let lock_path = data.join("get.lock");
+            let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).with_context(|| format!("cannot create {}", lock_path.display()))?;
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => bail!("another `reidm get` is already downloading this address (it holds {}); wait for it to finish", lock_path.display()),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("cannot lock {}", lock_path.display())),
+            }
             let mgr = Manager::open(&data, dir.clone().unwrap_or_else(default_download_dir), connections)?;
             let id = mgr.add(Request { url, filename: output, referer, cookie, dir, ..Default::default() })?;
             loop {
@@ -575,8 +542,10 @@ async fn main() -> Result<()> {
                 match &it.status {
                     Status::Done => {
                         eprintln!("\rdone: {}                                   ", it.path.display());
-                        // Its list is only there to resume an interrupted run.
+                        // Its list is only there to resume an interrupted run. The lock goes
+                        // after the manager has saved, before the folder is removed.
                         drop(mgr);
+                        drop(lock);
                         let _ = std::fs::remove_dir_all(&data);
                         break;
                     }
@@ -693,31 +662,20 @@ async fn main() -> Result<()> {
         }
         Cmd::Import { file, dir, later } => {
             let text = read_input(&file)?;
-            let mut body = if reidm_core::lists::looks_like_ef2(&text) {
-                let items = reidm_core::lists::parse_ef2(&text);
-                if items.is_empty() {
-                    bail!("no downloads found in {file}");
-                }
-                println!("importing {} download(s) from an IDM export", items.len());
-                serde_json::json!({ "items": items })
-            } else {
-                let urls = reidm_core::grabber::parse_url_list(&text);
-                if urls.is_empty() {
-                    bail!("no http(s) URLs found in {file}");
-                }
-                println!("importing {} URL(s)", urls.len());
-                serde_json::json!({ "urls": urls })
-            };
-            body["later"] = serde_json::Value::Bool(later);
+            let urls = reidm_core::grabber::parse_url_list(&text);
+            if urls.is_empty() {
+                bail!("no http(s) URLs found in {file}");
+            }
+            println!("importing {} URL(s)", urls.len());
+            let mut body = serde_json::json!({ "urls": urls, "later": later });
             if let Some(d) = dir {
                 body["dir"] = serde_json::Value::String(d.to_string_lossy().into_owned());
             }
             let v = api_post("/api/downloads/batch", body).await?;
             report_batch(&v);
         }
-        Cmd::Export { file, format } => {
-            let format = format.unwrap_or_else(|| if file.to_ascii_lowercase().ends_with(".ef2") { "ef2".into() } else { "txt".into() });
-            let text = match api_get(&format!("/api/export?format={format}")).await {
+        Cmd::Export { file } => {
+            let text = match api_get("/api/export").await {
                 Ok(t) => t,
                 // No daemon: read the list straight from disk. Any other failure (a refused
                 // token, a full disk) is reported rather than papered over.
@@ -725,27 +683,10 @@ async fn main() -> Result<()> {
                 Err(_) => {
                     let path = default_data_dir().join("downloads.json");
                     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("no downloads yet ({})", path.display()))?)?;
-                    let items: Vec<&serde_json::Value> = v["items"].as_object().into_iter().flatten().map(|(_, it)| it).collect();
-                    if format == "ef2" {
-                        let entries: Vec<reidm_core::lists::Entry> = items
-                            .iter()
-                            .filter_map(|it| {
-                                Some(reidm_core::lists::Entry {
-                                    url: it["request"]["url"].as_str()?.to_string(),
-                                    referer: it["request"]["referer"].as_str().map(str::to_string),
-                                    cookie: None,
-                                    user_agent: it["request"]["user_agent"].as_str().map(str::to_string),
-                                    post_data: None,
-                                })
-                            })
-                            .collect();
-                        reidm_core::lists::write_ef2(&entries)
-                    } else {
-                        let mut urls: Vec<String> = items.iter().filter_map(|it| it["request"]["url"].as_str().map(str::to_string)).collect();
-                        urls.sort();
-                        urls.dedup();
-                        reidm_core::grabber::url_list_text(&urls)
-                    }
+                    let mut urls: Vec<String> = v["items"].as_object().into_iter().flatten().filter_map(|(_, it)| it["request"]["url"].as_str().map(str::to_string)).collect();
+                    urls.sort();
+                    urls.dedup();
+                    reidm_core::grabber::url_list_text(&urls)
                 }
             };
             match file.as_str() {
@@ -907,60 +848,7 @@ async fn main() -> Result<()> {
         }
         Cmd::InstallHost => install::install()?,
         Cmd::UninstallHost => install::uninstall()?,
-        Cmd::PatchExtension { src, dst } => patch_extension(&src, &dst)?,
     }
-    Ok(())
-}
-
-/// The shipped extension (v6.43.1) refuses to start unless `runtime.getPlatformInfo().os == "win"`
-/// and dials the privileged port 1001. This rewrites a *local, user-supplied* copy so it can talk to
-/// reIDM on Linux/macOS. Nothing from the vendor's extension is bundled with reIDM.
-fn patch_extension(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
-    fn copy_dir(a: &std::path::Path, b: &std::path::Path) -> Result<()> {
-        std::fs::create_dir_all(b)?;
-        for e in std::fs::read_dir(a)? {
-            let e = e?;
-            let t = b.join(e.file_name());
-            if e.file_type()?.is_dir() {
-                copy_dir(&e.path(), &t)?;
-            } else {
-                std::fs::copy(e.path(), t)?;
-            }
-        }
-        Ok(())
-    }
-    if !src.join("manifest.json").exists() {
-        bail!("{} is not an unpacked extension (no manifest.json)", src.display());
-    }
-    // `std::fs::copy` truncates its destination before writing, so `reidm patch-extension X X`
-    // would erase every file as it went. Refuse rather than destroy the user's copy.
-    fn absolute(p: &std::path::Path) -> std::path::PathBuf {
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            std::env::current_dir().map(|c| c.join(p)).unwrap_or_else(|_| p.to_path_buf())
-        }
-    }
-    let (a, b) = (absolute(src), absolute(dst));
-    if a == b {
-        bail!("source and destination are the same directory ({}); nothing was changed", a.display());
-    }
-    if b.starts_with(&a) {
-        bail!("destination {} is inside the source directory {}", b.display(), a.display());
-    }
-    copy_dir(src, dst)?;
-    // Drop Chrome's integrity file: it would flag the modified script as corrupt.
-    let _ = std::fs::remove_dir_all(dst.join("_metadata"));
-    let bg = dst.join("background.js");
-    let mut js = std::fs::read_to_string(&bg).context("background.js missing")?;
-    const GATE: &str = r#"if(a&&a.os!="win")return Gb(!1);"#;
-    const PORTS: &str = r#"La=["127.0.0.1:1001","0.1.0.1:1001"]"#;
-    if !js.contains(GATE) || !js.contains(PORTS) {
-        bail!("this extension version does not match the known patch points (tested with 6.43.1)");
-    }
-    js = js.replacen(GATE, "", 1).replacen(PORTS, &format!(r#"La=["127.0.0.1:{}"]"#, ws::DEFAULT_LOCAL_PORT), 1);
-    std::fs::write(&bg, js)?;
-    println!("patched extension written to {}\nLoad it via chrome://extensions -> Developer mode -> Load unpacked.", dst.display());
     Ok(())
 }
 
@@ -997,10 +885,12 @@ mod tests {
 
     #[test]
     fn get_resumes_in_the_same_folder() {
-        let a = get_data_dir("https://x/a.iso", None);
-        assert_eq!(a, get_data_dir("https://x/a.iso", None));
-        assert_ne!(a, get_data_dir("https://x/b.iso", None));
-        assert_ne!(a, get_data_dir("https://x/a.iso", Some(std::path::Path::new("/tmp"))));
+        let a = get_data_dir("https://x/a.iso", None, None);
+        assert_eq!(a, get_data_dir("https://x/a.iso", None, None));
+        assert_ne!(a, get_data_dir("https://x/b.iso", None, None));
+        assert_ne!(a, get_data_dir("https://x/a.iso", Some(std::path::Path::new("/tmp")), None));
+        assert_ne!(a, get_data_dir("https://x/a.iso", None, Some("first.bin")));
+        assert_ne!(get_data_dir("https://x/a.iso", None, Some("first.bin")), get_data_dir("https://x/a.iso", None, Some("second.bin")));
     }
 
     #[test]

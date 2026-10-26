@@ -4,14 +4,66 @@
 
 use librqbit::{AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerOptions, Session, SessionOptions};
 use reidm_core::{Manager, Request, SettingsPatch, Status, TorrentRequest};
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-fn tmp(tag: &str) -> PathBuf {
+#[allow(dead_code)]
+struct AutoCleanDir {
+    path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl AutoCleanDir {
+    fn create(path: PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn new(path: PathBuf) -> Self {
+        Self::create(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Deref for AutoCleanDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for AutoCleanDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AutoCleanDir {
+    fn drop(&mut self) {
+        if matches!(std::env::var("REIDM_KEEP_TEST_DIR").as_deref(), Ok("1" | "true")) {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+        if self.path.exists() {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = std::fs::remove_dir_all(&self.path);
+                if !self.path.exists() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn tmp(tag: &str) -> AutoCleanDir {
     let p = std::env::temp_dir().join(format!("reidm-torrent-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    AutoCleanDir::create(p)
 }
 
 async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
@@ -299,6 +351,32 @@ async fn starting_a_finished_torrent_again_downloads_it_again() {
     assert_eq!(again.path, first.path, "the same place, not a folder beside it");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(std::fs::read(&again.path).unwrap(), data, "and its file stays");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_torrents_files_are_deleted_after_a_restart() {
+    let dir = tmp("restart-delete");
+    std::fs::create_dir_all(dir.join("seeder")).unwrap();
+    let data = vec![3u8; 120_000];
+    std::fs::write(dir.join("seeder").join("payload.bin"), &data).unwrap();
+    let (bytes, hash, peer, _seeder) = seed(&dir.join("seeder").join("payload.bin")).await;
+    let id;
+    {
+        let m = quiet_manager(&dir);
+        id = m.add(from_peer(&dir, "t", &bytes, &hash, &peer)).unwrap();
+        assert_eq!(finished(&m, id).await.status, Status::Done);
+    }
+    let it = {
+        let m = quiet_manager(&dir);
+        m.get(id).unwrap()
+    };
+    let file = it.path.clone();
+    assert!(file.exists());
+    // A new manager has no torrent session: there is no engine handle to ask, so the files
+    // recorded in the list have to go directly.
+    let m = quiet_manager(&dir);
+    m.remove(id, true);
+    wait_for("its file to go", || !file.exists()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

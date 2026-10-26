@@ -295,44 +295,34 @@ impl App {
         self.add.open = true;
     }
 
-    /// Read URLs from a text file or an IDM `.ef2` export.
+    /// Read URLs from a text file.
     pub(super) fn import_from_file(&mut self) {
-        self.picker.open(&self.ctx, PickFor::Import, Ask::Open { title: "Import downloads", filter: ("URL lists and IDM exports", &["txt", "list", "csv", "ef2"]) });
+        self.picker.open(&self.ctx, PickFor::Import, Ask::Open { title: "Import downloads", filter: ("URL lists", &["txt", "list", "csv"]) });
     }
 
-    /// Queue the downloads in a URL list or an IDM `.ef2` export.
+    /// Queue the downloads in a URL list.
     pub(super) fn import_path(&mut self, path: &std::path::Path) {
         match std::fs::read(path) {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
-                if reidm_core::lists::looks_like_ef2(&text) {
-                    let entries = reidm_core::lists::parse_ef2(&text);
-                    if entries.is_empty() {
-                        return self.toast("That IDM export holds no downloads");
-                    }
-                    self.queue_batch(serde_json::json!({ "items": entries, "later": false }), false);
-                } else {
-                    self.queue_urls(reidm_core::grabber::parse_url_list(&text), false);
-                }
+                self.queue_urls(reidm_core::grabber::parse_url_list(&text), false);
             }
             Err(e) => self.toast(format!("could not read {}: {e}", path.display())),
         }
     }
 
-    /// Write the download list as plain URLs or as IDM's `.ef2`: first, where.
-    pub(super) fn export_download_list(&mut self, ef2: bool) {
+    /// Write the download list as plain URLs: first, where.
+    pub(super) fn export_download_list(&mut self) {
         if self.snap.items.is_empty() {
             return self.toast("There is nothing to export");
         }
-        let (format, filter): (&str, (&'static str, &'static [&'static str])) = if ef2 { ("ef2", ("IDM export", &["ef2"])) } else { ("txt", ("URL list", &["txt"])) };
-        self.picker.open(&self.ctx, PickFor::Export { ef2 }, Ask::Save { title: "Export the download list", name: format!("reidm-downloads.{format}"), filter });
+        self.picker.open(&self.ctx, PickFor::Export, Ask::Save { title: "Export the download list", name: "reidm-downloads.txt".into(), filter: ("URL list", &["txt"]) });
     }
 
-    fn export_list_to(&mut self, ef2: bool, path: std::path::PathBuf) {
-        let format = if ef2 { "ef2" } else { "txt" };
+    fn export_list_to(&mut self, path: std::path::PathBuf) {
         let n = self.snap.items.len();
         self.cmd.run(move |c| {
-            let r = c.with_timeout(Duration::from_secs(120)).get(&format!("/api/export?format={format}")).and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+            let r = c.with_timeout(Duration::from_secs(120)).get("/api/export").and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
             reply(move |app: &mut App| match r {
                 Ok(()) => app.toast(format!("Exported {n} download(s) to {}", path.display())),
                 Err(e) => app.toast(format!("Could not export: {e}")),
@@ -364,7 +354,7 @@ impl App {
                 }
             }),
             PickFor::Import => self.import_path(&path),
-            PickFor::Export { ef2 } => self.export_list_to(ef2, path),
+            PickFor::Export => self.export_list_to(path),
             PickFor::ExportFound(urls) => match std::fs::write(&path, reidm_core::grabber::url_list_text(&urls)) {
                 Ok(()) => self.toast(format!("Exported {} URL(s)", urls.len())),
                 Err(e) => self.toast(format!("could not write {}: {e}", path.display())),

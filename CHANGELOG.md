@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.8.0
+
+### Changed
+
+* **The browser-extension compatibility layer for another download manager is gone.** reIDM ships
+  only its own extension. Removed with it: the reverse-engineering reference material, the
+  WebSocket server on ports 1001/61001, `.ef2` list import/export, the official-extension patcher,
+  and the native hosts that existed only for that extension. Plain URL-list import/export and
+  reIDM's own extension are unaffected; the project is Zektopic's alone.
+
+### Fixed
+
+* **Torrents** no longer exceed their share of the speed limit: the engine's limiter was rebuilt
+  with a fresh burst every 500 ms. Removing a finished torrent after a restart now deletes its
+  files, a torrent added again while its old copy is still being removed waits for it, and two
+  adds of one torrent can no longer both take it. A failed engine add keeps its real reason unless
+  a file really already exists.
+* **The window survives a quick Quit and reopen** — a new service waits briefly for the old one's
+  lock — and tells Windows users to use Task Manager rather than `pkill`. Large bulk actions
+  (restart, remove, purge) are no longer cut off at ten seconds.
+* **`reidm get`** locks its temporary state and keys it by the requested file name, so two runs
+  cannot overwrite each other or resume into the wrong file.
+* **Extension privacy:** the resource grabber's cookies follow its source window after that tab
+  has been closed, so an incognito grab never reads the normal profile's cookies.
+* **Extension reliability:** the download dialog's timeout starts when a request is shown, not
+  when it was queued; a stale "connected" status is corrected after a browser restart; capture
+  sends the clicked frame as the referrer; a failed manifest fetch is retried after 30 seconds and
+  an in-page navigation clears that tab's media cache; the shadow-root video lookup runs only when
+  the picker asks, so pages without a video stay cheap.
+
+### Extension 1.9.1
+
+* The video button and its picker find videos inside open shadow roots, and the browser checks now
+  drive the whole visible flow — the button appears over the video, lists what the page plays, and
+  hands it to reIDM (109 checks, with a web-component player and a YouTube-shaped page).
+
 ## 0.7.1-rc4
 
 ### Extension 1.9.0
@@ -145,7 +181,7 @@
 ### Security
 
 * The IDM-extension socket (port 1001/61001) can no longer pause, remove or delete downloads — any
-  program on the computer could. Tonec's extension never used those messages; `reidm pause`,
+  program on the computer could. The official extension never used those messages; `reidm pause`,
   `resume` and `rm` now use the token-protected API and report unknown downloads.
 * The extension endpoints check the `Host` header (DNS rebinding), request sizes are limited per
   endpoint with a clear message, and a web page can no longer make the window show the extension
@@ -447,9 +483,6 @@ remaining core features, and the desktop window catches up with IDM's.
 * **Two transfers could run the same download** when two parts of reIDM started queued downloads
   at the same moment; they wrote one file until one renamed it away from the other. The slot is
   now reserved under the lock that chooses it.
-* **IDM's Alt-click and Insert-click didn't work with Tonec's extension.** reIDM sent 0 for the
-  key masks in its settings message, which disabled both; it now sends IDM's defaults (found by
-  reading the extension's code side by side with the decompiled IDM).
 * On Windows, a reIDM service started through the browser's native host is no longer killed
   when the browser closes the host: it now leaves the browser's job object.
 * **On Windows, the browser couldn't start reIDM when reIDM had registered its native host
@@ -484,7 +517,7 @@ Five bugs in the extension, all found by loading it in a real Chromium and watch
   asynchronously.
 * **A refused download was destroyed.** The browser's copy was cancelled before reIDM was asked, so
   if reIDM was not running the file was simply lost. It is now paused, offered, and cancelled only
-  on acceptance — otherwise resumed. See `docs/PROTOCOL.md`; the official extension does the same.
+  on acceptance — otherwise resumed.
 * **A manifest fetched inline was never seen.** A page that loads its manifest from an inline
   `<script>` does so before the injected hook exists. The worker now re-fetches and parses manifests
   it observes through `webRequest`, which does not depend on timing.
@@ -608,7 +641,6 @@ regression test in `crates/reidm-core/tests/resume.rs`.
 * **A stalled server hung the download forever** and Pause had no effect, because cancellation was only
   checked after a chunk arrived. There is now an idle timeout and a 1-second cancellation tick.
 * **Removing a download while its probe was in flight could resurrect it** from a stale copy.
-* **`reidm patch-extension SRC SRC` wiped the extension**, because `fs::copy` truncates its destination.
 * **A second daemon overwrote the API token file before discovering the port was taken**, breaking the
   running daemon's clients until it was restarted.
 * Windows: a filename of `NUL`/`CON.txt`/`COM1` resolved to a device and discarded the data; filenames are
@@ -626,8 +658,6 @@ regression test in `crates/reidm-core/tests/resume.rs`.
 
 * The no-console launcher that used to be called `reidm-gui` is gone; `reidm-gui` is now the desktop app.
   `reidm-gui --background` keeps its old job of starting the service at login.
-* `docs/PROTOCOL.md` now separates what the vendor binaries do from what reIDM implements, and no longer
-  presents the original `IDMMsgHost` named-pipe design as if reIDM spoke it.
 
 ## 0.1.1
 

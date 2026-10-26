@@ -3,7 +3,7 @@
 A Manifest V3 extension for Chromium-based browsers (Chrome, Edge, Brave, Vivaldi, Opera,
 Chromium; version 120 or later) and, from 1.8, for Firefox 128 or later through the Firefox build,
 that hands the browser's downloads, links and page media to the **reIDM** download manager. It is
-reIDM's own and doesn't depend on, or talk to, Tonec's IDM extension.
+reIDM's own and doesn't depend on, or talk to, any other download manager's extension.
 
 **For users:** installing, what it does with your downloads, every setting, and privacy are in
 [docs/BROWSER_INTEGRATION.md](../docs/BROWSER_INTEGRATION.md). This file is for working on the

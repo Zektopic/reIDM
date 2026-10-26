@@ -193,7 +193,7 @@ impl App {
         if torrents > 1 {
             self.toast(format!("Opened the first of {torrents} torrents; add the others one at a time"));
         } else if !refused.is_empty() {
-            self.toast(format!("reIDM can't add {}: drop links, .torrent files, or .txt and .ef2 lists", refused.join(", ")));
+            self.toast(format!("reIDM can't add {}: drop links, .torrent files, or .txt lists", refused.join(", ")));
         }
     }
 }

@@ -4,9 +4,63 @@
 use reidm_core::{Manager, SettingsPatch, Status};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[allow(dead_code)]
+struct AutoCleanDir {
+    path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl AutoCleanDir {
+    fn create(path: PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn new(path: PathBuf) -> Self {
+        Self::create(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Deref for AutoCleanDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for AutoCleanDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AutoCleanDir {
+    fn drop(&mut self) {
+        if matches!(std::env::var("REIDM_KEEP_TEST_DIR").as_deref(), Ok("1" | "true")) {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+        if self.path.exists() {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = std::fs::remove_dir_all(&self.path);
+                if !self.path.exists() {
+                    break;
+                }
+            }
+        }
+    }
+}
 
 fn body(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 253) as u8 ^ (i >> 12) as u8).collect()
@@ -56,11 +110,9 @@ fn serve(data: Vec<u8>) -> (u16, Arc<Mutex<Vec<String>>>) {
     (port, ranges)
 }
 
-fn tmp(tag: &str) -> PathBuf {
+fn tmp(tag: &str) -> AutoCleanDir {
     let p = std::env::temp_dir().join(format!("reidm-compat-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    AutoCleanDir::create(p)
 }
 
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
@@ -218,7 +270,8 @@ async fn a_finished_file_moves_across_drives() {
     let (port, _) = serve(data.clone());
     let dir = tmp("xdev");
     let dl = dir.join("dl");
-    let parts = shm.join(format!("reidm-xdev-{}", std::process::id()));
+    let _parts = AutoCleanDir::create(shm.join(format!("reidm-xdev-{}", std::process::id())));
+    let parts = _parts.to_path_buf();
     let m = Manager::open(&dir.join("state"), dl.clone(), 2).unwrap();
     // No free-space floor: this is about moving across file systems, and /dev/shm is often far
     // smaller than the default floor (64 MB in a container), where the download would rightly

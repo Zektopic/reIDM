@@ -1,8 +1,8 @@
 //! The reIDM desktop window.
 //!
-//! Laid out like the classic IDM main window: a menu bar, a toolbar of icon-over-label
+//! Laid out like a classic download-manager window: a menu bar, a toolbar of icon-over-label
 //! buttons, a category tree down the left, the download table in the middle, and a status
-//! bar. Every IDM feature the window shows is implemented; anything reIDM does not have is left
+//! bar. Every feature the window shows is implemented; anything reIDM does not have is left
 //! out rather than shown as a dead button.
 
 mod about;
@@ -145,7 +145,7 @@ pub struct App {
     // updates
     update: Option<UpdateOffer>,
     update_rx: Option<Receiver<Result<Option<reidm_core::update::Release>, String>>>,
-    /// IDM's "Categories > All Downloads" node is collapsible; start open.
+    /// The "Categories > All Downloads" node is collapsible; start open.
     cats_open: bool,
     downloads_open: bool,
     /// An update check is kicked off once, a moment after startup.

@@ -5,7 +5,7 @@
 //
 //   cargo build --release --locked -p reidm
 //   node tools/stress-test.mjs [--big-mib 2048] [--batch 300] [--cycles 10] [--soak 10]
-//                              [--profile none|potato|laptop]
+//                              [--profile none|potato|laptop] [--keep-workdir]
 //
 // Linux only (reads /proc for memory). Throw-away service: own data folder, own HOME,
 // ports 61201/61202, and a local site on 61290 — never the real reIDM.
@@ -20,6 +20,7 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const opt = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
+const KEEP_WORKDIR = args.includes('--keep-workdir');
 const BIN = opt('bin', path.join(ROOT, 'target', 'release', 'reidm'));
 const PROFILE = opt('profile', 'none');
 // The same imitated machines profile-test uses: the service is capped, the site is not.
@@ -43,6 +44,49 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pct = (a, p) => a.length ? [...a].sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor((a.length * p) / 100))] : 0;
 
 const run = fs.mkdtempSync(path.join(os.tmpdir(), 'reidm-stress-'));
+
+let openSockets = new Set();
+let site = null;
+let svc = null;
+let cleanedUp = false;
+
+function cleanup() {
+  if (cleanedUp) return;
+  cleanedUp = true;
+  if (openSockets) {
+    for (const s of openSockets) {
+      try { s.destroy(); } catch {}
+    }
+  }
+  if (site) {
+    try { site.close(); } catch {}
+  }
+  if (svc && svc.exitCode === null) {
+    try { svc.kill('SIGKILL'); } catch {}
+  }
+  if (!KEEP_WORKDIR) {
+    try {
+      if (fs.existsSync(run)) {
+        fs.rmSync(run, { recursive: true, force: true });
+      }
+    } catch (e) {
+      console.error(`failed to clean up work dir ${run}:`, e);
+    }
+  } else {
+    console.log(`work dir preserved: ${run}`);
+  }
+}
+
+process.on('exit', cleanup);
+process.on('SIGINT', () => {
+  cleanup();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  cleanup();
+  process.exit(143);
+});
+
 const home = path.join(run, 'home');
 const data = path.join(run, 'data');
 const dl = path.join(run, 'dl');
@@ -57,8 +101,7 @@ const small = Buffer.alloc(32 * 1024, 0x5a);
 // --- the site ---------------------------------------------------------------------------------
 // Serves ranges of the sparse file at about 8 MiB/s per connection, so a 2 GiB download runs
 // long enough to overlap the cycles; one path answers the 1-byte probe and then never answers.
-let openSockets = new Set();
-const site = http.createServer((req, res) => {
+site = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/hang.bin') {
     if ((req.headers.range || '') === 'bytes=0-0') {
@@ -107,10 +150,9 @@ const env = {
   XDG_CACHE_HOME: path.join(home, '.cache'),
   REIDM_DATA_DIR: data,
   REIDM_UI_PORT: String(UI),
-  REIDM_LOCAL_PORT: String(LOCAL),
   RUST_LOG: 'reidm=warn,reidm_core=warn',
 };
-const launch = [BIN, 'daemon', '--no-idm-port', '--dir', dl];
+const launch = [BIN, 'daemon', '--dir', dl];
 const [cmd, cmdArgs] = PROFILE === 'none'
   ? [BIN, launch.slice(1)]
   : ['systemd-run', ['--user', '--scope', '--quiet', '--collect', `--unit=reidm-stress-${process.pid}-${Date.now()}`, ...(LIMITS[PROFILE] ?? []), '--', ...launch]];
@@ -118,7 +160,7 @@ if (PROFILE !== 'none' && !LIMITS[PROFILE]) {
   console.error(`unknown profile ${PROFILE}: use potato, laptop or none`);
   process.exit(2);
 }
-const svc = spawn(cmd, cmdArgs, { env, stdio: ['ignore', 'ignore', 'pipe'] });
+svc = spawn(cmd, cmdArgs, { env, stdio: ['ignore', 'ignore', 'pipe'] });
 let svcErr = '';
 svc.stderr.on('data', (d) => (svcErr += d));
 let token = null;
@@ -277,11 +319,11 @@ try {
   console.error('ERROR', e);
   console.error(svcErr.slice(-2000));
 } finally {
-  for (const s of openSockets) s.destroy();
-  site.close();
-  if (svc.exitCode === null) { svc.kill('SIGKILL'); }
   console.log(`\n${results.length} phases, ${failures.length} failure(s)`);
   for (const f of failures) console.log(' -', f);
-  console.log(`work dir ${run}`);
+  if (KEEP_WORKDIR) {
+    console.log(`work dir ${run}`);
+  }
+  cleanup();
   process.exit(failures.length ? 1 : 0);
 }

@@ -18,7 +18,6 @@ flowchart LR
     CS[content.js<br>click interception]
     SW[service-worker.js<br>download takeover]
     GR[grabber page]
-    IDMX[Tonec's IDM extension<br>optional]
   end
   subgraph reIDM
     D[reidm daemon<br>engine + service]
@@ -31,19 +30,16 @@ flowchart LR
   SW -- "HTTP 61002 /ext/*" --> D
   SW -- "native messaging: launch" --> H
   H -- "starts" --> D
-  IDMX -- "WebSocket 1001 / 61001" --> D
-  IDMX -- "native messaging (com.tonec.idm)" --> H
-  H -- "WebSocket 61001" --> D
   G -- "HTTP 61002 /api/* + token" --> D
   C -- "HTTP 61002 /api/* + token" --> D
 ```
 
 | Component | What it is |
 |---|---|
-| **`reidm daemon`** | The service: the download engine, the HTTP API and web view on port 61002, and the IDM extension protocol on 61001 (and 1001 where it can be bound). Everything else is a client of it. |
+| **`reidm daemon`** | The service: the download engine, the HTTP API and web view on port 61002. Everything else is a client of it. |
 | **`reidm-gui`** | The desktop window (egui). It polls `/api/downloads` about three times a second and renders it; every button is an API call. Starts the service if it isn't running. |
 | **`reidm` CLI** | The same binary as the service, with commands that call the API ([CLI.md](CLI.md)). |
-| **`reidm-host`** | The native-messaging helper the browser runs. For reIDM's extension (`com.zektopic.reidm`) it does one thing — start the service. For Tonec's extension (`com.tonec.idm`) it relays the IDM protocol to the service. |
+| **`reidm-host`** | The native-messaging helper the browser runs. For reIDM's extension (`com.zektopic.reidm`) it does one thing — start the service. |
 | **reIDM's extension** | `extension/`, a Manifest V3 extension for Chromium browsers ([BROWSER_INTEGRATION.md](BROWSER_INTEGRATION.md)). |
 
 All four programs run as the user, not as a system service, and talk over `127.0.0.1` only.
@@ -116,10 +112,6 @@ parse, a cookies file made from the browser's cookies, and the page after `--`. 
 the file name before downloading and the final path after merging; progress goes into the same
 fields as any download's. Stopping kills yt-dlp's whole process tree (its process group on Unix,
 `taskkill /T` on Windows); resuming runs it again and it carries on from its `.part` files.
-
-**Tonec's extension** speaks the IDM protocol — binary messages over a WebSocket, or over native
-messaging through `reidm-host` — described in [PROTOCOL.md](PROTOCOL.md). `session.rs` answers
-it the way `IDMan.exe` does.
 
 ## The download engine
 
@@ -267,8 +259,7 @@ to `127.0.0.1`, so each entry point says how it tells the two apart.
 | `/api/*` (port 61002) | the window, the CLI, your scripts | a random token, new at every start, in a file only your user can read, sent as `X-Reidm-Token` and compared in constant time. The `Host` must be `127.0.0.1:61002`/`localhost:61002`/`[::1]:61002` (stops DNS rebinding) and any `Origin` must be the service's own. |
 | `/` (the web view) | your browser, typing the address | served without the token check, with the token embedded in the page. `Host` and `Origin` checks as above; `frame-ancestors 'none'` so no page can frame it. |
 | `/ext/*` (port 61002) | reIDM's browser extension | the same `Host` rule as `/api/*`, and an `Origin` that is a browser extension, or no `Origin` at all. Browsers set `Origin` themselves; a page can't claim an extension's origin, and can't leave its own off. CORS preflights are answered only for extension origins, so a page can't even send the JSON request. A ping a browser marks `Sec-Fetch-Site: cross-site` (an `<img>` on a page) is answered but not counted as the extension checking in. |
-| WebSocket (61001, 1001) | Tonec's extension, `reidm-host` | the same `Origin` rule, checked during the handshake. Only the IDM protocol is spoken: nothing on it can pause, remove or delete a download. |
-| `reidm-host` | the two extensions | each native-messaging manifest lists exactly one extension ID in `allowed_origins`; the browser refuses every other caller, and the host itself refuses to relay for any caller but those two. It passes on only the IDM protocol's own message types. |
+| `reidm-host` | reIDM's extension | the native-messaging manifest lists exactly one extension ID in `allowed_origins`; the browser refuses every other caller, and the host itself refuses to start the service for any caller but that one. It can start the service and answer a ping, nothing else. |
 
 What this does and doesn't protect against:
 
@@ -280,9 +271,9 @@ What this does and doesn't protect against:
   header it likes — they exist to tell web pages apart.
 - **Other users** on the same machine can't read your token (mode 0600 on Unix; on Windows the
   data folder is in your profile), so they can't use `/api/`. They *can* reach the extension
-  endpoints and the WebSocket, which can't tell a local program from the extension, and so could
-  add downloads to your list — but not pause, remove or delete any. IDM's own port has the same
-  property. On a personal machine it doesn't arise; on a shared one, bear it in mind.
+  endpoints, which can't tell a local program from the extension, and so could add downloads to
+  your list — but not pause, remove or delete any. On a personal machine it doesn't arise; on a
+  shared one, bear it in mind.
 - **Cookies.** The extension reads cookies only for the address it is handing over, only when it
   hands it over. reIDM keeps them with the download so it can resume, never returns them from
   the API, and never writes them into exports.
@@ -296,7 +287,6 @@ What this does and doesn't protect against:
 
 | Path | |
 |---|---|
-| `crates/reidm-proto` | the IDM wire format: message encoding and the native-messaging framing |
 | `crates/reidm-core/src/lib.rs` | the engine: `Manager`, probing, segmentation, retries |
 | `crates/reidm-core/src/store.rs` | the list in memory, its saver thread, and crash-safe loading and saving |
 | `crates/reidm-core/src/disk.rs` | positional writes, preallocation, the no-replace rename, Mark-of-the-Web, free space |
@@ -307,17 +297,15 @@ What this does and doesn't protect against:
 | `crates/reidm-core/src/power.rs` | the sleep inhibitor and the when-done countdown and actions |
 | `crates/reidm-core/src/limiter.rs` | the token-bucket speed limiter, shared by every download (videos and torrents charge their bytes to it) |
 | `crates/reidm-core/src/schedule.rs` | the scheduler's time windows |
-| `crates/reidm-core/src/lists.rs` | `.ef2` import/export, batch patterns |
+| `crates/reidm-core/src/lists.rs` | batch patterns |
 | `crates/reidm-core/src/torrent.rs` | torrents through [librqbit](https://github.com/ikatson/rqbit): one session for all, matched to the list by info hash; downloading, seeding to the share ratio, and the session's records in `torrents/` |
 | `crates/reidm-core/src/media.rs` | video downloads through yt-dlp: fetching and checking yt-dlp, Deno and ffmpeg, running yt-dlp, its progress, stopping it |
 | `crates/reidm-core/src/grabber.rs` | the site grabber, URL-list parsing |
 | `crates/reidm-core/src/update.rs` | the release check |
 | `crates/reidm/src/main.rs` | the CLI and service start-up |
 | `crates/reidm/src/web.rs` | the HTTP API, extension endpoints and web view |
-| `crates/reidm/src/ws.rs`, `session.rs` | the IDM protocol over WebSocket |
 | `crates/reidm/src/install.rs` | native-messaging registration, extension staging |
 | `crates/reidm-host` | the native-messaging helper |
 | `crates/reidm-gui` | the desktop window |
 | `extension/` | reIDM's browser extension |
 | `tools/capture-test.mjs` | the real-browser test suite ([BUILDING.md](BUILDING.md#the-real-browser-tests)) |
-| `decomp/` | decompiler output of IDM, kept as interoperability reference ([NOTICE.md](../NOTICE.md)) |

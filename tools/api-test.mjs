@@ -85,10 +85,9 @@ const env = {
   XDG_CACHE_HOME: path.join(home, '.cache'),
   REIDM_DATA_DIR: data,
   REIDM_UI_PORT: String(UI),
-  REIDM_LOCAL_PORT: String(LOCAL),
   RUST_LOG: 'reidm=warn,reidm_core=warn',
 };
-const svc = spawn(BIN, ['daemon', '--no-idm-port', '--dir', dl], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+const svc = spawn(BIN, ['daemon', '--dir', dl], { env, stdio: ['ignore', 'ignore', 'pipe'] });
 let svcErr = '';
 svc.stderr.on('data', (d) => (svcErr += d));
 let token = null;

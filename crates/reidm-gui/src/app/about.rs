@@ -13,7 +13,7 @@ impl App {
             ui.set_min_width(420.0);
             ui.label(RichText::new(format!("reIDM {}", env!("CARGO_PKG_VERSION"))).strong().size(16.0));
             ui.add_space(6.0);
-            ui.label("A cross-platform download manager that takes over your browser's downloads and speaks the IDM browser-extension protocol.");
+            ui.label("A cross-platform download manager that takes over your browser's downloads, with its own browser extension.");
             ui.add_space(8.0);
             if let Some(u) = &self.update {
                 if u.checking {
@@ -28,7 +28,7 @@ impl App {
                 ui.label(RichText::new(format!("The download service running is version {}; restart it to use this one.", self.snap.service.version)).color(p.warn).size(12.0));
             }
             ui.add_space(8.0);
-            ui.label(RichText::new("Not affiliated with, endorsed by, or derived from Tonec Inc.").color(p.text_dim).size(12.0));
+            ui.label(RichText::new("Made by Zektopic.").color(p.text_dim).size(12.0));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button("Check for updates").clicked() {

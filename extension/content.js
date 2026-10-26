@@ -148,7 +148,7 @@
         return;
       }
       if (!isHttp(href)) return;
-      // IDM's convention: Alt+click means "let the browser have this one".
+      // Alt+click means "let the browser have this one".
       if (ev.altKey) {
         chrome.runtime.sendMessage({ type: 'bypass', url: href }).catch(() => {});
         return;
@@ -416,6 +416,8 @@
     lastSig = '';
     sent.clear();
     if (panel) { panel.textContent = ''; panel.hidden = true; }
+    // The worker's per-tab media and manifest cache belong to the old page too.
+    chrome.runtime.sendMessage({ type: 'page-navigated' }).catch(() => {});
     schedule(document);
   }
 

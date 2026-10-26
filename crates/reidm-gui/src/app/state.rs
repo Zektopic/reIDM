@@ -22,7 +22,7 @@ pub(super) enum PickFor {
     CategoryDir(&'static str),
     TempDir,
     Import,
-    Export { ef2: bool },
+    Export,
     ExportFound(Vec<String>),
     /// The download folder, from the first-run welcome: saved at once.
     WelcomeDir,
@@ -60,7 +60,7 @@ pub(super) const MAX_BATCH: u64 = 10_000;
 /// What a batch preview depends on: the pattern, from, to and padding.
 pub(super) type BatchKey = (String, String, String, usize);
 
-/// IDM's *Add batch download*: an address with one `*` and a range.
+/// *Add batch download*: an address with one `*` and a range.
 pub(super) struct BatchState {
     pub(super) open: bool,
     pub(super) pattern: String,

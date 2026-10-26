@@ -65,10 +65,6 @@ pub struct App {
     /// Random per run: part of every `ETag` and list cursor, so one from a previous run of the
     /// service is never mistaken for a current one.
     boot: u64,
-    /// Whether the daemon owns the port the *unmodified* extension dials first (1001). On Windows
-    /// that is the difference between "works out of the box" and "another download manager got
-    /// there first", which is worth telling the user about rather than burying in a log.
-    idm_port: Arc<std::sync::atomic::AtomicBool>,
     /// When reIDM's own extension last checked in, so the window can say whether browser
     /// capture is actually connected rather than guessing.
     ext: Arc<Mutex<Option<ExtSeen>>>,
@@ -85,7 +81,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(mgr: Manager, port: u16, idm_port: Arc<std::sync::atomic::AtomicBool>, shutdown: Arc<tokio::sync::watch::Sender<bool>>) -> App {
+    pub fn new(mgr: Manager, port: u16, shutdown: Arc<tokio::sync::watch::Sender<bool>>) -> App {
         // Its own random value rather than part of the token: the boot id is sent in every
         // `ETag`, and nothing about the token should ever be.
         let boot = u64::from_str_radix(&random_token()[..16], 16).unwrap_or(0);
@@ -94,7 +90,6 @@ impl App {
             token: Arc::new(random_token()),
             port,
             boot,
-            idm_port,
             ext: Default::default(),
             rows: Arc::new(Mutex::new(RowCache::new(boot))),
             shutdown,
@@ -659,42 +654,18 @@ async fn refresh_cancel(State(app): State<App>, h: HeaderMap) -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
-#[derive(Deserialize)]
-struct ExportQuery {
-    #[serde(default)]
-    format: Option<String>,
-}
-
-/// The download list as IDM's `.ef2` or a plain URL list. Cookies are never included: an export
-/// file is the kind of thing people share.
-async fn export(State(app): State<App>, h: HeaderMap, Query(q): Query<ExportQuery>) -> Response {
+/// The download list as a plain URL list. Cookies are never included: an export file is the
+/// kind of thing people share.
+async fn export(State(app): State<App>, h: HeaderMap) -> Response {
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
     let mgr = app.mgr.clone();
     let items = blocking(move || mgr.list()).await;
-    let body = match q.format.as_deref().unwrap_or("txt") {
-        "ef2" => {
-            let entries: Vec<reidm_core::lists::Entry> = items
-                .iter()
-                .map(|i| reidm_core::lists::Entry {
-                    url: i.request.url.clone(),
-                    referer: i.request.referer.clone(),
-                    cookie: None,
-                    user_agent: i.request.user_agent.clone(),
-                    post_data: None,
-                })
-                .collect();
-            reidm_core::lists::write_ef2(&entries)
-        }
-        "txt" => {
-            let mut urls: Vec<String> = items.iter().map(|i| i.request.url.clone()).collect();
-            urls.sort();
-            urls.dedup();
-            reidm_core::grabber::url_list_text(&urls)
-        }
-        other => return (StatusCode::BAD_REQUEST, format!("unknown format {other:?} (use ef2 or txt)")).into_response(),
-    };
+    let mut urls: Vec<String> = items.iter().map(|i| i.request.url.clone()).collect();
+    urls.sort();
+    urls.dedup();
+    let body = reidm_core::grabber::url_list_text(&urls);
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
 
@@ -1027,9 +998,6 @@ async fn ext_add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<ExtBa
 struct BatchBody {
     #[serde(default)]
     urls: Vec<String>,
-    /// Entries with their own referer/cookie/user agent, e.g. from an `.ef2` import.
-    #[serde(default)]
-    items: Vec<reidm_core::lists::Entry>,
     #[serde(default)]
     dir: Option<String>,
     /// Applied to every URL in the batch.
@@ -1048,12 +1016,12 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
     if let Err(c) = guard(&app, &h, true) {
         return c.into_response();
     }
-    if b.urls.len() + b.items.len() > MAX_BATCH {
-        return (StatusCode::BAD_REQUEST, format!("{} addresses is more than one batch may hold ({MAX_BATCH}); add them in parts", b.urls.len() + b.items.len())).into_response();
+    if b.urls.len() > MAX_BATCH {
+        return (StatusCode::BAD_REQUEST, format!("{} addresses is more than one batch may hold ({MAX_BATCH}); add them in parts", b.urls.len())).into_response();
     }
     let dir = b.dir.filter(|d| !d.trim().is_empty()).map(std::path::PathBuf::from);
-    let single = b.urls.len() + b.items.len() == 1;
-    let mut reqs: Vec<Request> = b
+    let single = b.urls.len() == 1;
+    let reqs: Vec<Request> = b
         .urls
         .into_iter()
         .map(|u| u.trim().to_string())
@@ -1066,22 +1034,8 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
             ..Default::default()
         })
         .collect();
-    // A download that came from a form needs its POST body sent again, which reIDM's engine does
-    // not do; fetching the address with a GET instead would quietly save some other response.
-    let (posts, items): (Vec<_>, Vec<_>) = b.items.into_iter().partition(|e| e.post_data.is_some());
-    reqs.extend(items.into_iter().filter(|e| !e.url.trim().is_empty()).map(|e| Request {
-        url: e.url.trim().to_string(),
-        dir: dir.clone(),
-        referer: e.referer.or_else(|| b.referer.clone()),
-        cookie: e.cookie,
-        user_agent: e.user_agent,
-        filename: if single { b.filename.clone() } else { None },
-        media: None,
-        torrent: None,
-        checksum: None,
-    }));
     let (mgr, later) = (app.mgr.clone(), b.later);
-    let mut results: Vec<serde_json::Value> = blocking(move || mgr.add_many_with(reqs, AddOptions { later, ..Default::default() }))
+    let results: Vec<serde_json::Value> = blocking(move || mgr.add_many_with(reqs, AddOptions { later, ..Default::default() }))
         .await
         .into_iter()
         .map(|(url, r)| match r {
@@ -1089,9 +1043,6 @@ async fn add_batch(State(app): State<App>, h: HeaderMap, Json(b): Json<BatchBody
             Err(e) => serde_json::json!({ "url": url, "error": format!("{e:#}") }),
         })
         .collect();
-    results.extend(posts.into_iter().map(|e| {
-        serde_json::json!({ "url": e.url, "error": "this download came from a form (POST), which reIDM cannot repeat; start it from the page in the browser" })
-    }));
     Json(serde_json::json!({ "results": results })).into_response()
 }
 
@@ -1258,9 +1209,6 @@ async fn status(State(app): State<App>, h: HeaderMap) -> Response {
         .map(|(path, free)| serde_json::json!({ "path": path.to_string_lossy(), "free": free }))
         .collect();
     Json(serde_json::json!({
-        "idm_port": app.idm_port.load(std::sync::atomic::Ordering::Relaxed),
-        "idm_port_number": crate::ws::IDM_PORT,
-        "local_port": crate::ws::local_port(),
         "ui_port": app.port,
         "platform": std::env::consts::OS,
         "version": env!("CARGO_PKG_VERSION"),
@@ -1595,7 +1543,7 @@ mod tests {
         let port = l.local_addr().unwrap().port();
         let (stop, _) = tokio::sync::watch::channel(false);
         let stop = Arc::new(stop);
-        let mut app = App::new(mgr.clone(), port, Default::default(), stop.clone());
+        let mut app = App::new(mgr.clone(), port, stop.clone());
         app.exit_grace = Duration::from_millis(300);
         let token = app.token.to_string();
         tokio::spawn(serve(l, app.clone()));

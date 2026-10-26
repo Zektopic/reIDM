@@ -36,8 +36,8 @@ says, for each download the browser kept, why:
 | an error from reIDM | reIDM tried and couldn't fetch the file — the link needs something the browser has and reIDM doesn't, or it can be used only once. The browser carried on, so nothing is lost |
 
 If a download doesn't appear in *Just now* at all, the extension never saw it: check that it is
-enabled, and that **Tonec's IDM extension** isn't installed alongside it. Two extensions that both
-take over downloads interfere with each other; disable one.
+enabled, and that no other download-manager extension is installed alongside it. Two extensions
+that both take over downloads interfere with each other; disable one.
 
 **The popup says *reIDM is not running*, and Start reIDM does nothing.** The extension starts
 reIDM through its native-messaging helper, `com.zektopic.reidm`.
@@ -66,11 +66,6 @@ use reIDM without the extension (paste links into *Add URL*).
 **After updating reIDM, the extension is still the old version.** reIDM refreshes the folder
 when it starts, and the browser reads it again when the browser restarts — or immediately if you
 press the reload arrow on the extension's card.
-
-**Tonec's IDM extension doesn't connect to reIDM.** See [EXTENSION.md](EXTENSION.md): on Windows
-it needs port 1001, which a real IDM installation takes first (the service's log says
-*not serving the extension's default port 1001 … another download manager may be using it*); on
-macOS and Linux it needs `reidm patch-extension`. reIDM's own extension avoids both problems.
 
 ## Downloads
 
@@ -195,9 +190,9 @@ or use **Restart**.
 **Commands say "cannot reach the daemon".** The service isn't running. Start the window, or
 `reidm daemon`.
 
-**"web UI unavailable … (is another reidm running?)" / the service exits at once.** Ports 61001
-and 61002 are taken — almost always by another reIDM. Find it (`ss -ltnp | grep 6100`,
-`lsof -i :61002`, or on Windows `netstat -ano | findstr 6100`) and stop it, or just use that one.
+**"web UI unavailable … (is another reidm running?)" / the service exits at once.** Port 61002
+is taken — almost always by another reIDM. Find it (`ss -ltnp | grep 61002`,
+`lsof -i :61002`, or on Windows `netstat -ano | findstr 61002`) and stop it, or just use that one.
 
 **After updating, the window says "the service answered 405", or that an older reIDM service is
 running.** A background service from the previous reIDM is still running (closing the window does

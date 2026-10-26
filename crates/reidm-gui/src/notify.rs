@@ -1,4 +1,4 @@
-//! Telling the user a download finished or failed: a desktop notification, or IDM's *Download
+//! Telling the user a download finished or failed: a desktop notification, or the *Download
 //! complete* window, as Options › General says.
 //!
 //! A notification can't be relied on alone: Windows lets people switch them off for every app,
@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OnFinish {
-    /// IDM's *Download complete* window.
+    /// The *Download complete* window.
     Dialog,
     Notification,
     Nothing,

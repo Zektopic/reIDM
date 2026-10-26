@@ -1,9 +1,9 @@
-//! IDM's *Download complete* window.
+//! The *Download complete* window.
 
 use super::*;
 
 impl App {
-    /// IDM's "Download complete" window, one finished download at a time.
+    /// The "Download complete" window, one finished download at a time.
     pub(super) fn complete_window(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(&id) = self.completed.first() else { return };
         let Some(it) = self.item(id).cloned() else {

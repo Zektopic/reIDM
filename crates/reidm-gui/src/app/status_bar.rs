@@ -45,14 +45,6 @@ impl App {
                         self.show_integration = true;
                     }
 
-                    if self.snap.connected && self.snap.service.platform == "windows" && !self.snap.service.idm_port {
-                        ui.separator();
-                        ui.label(RichText::new("Port 1001 busy").color(p.warn).size(12.0)).on_hover_text(
-                            "Another program (usually an installed IDM) holds port 1001, so the official IDM extension \
-                             cannot reach reIDM directly. reIDM's own extension is unaffected.",
-                        );
-                    }
-
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if self.snap.total_rate > 0.0 {
                             ui.label(RichText::new(rate_human(self.snap.total_rate)).color(p.accent_fg).size(12.0).strong());

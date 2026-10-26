@@ -9,6 +9,41 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — The third-party extension support leaves, and the review's 15 findings are fixed (0.8.0)
+
+**Context.** The owner asked for the decompiled reference material to leave the working tree
+(history stays, as it always would) and for every company-name mention to go, with reIDM presented
+as Zektopic's own work. The same pass ran a high-effort review over the extension, the torrent
+engine, the API client and the service: 15 findings, all confirmed by the reviewer, several of them
+serious (torrents over their speed share, deletions that kept files, two adds taking one torrent,
+incognito cookies from the wrong profile).
+
+**Decision.** The compatibility layer for the other download manager's browser extension is
+removed whole: its WebSocket server (`ws.rs`, `session.rs`), its protocol crate, `.ef2`
+import/export, the official-extension patcher, its native hosts and their packaging entries, and
+the reverse-engineering documents and tools. reIDM now speaks only to its own extension over the
+HTTP API and `com.zektopic.reidm`. The CHANGELOG and DEVLOG keep their history, but the current
+docs, UI and comments carry no company name and no dead references.
+
+**The review's fixes.** Each was verified before changing anything; the two that needed a design
+change are worth naming. Torrents: the 500 ms share update now compares against the last values
+before touching librqbit's limiter (setting the same limit rebuilt a full burst, letting torrents
+run 2–3× over their share); a removal is registered by info hash the moment it starts, so a
+re-add waits for it, and the same hash is checked again under the lock that records it. Files
+recorded in the list are deleted directly when the engine has no copy to ask (a finished torrent
+after a restart), with empty directories pruned and nothing else touched. The rest: the dialog
+timer is armed when a request is shown, the saved extension status is read back at worker start,
+the sending frame is the referrer, failed manifests retry after 30 s, in-page navigation clears
+the tab's cache, the shadow-root walk is on-demand, the grabber carries its incognito flag, bulk
+actions get a 300 s client, `reidm get` locks and keys its state, quit advice is platform-specific,
+and a stopping service's lock is waited for.
+
+**Evidence.** 94 core unit tests + 39 engine + 15 torrent + 33 compat + the rest of the workspace
+pass; the real-browser suite is **109/109** (including the button flow, the shadow-root player and
+the YouTube-shaped page); `tools/api-test.mjs` passes; clippy with Rust 1.99.1 is clean on Linux,
+Windows and macOS targets; the Firefox build's shim self-test passes and `web-ext lint` reports 0
+errors. The `AutoCleanDir` test cleanup already in the working tree was kept and passes.
+
 ## 2026-10-26 — The video button, proved end to end; and shadow roots (0.7.1-rc4, extension 1.9.0)
 
 **Context.** The user asked for the extension to detect a video and show it in *Download with
@@ -1208,10 +1243,11 @@ and after, not by matching the message.
 
 **H8 — decision: the WebSocket no longer honours types 1001–1003.** Checked what the real IDM
 extension sends: types 0, 1, 2, 13, 14 (and 15+ for media), never ≥ 1000 — those were reIDM's own CLI
-additions (`docs/PROTOCOL.md`). So dropping them breaks nothing for Tonec's extension, while the
+additions. So dropping them breaks nothing for the original extension, while the
 socket (no token; any local process, any user) could pause, remove and *delete files*. The CLI's
 `pause`/`resume`/`rm` use the token-protected HTTP API and now fail for unknown ids. `reidm-host` also
-refuses to relay types ≥ 1000 and relays only for Tonec's two Chromium IDs or its Firefox ID.
+refuses to relay types ≥ 1000 and relays only for the original extension's two Chromium IDs or
+its Firefox ID.
 *Alternative rejected:* requiring the IDM extension's `Origin` — native host and patched copies send
 none, and a local process can forge it anyway.
 

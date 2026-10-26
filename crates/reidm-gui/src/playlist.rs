@@ -143,7 +143,7 @@ impl Row {
         s
     }
 
-    /// The file's name, after the video as IDM names it; yt-dlp sets the real extension.
+    /// The file's name, after the video; yt-dlp sets the real extension.
     fn file_name(&self) -> String {
         let ext = if self.choice.res == Res::Audio { self.choice.audio.code() } else { "mp4" };
         format!("{}.{ext}", reidm_core::sanitize_filename(&self.entry.title))

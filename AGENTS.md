@@ -2,8 +2,7 @@
 
 reIDM is a cross-platform download manager in Rust: a background **service** (`reidm daemon`)
 owns every download; a native **window** (`reidm-gui`, egui) and a **CLI** talk to it over a
-local HTTP API; a Chromium **extension** hands it the browser's downloads. It also speaks the
-original IDM extension's protocol. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before
+local HTTP API; a browser **extension** hands it the browser's downloads. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before
 changing anything structural, and **[docs/DEVLOG.md](docs/DEVLOG.md) for why things are the way
 they are** — add an entry there for every change that involves a decision.
 
@@ -12,14 +11,13 @@ they are** — add an entry there for every change that involves a decision.
 | Path | What |
 |---|---|
 | `crates/reidm-core` | the engine: segmented HTTP downloads (`lib.rs`), videos through yt-dlp (`media.rs`), torrents through librqbit (`torrent.rs`), categories (`category.rs`), the limiter, scheduler, lists, site grabber, update check |
-| `crates/reidm` | the `reidm` binary: CLI, daemon, HTTP API (`web.rs`), IDM WebSocket protocol (`ws.rs`, `session.rs`), native-host registration (`install.rs`) |
+| `crates/reidm` | the `reidm` binary: CLI, daemon, HTTP API (`web.rs`), native-host registration (`install.rs`) |
 | `crates/reidm-host` | the native-messaging host the browser starts |
 | `crates/reidm-gui` | the desktop window (`app.rs`), its API client (`api.rs`), playlist and torrent windows |
-| `crates/reidm-proto` | the IDM protocol's binary messages |
 | `extension/` | reIDM's own MV3 extension |
 | `docs/` | user and developer documentation — keep it true when behaviour changes |
 | `packaging/`, `.github/workflows/` | installers and CI. Linux CI and the `.deb` build run on the self-hosted runner `manupa-hnx`; Windows and macOS on GitHub's |
-| `decomp/`, `samples/` | reverse-engineering material; `samples/` is untrusted vendor data (read-only, `python3 -I`) |
+| `samples/` | untrusted vendor data for reference (read-only, `python3 -I`) |
 
 ## Before you call something done
 

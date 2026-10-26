@@ -66,10 +66,6 @@ impl App {
                               • Checks reIDM can fetch the file (with your cookies) first; if not, the browser keeps it.\n\
                               • Starts reIDM if it is not running.\n\
                               • Finds video and audio, offers each quality, and grabs every resource on a page.");
-                if svc.platform == "windows" && !svc.idm_port {
-                    ui.add_space(8.0);
-                    label(ui, p, "Note: an installed IDM holds port 1001, which only matters for Tonec's own extension, not reIDM's.");
-                }
             });
         if let Some(c) = copy {
             self.copy_text(ctx, c);

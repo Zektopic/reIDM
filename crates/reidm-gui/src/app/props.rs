@@ -4,7 +4,7 @@ use super::*;
 
 impl App {
     /// One download's details: addresses, sizes, its connections as a segment map, and its own
-    /// speed limit. IDM shows this as the download progress dialog.
+    /// speed limit. The window shows this as the download progress dialog.
     pub(super) fn props_window(&mut self, ctx: &egui::Context, p: &Palette) {
         if let Some(st) = &mut self.props {
             if let Some(Ok(r)) = st.verifying.as_ref().map(|rx| rx.try_recv()) {

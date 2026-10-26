@@ -185,7 +185,7 @@ async function queue(urls) {
     return video ? { url, video: true, title: video.title } : { url, filename: baseName(url) || undefined };
   });
   say('Handing over to reIDM…');
-  const r = await ask({ type: 'queue-media', tabId: tab ? tab.id : undefined, items });
+  const r = await ask({ type: 'queue-media', tabId: tab ? tab.id : undefined, incognito: !!(tab && tab.incognito), items });
   if (!r) return say('No answer from the extension.', 'err');
   const n = r.done || 0;
   const errors = r.errors || [];

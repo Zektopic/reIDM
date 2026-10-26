@@ -261,7 +261,7 @@ impl Item {
 /// files, which list rows leave out.
 pub type Detail = reidm_core::Item;
 
-/// IDM groups downloads into a fixed set of categories; reIDM uses the same idea and the same
+/// Downloads are grouped into a fixed set of categories, using the same
 /// extension vocabulary the browser extension sends in its type-4 settings message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Category {
@@ -320,7 +320,7 @@ impl Category {
 
 }
 
-/// What the category tree selects: a file-type category, or one of IDM's status nodes.
+/// What the category tree selects: a file-type category, or one of the status nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Category(Category),
@@ -535,7 +535,7 @@ pub struct ExtensionSeen {
     pub browser: String,
 }
 
-/// `1.4 GB`, `812 KB`, … (IDM shows decimal units, so we do too).
+/// `1.4 GB`, `812 KB`, … (decimal units).
 pub fn size_human(n: u64) -> String {
     const U: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
     let mut v = n as f64;
@@ -607,7 +607,7 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// `00:01:12`, or empty when unknown. IDM counts down the remaining time.
+/// `00:01:12`, or empty when unknown, counting down the remaining time.
 pub fn eta_human(secs: f64) -> String {
     if !secs.is_finite() || secs < 0.0 {
         return String::new();

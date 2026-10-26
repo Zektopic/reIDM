@@ -284,7 +284,7 @@ pub struct Settings {
     pub limit_enabled: bool,
     #[serde(default)]
     pub schedule: schedule::Schedule,
-    /// File each download into its category's folder, as IDM does.
+    /// File each download into its category's folder.
     #[serde(default = "yes")]
     pub sort_by_category: bool,
     /// A category's folder where the user moved it; otherwise `<default_dir>/<Category>`, and

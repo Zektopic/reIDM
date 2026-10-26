@@ -1,6 +1,6 @@
 //! The scheduler: start the scheduled queue at a time of day, and optionally stop it again.
 //!
-//! IDM's scheduler works on queues; reIDM has one scheduled queue, which is every download added
+//! reIDM has one scheduled queue, which is every download added
 //! with *Download Later* (or moved into it). The clock is local time, because "start at 2am" means
 //! the user's 2am.
 //!

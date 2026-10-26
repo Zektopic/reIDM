@@ -13,7 +13,7 @@ globalThis.REIDM_DEFAULTS = Object.freeze({
   interceptClicks: true,
   // Take every download the browser starts. Off: only those whose name matches `fileTypes`.
   captureAll: true,
-  // IDM's stock list.
+  // The stock list.
   fileTypes:
     '3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 DEB DMG EXE FLAC GZ GZIP IMG ISO LZH M4A M4V MKV MOV MP3 MP4 ' +
     'MPA MPE MPEG MPG MSI MSU OGG OGV PDF PKG PLJ PPS PPT QT RA RAR RM RMVB RPM SEA SIT SITX TAR TGZ TIF TIFF ' +
@@ -27,7 +27,7 @@ globalThis.REIDM_DEFAULTS = Object.freeze({
   launchReidm: true,
   // A desktop notification when reIDM takes a download, or can't.
   notifications: true,
-  // IDM's "Download file info" dialog before each download: Start, Download later, Cancel.
+  // The "Download file info" dialog before each download: Start, Download later, Cancel.
   askBeforeDownload: true,
   // Watch for video and audio: the network listeners, the page hook and the video button.
   sniffMedia: true,

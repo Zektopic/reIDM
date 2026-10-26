@@ -1,4 +1,4 @@
-// IDM's "Download file info" dialog: what is about to be downloaded, with Start download,
+// The "Download file info" dialog: what is about to be downloaded, with Start download,
 // Download later and Cancel. One window shows every waiting download in turn ("2 more
 // waiting"). The service worker opened it and waits for each answer, which goes back over a
 // port; the port also keeps the worker alive while the user decides.
@@ -65,7 +65,7 @@ function focusFirst() {
   else selectBaseName();
 }
 
-/** Select the name without its extension, as IDM does: the part one usually changes. */
+/** Select the name without its extension: the part one usually changes. */
 function selectBaseName() {
   const el = $('name');
   el.focus();

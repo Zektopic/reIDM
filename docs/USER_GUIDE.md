@@ -30,7 +30,7 @@ or Esc closes it; Help › *Welcome…* shows it again.
 Start Queue · Stop Queue · Site Grabber · Speed Limiter, and a search box that filters the list by
 name or address.
 
-**Categories** on the left sort downloads the way IDM does:
+**Categories** on the left sort downloads by type:
 
 | Node | Shows |
 |---|---|
@@ -92,7 +92,7 @@ The dialog fills itself with whatever links are on the clipboard when it opens.
   **Restart** downloads it again.
 
 **Drag and drop** onto the window: a `.torrent` file opens *Add torrent*; a `.txt` list of
-addresses or an IDM `.ef2` export is imported; a link saved as a shortcut (`.url` on Windows,
+addresses is imported; a link saved as a shortcut (`.url` on Windows,
 `.webloc` on macOS, a `.desktop` link on Linux) opens Add URL with it filled in. Windows,
 macOS and Linux hand programs dropped files only, not text, so a link dragged straight from a
 browser page doesn't arrive unless the browser makes a shortcut of it.
@@ -109,7 +109,7 @@ carries on, and a finished one is reported as already downloaded. Two addresses 
 in the order of their query parameters, or in a `#fragment`, count as the same download.
 
 **Add batch download** (Tasks menu, or the button in Add URL) takes an address with one `*` and a
-range, like IDM's:
+range:
 
 | Pattern | From | To | Wildcard size | Gives |
 |---|---|---|---|---|
@@ -201,7 +201,7 @@ directly). Videos use it too; torrents only through SOCKS5, if asked. The passwo
 settings file, readable by your user only, and never shown again.
 
 **When a download finishes** reIDM shows a desktop notification (where there is a notification
-area) or IDM's small *Download complete* window, with *Open*, *Open folder* and *Close* — Options
+area) or the small *Download complete* window, with *Open*, *Open folder* and *Close* — Options
 › General chooses, or nothing at all. When many finish at once, one notification counts them.
 Where notifications can't be shown (Windows can switch them off for every program, and a Linux
 desktop may have no notification service), the *Download complete* window shows instead. A
@@ -336,13 +336,9 @@ it sees the page as you do. reIDM says so when a page looks script-built rather 
 
 ## Import and export
 
-**Tasks › Import** reads a plain list of addresses (one per line, `#` comments allowed) or an
-**IDM export file** (`.ef2`) — with the referrer, cookies and user agent IDM stored for each
-download. Entries IDM recorded as form submissions (POST) are reported and skipped: reIDM can't
-repeat a form.
+**Tasks › Import** reads a plain list of addresses (one per line, `#` comments allowed).
 
-**Tasks › Export** writes the list as plain addresses (`.txt`) or as an IDM `.ef2` file, which IDM
-itself can import. Exports never include cookies.
+**Tasks › Export** writes the list as plain addresses (`.txt`). Exports never include cookies.
 
 ## Options
 
@@ -363,7 +359,7 @@ or later.
 | Updates | *Check now*. reIDM also checks once shortly after it starts |
 | **Folders** tab: | |
 | Download folder | where new downloads go unless Add URL says otherwise |
-| Save each download in the folder for its type | IDM's categories, on by default: videos in `Video`, archives in `Compressed`, installers in `Programs`, and `Documents`, `Images`, `Music`; anything else in the download folder itself |
+| Save each download in the folder for its type | on by default: videos in `Video`, archives in `Compressed`, installers in `Programs`, and `Documents`, `Images`, `Music`; anything else in the download folder itself |
 | One folder per type | each defaults to the folder of that name under the download folder (shown greyed), and follows it if the download folder moves; *Browse…* puts it anywhere, *Default* puts it back |
 | **Downloads** tab: | |
 | Performance | **Light** (4 connections per download, 2 downloads at once), **Balanced** (8 and 4, the default) or **Maximum** (16 and 8). *Custom* shows when Advanced settings were changed by hand |

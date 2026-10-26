@@ -86,7 +86,7 @@ pub(super) enum Icon {
     Gauge,
 }
 
-/// An IDM-style toolbar button: a large icon with a small caption underneath. Two-line
+/// A toolbar button: a large icon with a small caption underneath. Two-line
 /// captions (e.g. "Delete\nCompleted") are supported, which is why the height is fixed
 /// rather than derived from the text.
 pub(super) fn tool(ui: &mut egui::Ui, p: &Palette, label: &str, icon: Icon, primary: bool) -> egui::Response {

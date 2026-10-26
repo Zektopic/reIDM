@@ -8,7 +8,7 @@ impl App {
             .frame(egui::Frame::NONE.fill(p.panel).inner_margin(egui::Margin::symmetric(8, 4)))
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
-                    // IDM's own menu order.
+                    // The classic download manager's menu order.
                     ui.menu_button("Tasks", |ui| {
                         if ui.button("Add URL…").clicked() {
                             self.open_add();
@@ -28,20 +28,14 @@ impl App {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("Import (URL list or IDM .ef2)…").clicked() {
+                        if ui.button("Import a URL list…").clicked() {
                             self.import_from_file();
                             ui.close();
                         }
-                        ui.menu_button("Export", |ui| {
-                            if ui.button("As a URL list (.txt)…").clicked() {
-                                self.export_download_list(false);
-                                ui.close();
-                            }
-                            if ui.button("As an IDM export (.ef2)…").clicked() {
-                                self.export_download_list(true);
-                                ui.close();
-                            }
-                        });
+                        if ui.button("Export as a URL list (.txt)…").clicked() {
+                            self.export_download_list();
+                            ui.close();
+                        }
                         ui.separator();
                         if ui.button("Site Grabber…").clicked() {
                             self.show_grabber = true;

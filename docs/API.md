@@ -224,15 +224,7 @@ Many at once. Each address is reported separately, so one bad address doesn't fa
 }
 ```
 
-Instead of (or as well as) `urls`, `items` takes entries with their own headers — the shape an
-`.ef2` import produces:
-
-```json
-{ "items": [ { "url": "https://example.com/a.zip", "referer": "https://example.com/", "cookie": "k=v", "user_agent": "UA/1" } ] }
-```
-
-`filename` is honoured only when the batch holds a single address. An item with `post_data`
-(a form submission) is refused, since reIDM can't repeat a form.
+`filename` is honoured only when the batch holds a single address.
 
 ```json
 {
@@ -482,9 +474,6 @@ What the service is able to do right now.
   "version": "0.4.0",
   "platform": "windows",
   "ui_port": 61002,
-  "local_port": 61001,
-  "idm_port": true,
-  "idm_port_number": 1001,
   "extension": { "seconds_ago": 12, "version": "1.1.0", "browser": "Chrome 153" },
   "extension_dir": "C:\\Users\\me\\AppData\\Roaming\\Zektopic\\reIDM\\data\\browser-extension",
   "refresh_armed": null,
@@ -497,7 +486,6 @@ What the service is able to do right now.
 
 | Field | |
 |---|---|
-| `idm_port` | whether the service holds port 1001, which Tonec's extension dials first |
 | `extension` | when reIDM's browser extension last checked in, its version and browser; `null` if it hasn't since the service started. It checks in once a minute |
 | `extension_dir` | the folder to load in the browser |
 | `refresh_armed` | the download waiting for a new address from the browser, if any |
@@ -534,10 +522,9 @@ Stops a countdown and sets the action to `none`.
 
 ## Export
 
-#### `GET /api/export?format=txt` · `GET /api/export?format=ef2`
+#### `GET /api/export`
 
-The list as plain text: one address per line (`txt`, the default), or IDM's export format
-(`ef2`) with each download's referrer and user agent. Never includes cookies.
+The list as plain text: one address per line. Never includes cookies.
 
 ## Videos
 
@@ -718,6 +705,3 @@ with `"ok": true`.
 | `413` | the body is bigger than this endpoint accepts (see [Authentication](#authentication)) |
 | `415` | a JSON body without `Content-Type: application/json` |
 | `422` | valid JSON of the wrong shape, such as a missing `url` |
-
-The extension protocol Tonec's *IDM Integration Module* speaks — a binary WebSocket protocol on
-ports 61001 and 1001 — is described in [PROTOCOL.md](PROTOCOL.md).

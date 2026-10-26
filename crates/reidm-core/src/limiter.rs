@@ -10,7 +10,7 @@
 //! way to them and the global limit holds for everything together.
 //!
 //! Connections get bandwidth in proportion to how often they ask, so a download with eight
-//! connections gets more of a shared limit than one with two. That is how IDM behaves too.
+//! connections gets more of a shared limit than one with two.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};

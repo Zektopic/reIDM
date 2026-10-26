@@ -188,12 +188,12 @@ security, responsiveness or correctness problem · **Medium** · **Low**.
 ### H8. The IDM WebSocket accepts unauthenticated pause, resume and **remove+purge** control messages
 - **Where:** `session.rs:289-304` (`T_CTL_REMOVE` with `arg(1)!=0` calls `mgr.remove(id, true)`, which deletes the
   finished file). `ws.rs:24-29` accepts any connection with no `Origin` header. The ports are 61001 and 1001 (and
-  1001 is the port Tonec's extension dials). `reidm-host/src/main.rs:158-164` relays *any* message from Tonec's
+  1001 is the port the original extension dials). `reidm-host/src/main.rs:158-164` relays *any* message from the third-party
   extension unfiltered. The CLI uses this path (`main.rs:726-728`).
 - **Scenario:** any local process, **including another OS user on a shared machine** (the API token protects only
   `/api/*`), can loop over ids 1..N and send `T_CTL_REMOVE` with purge, deleting the user's downloaded files.
   `docs/ARCHITECTURE.md` says other users "could add downloads"; in fact they can also delete files. A
-  compromised or updated third-party (Tonec) extension can do the same through the native host.
+  compromised or updated third-party extension can do the same through the native host.
 - **Fix:** remove the `T_CTL_*` handlers from `Session`. Move `reidm pause/resume/rm` to the token-protected HTTP
   API, which also gives the CLI error reporting: today `reidm rm 999` "succeeds" silently. As a defence in depth,
   drop message types ≥ 1000 in the host's relay.

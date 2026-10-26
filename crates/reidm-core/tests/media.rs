@@ -4,9 +4,63 @@
 #![cfg(unix)]
 
 use reidm_core::{Manager, Media, Outcome, Request, Status};
+use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[allow(dead_code)]
+struct AutoCleanDir {
+    path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl AutoCleanDir {
+    fn create(path: PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn new(path: PathBuf) -> Self {
+        Self::create(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Deref for AutoCleanDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for AutoCleanDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AutoCleanDir {
+    fn drop(&mut self) {
+        if matches!(std::env::var("REIDM_KEEP_TEST_DIR").as_deref(), Ok("1" | "true")) {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+        if self.path.exists() {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = std::fs::remove_dir_all(&self.path);
+                if !self.path.exists() {
+                    break;
+                }
+            }
+        }
+    }
+}
 
 const FAKE_YTDLP: &str = r#"#!/bin/sh
 # Stand-in for yt-dlp. Records its arguments; `mode` beside it says how to behave.
@@ -48,11 +102,9 @@ printf 'video' > "$file"
 echo "REIDM-FILE $file"
 "#;
 
-fn tmp(tag: &str) -> PathBuf {
+fn tmp(tag: &str) -> AutoCleanDir {
     let p = std::env::temp_dir().join(format!("reidm-media-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    AutoCleanDir::create(p)
 }
 
 fn exe(path: &Path, body: &str) {
@@ -62,7 +114,7 @@ fn exe(path: &Path, body: &str) {
 
 /// A manager whose tools folder holds the stand-ins, marked as just checked so nothing is
 /// fetched from the network.
-fn setup(tag: &str, mode: &str) -> (Manager, PathBuf, PathBuf) {
+fn setup(tag: &str, mode: &str) -> (Manager, PathBuf, PathBuf, AutoCleanDir) {
     let dir = tmp(tag);
     let state = dir.join("state");
     let tools = state.join("tools");
@@ -73,7 +125,7 @@ fn setup(tag: &str, mode: &str) -> (Manager, PathBuf, PathBuf) {
     std::fs::write(tools.join("mode"), mode).unwrap();
     let dl = dir.join("dl");
     let m = Manager::open(&state, dl.clone(), 4).unwrap();
-    (m, dl, tools)
+    (m, dl, tools, dir)
 }
 
 fn video(dl: &Path, format: &str) -> Request {
@@ -99,7 +151,7 @@ async fn wait_for(m: &Manager, id: u64, what: impl Fn(&Status) -> bool) -> reidm
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_video_is_fetched_by_ytdlp_and_named_after_its_title() {
-    let (m, dl, tools) = setup("ok", "");
+    let (m, dl, tools, _dir) = setup("ok", "");
     let id = m.add(video(&dl, "137+bestaudio/best[height<=1080]")).unwrap();
     let it = wait_for(&m, id, |s| *s == Status::Done).await;
     assert_eq!(it.path, dl.join("Clip [abc] 360p.mp4"), "the name yt-dlp reported");
@@ -119,7 +171,7 @@ async fn a_video_is_fetched_by_ytdlp_and_named_after_its_title() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failure_says_what_ytdlp_said() {
-    let (m, dl, _) = setup("fail", "fail");
+    let (m, dl, _, _dir) = setup("fail", "fail");
     let id = m.add(video(&dl, "18")).unwrap();
     let it = wait_for(&m, id, |s| matches!(s, Status::Failed(_))).await;
     assert_eq!(it.status, Status::Failed("[youtube] abc: Video unavailable".into()));
@@ -127,7 +179,7 @@ async fn a_failure_says_what_ytdlp_said() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stopping_a_video_stops_ytdlp_at_once() {
-    let (m, dl, _) = setup("stop", "slow");
+    let (m, dl, _, _dir) = setup("stop", "slow");
     let id = m.add(video(&dl, "18")).unwrap();
     let it = wait_for(&m, id, |_| m.get(id).is_some_and(|i| i.downloaded > 0)).await;
     assert_eq!(it.path, dl.join("Clip [abc] 360p.mp4"), "named as soon as yt-dlp said where it was going");
@@ -145,7 +197,7 @@ async fn stopping_a_video_stops_ytdlp_at_once() {
 async fn deleting_a_running_video_stops_ytdlp_and_removes_its_pieces() {
     // A playlist item deleted while it downloads: the run must stop yt-dlp (the whole process
     // group), leave no pieces behind, and answer at once — the delete that used to hang.
-    let (m, dl, tools) = setup("remove", "slow");
+    let (m, dl, tools, _dir) = setup("remove", "slow");
     let state = tools.parent().unwrap().to_path_buf();
     let id = m.add(video(&dl, "18")).unwrap();
     wait_for(&m, id, |_| m.get(id).is_some_and(|i| i.downloaded > 0)).await;
@@ -165,7 +217,7 @@ async fn deleting_a_running_video_stops_ytdlp_and_removes_its_pieces() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_page_in_two_formats_is_two_downloads() {
-    let (m, dl, _) = setup("dupes", "slow");
+    let (m, dl, _, _dir) = setup("dupes", "slow");
     let a = m.add_detailed(video(&dl, "18")).unwrap();
     let b = m.add_detailed(video(&dl, "140")).unwrap();
     let again = m.add_detailed(video(&dl, "18")).unwrap();
@@ -180,7 +232,7 @@ async fn one_page_in_two_formats_is_two_downloads() {
 async fn a_video_begun_over_one_connection_carries_on_that_way() {
     // reIDM 0.5.0 fetched videos over one connection; yt-dlp can't continue such a partial file
     // in pieces, and says "fragment 1 not found". The download must carry on, not fail.
-    let (m, dl, tools) = setup("oldpart", "oldpart");
+    let (m, dl, tools, _dir) = setup("oldpart", "oldpart");
     let id = m.add(video(&dl, "18")).unwrap();
     let it = wait_for(&m, id, |s| matches!(s, Status::Done | Status::Failed(_))).await;
     assert_eq!(it.status, Status::Done, "{:?}", it.status);
@@ -204,7 +256,7 @@ async fn a_video_whose_addresses_expire_partway_carries_on_from_the_page() {
     // YouTube's addresses for a video's data expire after hours; a long download outlives them
     // and the server starts answering 403. The download must carry on with fresh ones — which
     // means reading the page again, never reusing what the last run was given.
-    let (m, dl, tools) = setup("expire", "expire");
+    let (m, dl, tools, _dir) = setup("expire", "expire");
     let id = m.add(video(&dl, "137+bestaudio")).unwrap();
     let it = wait_for(&m, id, |s| matches!(s, Status::Done | Status::Failed(_))).await;
     assert_eq!(it.status, Status::Done, "{:?}", it.status);
@@ -221,7 +273,7 @@ async fn a_video_whose_addresses_expire_partway_carries_on_from_the_page() {
 async fn a_video_refused_from_the_start_fails_at_once() {
     // Carrying on is for a download that was getting somewhere; one that never started fails
     // with yt-dlp's reason, without running it again and again.
-    let (m, dl, tools) = setup("forbidden", "forbidden");
+    let (m, dl, tools, _dir) = setup("forbidden", "forbidden");
     let id = m.add(video(&dl, "18")).unwrap();
     let it = wait_for(&m, id, |s| matches!(s, Status::Failed(_))).await;
     assert_eq!(it.status, Status::Failed("unable to download video data: HTTP Error 403: Forbidden".into()));
@@ -232,7 +284,7 @@ async fn a_video_refused_from_the_start_fails_at_once() {
 async fn output_in_another_encoding_does_not_stop_the_reading() {
     // A title in Latin-1 used to end the reading of yt-dlp's output; yt-dlp then blocked on a
     // full pipe and the download hung.
-    let (m, dl, _) = setup("latin1", "latin1");
+    let (m, dl, _, _dir) = setup("latin1", "latin1");
     let id = m.add(video(&dl, "18")).unwrap();
     let it = wait_for(&m, id, |s| matches!(s, Status::Done | Status::Failed(_))).await;
     assert_eq!(it.status, Status::Done, "{:?}", it.status);
@@ -240,7 +292,7 @@ async fn output_in_another_encoding_does_not_stop_the_reading() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_cookies_file_is_private_and_goes_with_the_download() {
-    let (m, dl, tools) = setup("cookies", "");
+    let (m, dl, tools, _dir) = setup("cookies", "");
     let mut req = video(&dl, "18");
     req.cookie = Some("SID=secret".into());
     let id = m.add(req).unwrap();
@@ -254,7 +306,7 @@ async fn the_cookies_file_is_private_and_goes_with_the_download() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ytdlp_gets_its_share_of_the_global_limit_and_a_new_limit_reaches_it() {
-    let (m, dl, tools) = setup("limit", "slow");
+    let (m, dl, tools, _dir) = setup("limit", "slow");
     m.update_settings(reidm_core::SettingsPatch { speed_limit: Some(1_000_000), limit_enabled: Some(true), ..Default::default() }).unwrap();
     let a = m.add(video(&dl, "18")).unwrap();
     wait_for(&m, a, |_| m.get(a).is_some_and(|i| i.downloaded > 0)).await;

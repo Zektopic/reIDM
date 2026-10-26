@@ -12,7 +12,7 @@ impl App {
                 ui.label(RichText::new("CATEGORIES").size(12.0).color(p.text_dim).strong());
                 ui.add_space(2.0);
 
-                // IDM nests its categories under "Categories > All Downloads"; mirror that with
+                // The categories nest under "Categories > All Downloads"; mirror that with
                 // real expanders rather than a flat list.
                 let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 20.0), egui::Sense::click());
                 icons::chevron(ui.painter(), egui::Rect::from_min_size(r.min + Vec2::new(2.0, 4.0), Vec2::splat(12.0)), p.text_dim, self.cats_open);

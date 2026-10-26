@@ -2,7 +2,7 @@
 //!
 //! A download is fetched over several connections, each owning a byte range (a *segment*).
 //! When a connection finishes its range early it takes over half of the largest range another
-//! connection is still working on — IDM's dynamic segmentation — so one slow connection does
+//! connection is still working on — dynamic segmentation — so one slow connection does
 //! not decide how long the whole file takes.
 
 pub mod category;
@@ -105,7 +105,7 @@ pub struct Request {
 /// How to add a download, beyond what to fetch.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct AddOptions {
-    /// Put it in the list without starting it — IDM's *Download Later*. It joins the scheduled
+    /// Put it in the list without starting it — *Download Later*. It joins the scheduled
     /// queue, which the scheduler (or *Start queue*) starts.
     #[serde(default)]
     pub later: bool,
@@ -232,7 +232,7 @@ pub struct Item {
     /// When the download was queued, as unix seconds.
     #[serde(default)]
     pub added: u64,
-    /// When a transfer last ran, as unix seconds. Shown as IDM's "Last Try" column.
+    /// When a transfer last ran, as unix seconds. Shown as the "Last Try" column.
     #[serde(default)]
     pub last_try: Option<u64>,
     /// When the download completed, as unix seconds.
@@ -476,6 +476,11 @@ struct Inner {
     refresh: Mutex<Option<(u64, Instant)>>,
     /// The BitTorrent session, started by the first torrent.
     torrents: tokio::sync::OnceCell<Arc<librqbit::Session>>,
+    /// The torrent limits last given to the engine. Setting the same value again rebuilds the
+    /// engine's token buckets with a fresh burst, so the 500 ms share update must not repeat one
+    /// (the sentinel is a value no limit can take).
+    torrent_down_bps: AtomicU64,
+    torrent_up_bps: AtomicU64,
     #[cfg(test)]
     faults: Arc<tests::Faults>,
 }
@@ -847,8 +852,9 @@ struct Effects {
     /// Media downloads whose old pieces are to be found and deleted with their file. The scan
     /// reads the download folder, so it happens in `apply`, after the list is unlocked.
     leftovers_of: Vec<PathBuf>,
-    /// Torrents (by info hash) to take out of the torrent engine, with their files.
-    forget: Vec<String>,
+    /// Torrents to take out of the engine, with their files: the status (for its recorded
+    /// files) and the download's path (which is the torrent's folder for several files).
+    forget: Vec<(TorrentStatus, PathBuf)>,
 }
 
 impl Manager {
@@ -916,6 +922,8 @@ impl Manager {
             limiter,
             refresh: Mutex::new(None),
             torrents: tokio::sync::OnceCell::new(),
+            torrent_down_bps: AtomicU64::new(u64::MAX),
+            torrent_up_bps: AtomicU64::new(u64::MAX),
             #[cfg(test)]
             faults: Arc::default(),
         })))
@@ -1415,9 +1423,9 @@ impl Manager {
         for d in &fx.delete_dirs {
             let _ = std::fs::remove_dir_all(d);
         }
-        for hash in fx.forget {
+        for (t, path) in fx.forget {
             // From nothing: the torrent engine forgets it, and its files go.
-            self.forget_torrent(hash, true);
+            self.forget_torrent(t, path, true);
         }
         self.save_now();
         if fx.pump {
@@ -1514,7 +1522,7 @@ impl Manager {
         it.part = None;
         it.status = Status::Queued;
         if let Some(t) = it.torrent.take() {
-            fx.forget.push(t.info_hash);
+            fx.forget.push((t, it.path.clone()));
         }
         if it.request.media.is_some() {
             // yt-dlp would otherwise find the finished file and its pieces and stop there.
@@ -1596,6 +1604,12 @@ impl Manager {
             let mut db = self.0.db.lock().unwrap();
             let live = self.0.live.lock().unwrap();
             let Some(it) = db.remove(id) else { return };
+            if let Some(t) = &it.torrent {
+                // Registered before the list lets go of it: a torrent added again right now
+                // waits for the old copy to be gone instead of adopting the handle being
+                // removed (whose delete would then take the new download's files).
+                self.mark_forgetting(&t.info_hash);
+            }
             match live.get(&id) {
                 Some(l) => {
                     *l.removed.lock().unwrap() = Some((it, delete_files));
@@ -1625,7 +1639,7 @@ impl Manager {
         }
         if let Some(t) = &it.torrent {
             // The torrent engine owns a torrent's files (one, or a folder of them).
-            self.forget_torrent(t.info_hash.clone(), delete_files);
+            self.forget_torrent(t.clone(), it.path.clone(), delete_files);
             return;
         }
         if delete_files {
@@ -1737,7 +1751,7 @@ impl Manager {
     // ── refreshing an address ────────────────────────────────────────────
 
     /// Use the next download the browser hands over as `id`'s new address, for the next
-    /// three minutes. This is IDM's *Refresh download address*: open the page again, click the
+    /// three minutes. This is *Refresh download address*: open the page again, click the
     /// link again, and the expired download carries on from where it was.
     pub fn arm_refresh(&self, id: u64) -> Result<()> {
         let db = self.0.db.lock().unwrap();
@@ -1908,7 +1922,7 @@ impl Manager {
                     it.note = None;
                     if st == Status::Done {
                         it.finished_at = Some(now_secs());
-                        // A finished download leaves the scheduled queue, as in IDM.
+                        // A finished download leaves the scheduled queue.
                         it.scheduled = false;
                         it.replace = false;
                     }
@@ -2378,7 +2392,7 @@ impl Manager {
                 p.workers -= 1;
                 // While other connections are still working, a refused or broken one hands its
                 // range back and bows out: many servers cap connections per client, and carrying
-                // on with fewer — what IDM does — beats failing the whole download.
+                // on with fewer beats failing the whole download.
                 if p.workers > 0 && !is_fatal(&e) && !ctx.live.cancel.load(Ordering::SeqCst) {
                     tracing::info!("download {}: dropping a connection ({e:#}); {} still working", ctx.id, p.workers);
                     return Ok(());

@@ -90,7 +90,7 @@ impl App {
                                 toggle_all = true;
                             }
                         });
-                        // Sortable column labels, with IDM's column order and titles.
+                        // Sortable column labels, in the classic column order and titles.
                         let cur = self.sort;
                         let desc = self.desc;
                         let mut h = |header: &mut egui_extras::TableRow, label: &str, k: SortKey| {
@@ -272,7 +272,7 @@ impl App {
                                 ui.label(RichText::new(txt).size(12.0).color(if active { p.accent_fg } else { p.text_dim }));
                             });
 
-                            // Last Try, as IDM shows it.
+                            // Last Try.
                             row.col(|ui| {
                                 let txt = it.last_try.map(|t| since_human(t, now)).unwrap_or_default();
                                 ui.label(RichText::new(txt).size(12.0).color(p.text_dim));
@@ -327,7 +327,7 @@ impl App {
                     }
                 }
                 if let Some(id) = open_req {
-                    // IDM: a finished download opens; an unfinished one shows its progress.
+                    // A finished download opens; an unfinished one shows its progress.
                     if self.item(id).is_some_and(|i| i.status == Status::Done) {
                         self.open_id(id, false);
                     } else {
