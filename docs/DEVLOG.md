@@ -9,6 +9,37 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — The real Windows PC, tested (0.7.1-rc)
+
+**Context.** The user's Windows 11 PC came back online. `0.7.1-rc` was installed over 0.7.0 and
+the service and window were started in their desktop session as the user (session 1, not from the
+elevated SSH session); the test downloads were removed afterwards.
+
+**Evidence.**
+- A 2 GiB download from a deterministic LAN server completed and **matched its SHA-256**. Windows
+  marked it as from the internet (`Zone.Identifier` with `ZoneId=3` and `HostUrl`); removing it with
+  purge deleted the file.
+- With that download running, `/api/downloads/rows` answered in at most **15 ms** with no errors,
+  and three cycles of 100 adds and 100 purges took **19–24 ms** each — the playlist-add/delete
+  scenario that used to hang.
+- `powercfg /requests` showed the reIDM service holding a SYSTEM request during the transfer; it
+  was released after.
+- When-done (*exit*): the countdown started only after the download finished (`fires_at` set), and
+  `when-done/cancel` cleared it.
+- A YouTube download with the picker's real *Best* selector finished as a **635,505-byte MP4** and
+  was purged — the video path behind the reported 404.
+- `reidm.log` was written; the staged extension is **1.8.0**; the Firefox native host was
+  registered on Windows (`com.zektopic.reidm`, `reidm@zektopic.in`).
+- The tray icon's hidden `tray_icon_app` window exists in the window process.
+
+**Not observed.** The tray icon/menu and the completion fallback window while a full-screen game
+covered and occluded the window: an occluded egui window stops painting, so it did not process the
+completion during the test. Both paths were exercised on Linux with the real service; the user can
+confirm them visually with the window visible. The user's Edge still has extension 1.5.0 loaded
+until it is reloaded, and macOS remains untested (no Mac access).
+
+**Follow-ups.** None in the code from this run.
+
 ## 2026-10-26 — Extension 1.8.0: Firefox, and the 0.7.1-rc release (PR #10)
 
 **Context.** The user's Mac showed extension **1.5.0**'s console error *"Unsafe attempt to load URL
