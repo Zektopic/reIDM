@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.1-rc2
+
+### Fixed
+
+* **After updating, the window could say "the service answered 405" and show no list.** A background
+  service from the previous reIDM was still running (closing the window does not stop it) and the
+  new window used it. The window now checks the service's version, stops an older one — its
+  downloads carry on from the list on disk — and starts its own; if it cannot, it says in plain
+  words which process to quit.
+
 ## 0.7.1-rc
 
 ### New

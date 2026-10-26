@@ -107,22 +107,128 @@ fn read_token_now(file: &std::path::Path) -> Option<String> {
     Some(s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// Is reIDM's service answering on its port? A bare TCP connect would also succeed against some
-/// other program that took the port, and the window would then wait for ever.
-fn daemon_up() -> bool {
-    let a = agent(Duration::from_millis(800));
-    let Ok(mut r) = a.get(format!("http://127.0.0.1:{}/ext/ping", ui_port())).call() else { return false };
-    r.status().is_success() && r.body_mut().read_to_string().ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).is_some_and(|v| v["app"] == "reIDM")
+/// This window's own version. The background service must run the same one: a service left
+/// running from a previous install answers the ping but not the requests this window makes (a
+/// 0.7.0 service answers `GET /api/downloads/rows` with 405, because its only route below
+/// `/api/downloads` answers DELETE).
+fn our_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
-/// Make sure a daemon is running, starting one if needed. Returns false if it never came up.
-/// Blocks for up to 15 s, so call it from the poller or `--background`, never a frame.
-pub fn ensure_daemon() -> bool {
-    if daemon_up() {
-        return true;
+/// The version an answering reIDM service reports, or `None` when nothing that calls itself
+/// reIDM answers on the window's port.
+fn service_version() -> Option<String> {
+    let a = agent(Duration::from_millis(800));
+    let mut r = a.get(format!("http://127.0.0.1:{}/ext/ping", ui_port())).call().ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    let text = r.body_mut().read_to_string().ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    (v["app"] == "reIDM").then(|| v["version"].as_str().unwrap_or_default().to_string())
+}
+
+/// The processes listening on `port`, so an older reIDM service can be stopped. Only used after
+/// the port answered as reIDM.
+fn listening_pids(port: u16) -> Result<Vec<String>, String> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("lsof")
+            .args(["-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+            .output()
+            .map_err(|e| format!("lsof: {e}"))?;
+        Ok(String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_string).collect())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("netstat").args(["-ano", "-p", "TCP"]).creation_flags(0x0800_0000).output().map_err(|e| format!("netstat: {e}"))?;
+        let want = format!(":{port}");
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let c: Vec<&str> = l.split_whitespace().collect();
+                (c.len() >= 5 && c[1].ends_with(&want) && c[3].eq_ignore_ascii_case("LISTENING")).then(|| c[4].to_string())
+            })
+            .collect())
+    }
+}
+
+fn stop_pid(pid: &str, force: bool) {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill").args([if force { "-KILL" } else { "-TERM" }, pid]).status();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `taskkill /F`: a windowless service has no close message to ask it with.
+        let _ = force;
+        let _ = std::process::Command::new("taskkill").args(["/F", "/PID", pid]).creation_flags(0x0800_0000).status();
+    }
+}
+
+/// Whether the process is a reIDM binary, so a port found between two checks cannot make the
+/// window signal something else.
+fn is_reidm(pid: &str) -> bool {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps").args(["-o", "comm=", "-p", pid]).output();
+        out.map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("reidm")).unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]).creation_flags(0x0800_0000).output();
+        out.map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("reidm")).unwrap_or(false)
+    }
+}
+
+/// Stop a service of another reIDM version that holds the port. It is signalled (`SIGTERM`,
+/// which a 0.8 service answers by flushing its list before it exits), and killed only if it does
+/// not go. Its list is on disk either way, and the service this window starts carries on from it.
+fn replace_service(stale: &str) -> Result<(), String> {
+    let port = ui_port();
+    let pids = listening_pids(port).map_err(|e| {
+        format!("an older reIDM service ({stale}) is running and could not be stopped automatically ({e}); quit it in Activity Monitor, or run `pkill -x reidm`, and open reIDM again — its downloads carry on")
+    })?;
+    let pids: Vec<String> = pids.into_iter().filter(|p| is_reidm(p)).collect();
+    if pids.is_empty() {
+        return Err(format!("reIDM {stale} is running but its process could not be found; quit it in Activity Monitor, or run `pkill -x reidm`, and open reIDM again — its downloads carry on"));
+    }
+    for pid in &pids {
+        stop_pid(pid, false);
+    }
+    for _ in 0..50 {
+        if service_version().is_none() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for pid in &pids {
+        stop_pid(pid, true);
+    }
+    for _ in 0..20 {
+        if service_version().is_none() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("the older reIDM service ({stale}) is still running; quit it in Activity Monitor, or run `pkill -x reidm`, and open reIDM again — its downloads carry on"))
+}
+
+/// Make sure the service this window belongs to is running, starting it if needed. A service of
+/// another version is stopped first: this window cannot use it, and the two share their list on
+/// disk. Returns why it could not be done, in words a user can act on.
+pub fn ensure_daemon() -> Result<(), String> {
+    if let Some(v) = service_version() {
+        if v == our_version() {
+            return Ok(());
+        }
+        replace_service(&v)?;
     }
     let exe = std::env::current_exe().ok().map(|p| p.with_file_name(if cfg!(windows) { "reidm.exe" } else { "reidm" }));
-    let Some(exe) = exe else { return false };
+    let Some(exe) = exe else { return Err("cannot find the reIDM program next to this window".into()) };
 
     let mut c = std::process::Command::new(exe);
     c.arg("daemon").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
@@ -138,21 +244,28 @@ pub fn ensure_daemon() -> bool {
         use std::os::unix::process::CommandExt;
         c.process_group(0);
     }
-    let Ok(mut child) = c.spawn() else { return false };
+    let Ok(mut child) = c.spawn() else { return Err("cannot start reIDM's background service".into()) };
     for _ in 0..60 {
-        if daemon_up() {
-            // It runs on; reap it if it ever exits while the window is open.
-            std::thread::spawn(move || child.wait());
-            return true;
+        if let Some(v) = service_version() {
+            if v == our_version() {
+                // It runs on; reap it if it ever exits while the window is open.
+                std::thread::spawn(move || child.wait());
+                return Ok(());
+            }
+            return Err(format!("the background service is reIDM {v}, but this window is {}", our_version()));
         }
         // A service that exits at once (the port is taken, or one is already running for this
         // data folder) has said why on its own stderr; there is no point waiting it out.
         if let Ok(Some(_)) = child.try_wait() {
-            return daemon_up();
+            return match service_version() {
+                Some(v) if v == our_version() => Ok(()),
+                Some(v) => Err(format!("the background service is reIDM {v}, but this window is {}", our_version())),
+                None => Err("reIDM's background service stopped while starting; see its log".into()),
+            };
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    false
+    Err("reIDM's background service did not start; see its log".into())
 }
 
 fn agent(timeout: Duration) -> ureq::Agent {
@@ -607,11 +720,13 @@ fn poll_loop(client: Client, tx: Sender<Snapshot>, pace: Pace, poked: Receiver<(
     repaint();
     // Started here rather than before the window opens: the window shows at once, saying what
     // it is waiting for, instead of after up to 15 silent seconds.
-    if !ensure_daemon() {
-        snap.problem = Some("reIDM's background service could not be started. Is `reidm` installed next to this program?".into());
+    let mut start_problem: Option<String> = None;
+    if let Err(why) = ensure_daemon() {
+        snap.problem = Some(why.clone());
         snap.rev += 1;
         let _ = tx.send(snap.clone());
         repaint();
+        start_problem = Some(why);
     }
     let mut list = ListState::default();
     let mut rates = Rates::default();
@@ -641,6 +756,7 @@ fn poll_loop(client: Client, tx: Sender<Snapshot>, pace: Pace, poked: Receiver<(
                 if !snap.connected {
                     snap.connected = true;
                     snap.problem = None;
+                    start_problem = None;
                     changed = true;
                 }
             }
@@ -651,6 +767,7 @@ fn poll_loop(client: Client, tx: Sender<Snapshot>, pace: Pace, poked: Receiver<(
                     if !snap.connected {
                         snap.connected = true;
                         snap.problem = None;
+                        start_problem = None;
                         changed = true;
                     }
                 }
@@ -661,13 +778,24 @@ fn poll_loop(client: Client, tx: Sender<Snapshot>, pace: Pace, poked: Receiver<(
             },
             Ok(r) => {
                 list.cursor = None;
-                let why = r.into_result().err().unwrap_or_default();
+                let why = if let Some(w) = &start_problem {
+                    // The startup's explanation names the old service and what to do; a bare
+                    // "the service answered 405" would say nothing useful.
+                    w.clone()
+                } else if r.status == 405 {
+                    // What an older service answers to `GET /api/downloads/rows` (its only
+                    // route below `/api/downloads` answers DELETE).
+                    "the background service is an older reIDM and this window can't use it. Quit it in Activity Monitor, or run `pkill -x reidm`, and open reIDM again — its downloads carry on".to_string()
+                } else {
+                    r.into_result().err().unwrap_or_default()
+                };
                 changed |= set_problem(&mut snap, why);
             }
             Err(e) => {
                 // The service restarted, or stopped: start over with the whole list.
                 list.cursor = None;
-                changed |= set_problem(&mut snap, e);
+                let why = start_problem.clone().unwrap_or(e);
+                changed |= set_problem(&mut snap, why);
             }
         }
 

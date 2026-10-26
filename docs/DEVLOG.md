@@ -9,6 +9,35 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — An update replaces an older service that is still running (0.7.1-rc2)
+
+**Context.** On the user's Mac the window showed *"the service answered 405"* and no list right
+after installing 0.7.1-rc over 0.7.0. The 0.7.0 background service was still running from the old
+app — closing the window does not stop the service — and the new window used it. The window's list
+request is `GET /api/downloads/rows`; 0.7.0 has no such route, and its `/api/downloads/:id`
+accepts DELETE only, so the request matched that path and axum answered **405**.
+
+**Decision.** `ensure_daemon` now asks `/ext/ping` for the service's version. A service of another
+version is stopped and replaced: its PID comes from `lsof -t -iTCP:<port> -sTCP:LISTEN` (Unix) or
+`netstat -ano` (Windows), is checked with `ps`/`tasklist` to be a reIDM binary, and is sent
+SIGTERM (a 0.8 service answers by flushing its list) — SIGKILL only if it will not go. The window
+then starts the service beside itself; both versions share the data folder, so the new service
+carries on from the list on disk. If the stop fails, the window says which process to quit and how
+(`pkill -x reidm`), and a 405 from the rows request now produces that explanation rather than the
+bare status.
+
+**Alternatives.** A message only (leaves the user stuck); asking the old service to shut down via
+`/api/shutdown` (0.7.0 has no such route, and a 0.8 one requires the window's token); `pkill -x
+reidm` unconditionally (could stop another instance with its own data folder).
+
+**Evidence.** A stand-in 0.7.0 service on 61002 (ping says 0.7.0, rows answers 405): the new
+window stopped it, started the real service (its log shows the ports and the staged extension), and
+showed a Ready window with the list instead of the 405. 47 GUI tests and clippy on Linux, Windows
+and macOS pass. The Mac itself remains the user's to confirm.
+
+**Follow-ups.** A login item left by the old app can start the old service again; removing it is
+the user's (“Start reIDM when you sign in” in Options points at the current app).
+
 ## 2026-10-26 — The real Windows PC, tested (0.7.1-rc)
 
 **Context.** The user's Windows 11 PC came back online. `0.7.1-rc` was installed over 0.7.0 and

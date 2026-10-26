@@ -191,6 +191,12 @@ or use **Restart**.
 and 61002 are taken — almost always by another reIDM. Find it (`ss -ltnp | grep 6100`,
 `lsof -i :61002`, or on Windows `netstat -ano | findstr 6100`) and stop it, or just use that one.
 
+**After updating, the window says "the service answered 405", or that an older reIDM service is
+running.** A background service from the previous reIDM is still running (closing the window does
+not stop it): the new window cannot use its API. Quit it — Activity Monitor › `reidm` › Quit, or
+`pkill -x reidm` — and open reIDM again; its downloads carry on from the list on disk. Version
+0.7.1-rc2 and later replace it by themselves.
+
 **The list came back older, or empty, with a warning about `downloads.json`.** reIDM keeps the
 previous copy of the list as `downloads.json.bak`. If the list is damaged when the service starts
 (a disk error, an edit by hand), the damaged file is kept as `downloads.json.corrupt-<time>` and

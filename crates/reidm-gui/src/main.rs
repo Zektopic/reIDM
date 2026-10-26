@@ -62,8 +62,8 @@ fn main() -> eframe::Result<()> {
     // without showing a window. With a window, the poller starts the service instead, so the
     // window shows at once and says what it is waiting for.
     if background {
-        if !api::ensure_daemon() {
-            eprintln!("reIDM: could not start the background download service. Is reidm installed next to this program?");
+        if let Err(e) = api::ensure_daemon() {
+            eprintln!("reIDM: {e}");
             std::process::exit(1);
         }
         return Ok(());
