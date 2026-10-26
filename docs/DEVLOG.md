@@ -53,6 +53,11 @@ Headless Firefox under Xvfb installs the temporary add-on and its background pin
 100/100, 48/48 and 20/20 on the 1.8.0 sources. The `reidm` tests (39, including the new Firefox
 host test) and clippy pass.
 
+**Release note.** The first tag run built all three jobs, but its publish step tried to upload the
+unpacked `dist/firefox-extension/` directory as a release asset and failed. The workflow now
+uploads files only and the Linux job removes the folder; the tag was moved to that commit so the
+release is built by the fixed workflow.
+
 **Follow-ups.** AMO signing is left to the user or the release process; Firefox's tiny-download
 race is inherent to its API.
 

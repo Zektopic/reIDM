@@ -31,6 +31,8 @@ jobs:
           V="${GITHUB_REF_NAME#v}"; [ "$GITHUB_REF_TYPE" = tag ] || V="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)-dev"
           node tools/build-firefox-extension.mjs
           (cd extension && zip -r -X "../dist/reidm-extension-$V.zip" .)
+          # Only the zip is shipped; the unpacked folder is a development aid.
+          rm -rf dist/firefox-extension
       - uses: actions/upload-artifact@v4
         with: { name: deb, path: "dist/*" }
 
@@ -124,7 +126,10 @@ jobs:
           PRE=""
           case "${{ github.ref_name }}" in *-*) PRE="--prerelease" ;; esac
           ls -la dist
-          gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" \
+          # Files only: artifact folders come along with the downloads, and a release asset
+          # cannot be a directory.
+          ASSETS=$(find dist -maxdepth 1 -type f -print)
+          gh release create "${{ github.ref_name }}" $ASSETS --repo "${{ github.repository }}" \
             --title "reIDM ${GITHUB_REF_NAME#v}" --notes-file - $PRE <<'EON'
           A cross-platform download manager that takes over your browser's downloads. See CHANGELOG.md for what is new.
 
