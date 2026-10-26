@@ -604,7 +604,9 @@ async fn connections_that_keep_breaking_off_still_finish() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_that_appears_at_the_destination_is_kept() {
-    let srv = serve(Cfg { throttle: Some(1 << 20), ..Default::default() });
+    // Slow enough that the file below is certainly there before the download finishes: at 1 MiB/s
+    // on a fast Windows runner it could finish before the write, and the test then proved nothing.
+    let srv = serve(Cfg { throttle: Some(128 << 10), ..Default::default() });
     let data = body(1 << 20, 5);
     srv.cfg.files.lock().unwrap().insert("/report.bin".into(), data.clone());
     let (m, dl) = manager("taken", 2);
@@ -612,8 +614,8 @@ async fn a_file_that_appears_at_the_destination_is_kept() {
     assert_eq!(m.get(id).unwrap().path, dl.join("report.bin"));
     // While it downloads, something else saves a file under the same name: the browser's own
     // copy, or the user's.
-    wait_until("progress", || m.get(id).unwrap().downloaded > 0);
     std::fs::write(dl.join("report.bin"), b"the user's own file").unwrap();
+    wait_until("progress", || m.get(id).unwrap().downloaded > 0);
     wait_until("done", || state(&m, id) == Status::Done);
     assert_eq!(std::fs::read(dl.join("report.bin")).unwrap(), b"the user's own file", "an existing file was replaced");
     let path = m.get(id).unwrap().path;
