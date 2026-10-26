@@ -51,7 +51,9 @@ the self-hosted runner `manupa-hnx` was offline (the .deb is built there; local 
 Headless Firefox under Xvfb installs the temporary add-on and its background pings
 `/ext/ping?v=1.8.0` (verified against a throw-away endpoint). The Chromium browser suite passes
 100/100, 48/48 and 20/20 on the 1.8.0 sources. The `reidm` tests (39, including the new Firefox
-host test) and clippy pass.
+host test) and clippy pass. A real YouTube download through the service with the extension's own
+*Best* selector (its fallback chain, not plain `best`) completed as a 635 KB MP4 — the 1.5.0-era
+video failure is not reproducible on this RC.
 
 **Release note.** The first tag run built all three jobs, but its publish step tried to upload the
 unpacked `dist/firefox-extension/` directory as a release asset and failed. The workflow now
