@@ -1,28 +1,19 @@
-//! Browser integration on disk: the native-messaging host manifests, and the copy of reIDM's
+//! Browser integration on disk: the native-messaging host manifest, and the copy of reIDM's
 //! own extension that browsers load.
 //!
-//! Two hosts are registered, both served by `reidm-host`:
-//!
-//! * `com.tonec.idm`, mirroring the manifest the original IDM installer ships, for the official
-//!   IDM extension;
-//! * `com.zektopic.reidm`, for reIDM's own extension, which uses it to start reIDM on demand.
-//!
-//! Chromium-family browsers find a host through a JSON manifest: in a per-browser directory on
-//! Linux and macOS, through a registry key pointing at the file on Windows.
+//! `com.zektopic.reidm` is served by `reidm-host` and lets reIDM's extension start reIDM on
+//! demand. Chromium-family browsers find a host through a JSON manifest: in a per-browser
+//! directory on Linux and macOS, through a registry key pointing at the file on Windows.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-const CHROME_ORIGINS: [&str; 2] = [
-    "chrome-extension://ngpampappnmepgilojfohadhhmbhlaek/",
-    "chrome-extension://llbjbkhnmlidjebalopleeepgdfgcpec/",
-];
-const FIREFOX_ID: &str = "mozilla_cc3@internetdownloadmanager.com";
-const HOST_NAME: &str = "com.tonec.idm";
-
-/// reIDM's own extension and its host. The ID is fixed by the `key` in the extension manifest.
+/// reIDM's own extension and its host. The Chromium ID is fixed by the `key` in the extension
+/// manifest; Firefox has no such key, so its `browser_specific_settings.gecko.id` names it, and
+/// the native host admits that ID in `allowed_extensions`.
 pub const REIDM_HOST_NAME: &str = "com.zektopic.reidm";
 pub const REIDM_EXTENSION_ID: &str = "pgeonmdaagbiccimgojpafdjcipcfnlc";
+pub const REIDM_FIREFOX_ID: &str = "reidm@zektopic.in";
 
 #[cfg(not(windows))]
 struct Target {
@@ -80,29 +71,19 @@ const WINDOWS_BROWSERS: [(&str, &str); 4] = [
     ("vivaldi", r"HKCU\Software\Vivaldi\NativeMessagingHosts"),
 ];
 
-fn manifest(host_path: &Path, firefox: bool) -> serde_json::Value {
+fn reidm_manifest(host_path: &Path, firefox: bool) -> serde_json::Value {
     let mut m = serde_json::json!({
-        "name": HOST_NAME,
-        "description": "reIDM native messaging host (IDM-compatible)",
-        "type": "stdio",
-        "path": host_path,
-    });
-    if firefox {
-        m["allowed_extensions"] = serde_json::json!([FIREFOX_ID]);
-    } else {
-        m["allowed_origins"] = serde_json::json!(CHROME_ORIGINS);
-    }
-    m
-}
-
-fn reidm_manifest(host_path: &Path) -> serde_json::Value {
-    serde_json::json!({
         "name": REIDM_HOST_NAME,
         "description": "Starts reIDM for the reIDM browser extension",
         "type": "stdio",
         "path": host_path,
-        "allowed_origins": [format!("chrome-extension://{REIDM_EXTENSION_ID}/")],
-    })
+    });
+    if firefox {
+        m["allowed_extensions"] = serde_json::json!([REIDM_FIREFOX_ID]);
+    } else {
+        m["allowed_origins"] = serde_json::json!([format!("chrome-extension://{REIDM_EXTENSION_ID}/")]);
+    }
+    m
 }
 
 fn host_binary() -> Result<PathBuf> {
@@ -176,32 +157,6 @@ fn reg_set_default(key: &str, value: &Path) -> bool {
 
 pub fn install() -> Result<()> {
     let host = host_binary()?;
-    #[cfg(windows)]
-    {
-        let dir = reidm_core::default_data_dir();
-        std::fs::create_dir_all(&dir)?;
-        let idm_file = dir.join(format!("{HOST_NAME}.chromium.json"));
-        write_if_changed(&idm_file, &manifest(&host, false))?;
-        let ff_file = dir.join(format!("{HOST_NAME}.firefox.json"));
-        write_if_changed(&ff_file, &manifest(&host, true))?;
-        for (browser, base) in WINDOWS_BROWSERS {
-            let ok = reg_set_default(&format!(r"{base}\{HOST_NAME}"), &idm_file);
-            println!("{browser}: {}", if ok { "registered" } else { "FAILED" });
-        }
-        let ok = reg_set_default(&format!(r"HKCU\Software\Mozilla\NativeMessagingHosts\{HOST_NAME}"), &ff_file);
-        println!("firefox: {}", if ok { "registered" } else { "FAILED" });
-    }
-    #[cfg(not(windows))]
-    for t in targets() {
-        // Only touch browsers that are actually installed (their profile dir's parent exists).
-        let Some(parent) = t.dir.parent() else { continue };
-        if !parent.exists() {
-            continue;
-        }
-        let f = t.dir.join(format!("{HOST_NAME}.json"));
-        write_if_changed(&f, &manifest(&host, t.firefox))?;
-        println!("{}: wrote {}", t.browser, f.display());
-    }
     for line in ensure_reidm_host()? {
         println!("{line}");
     }
@@ -219,9 +174,13 @@ pub fn ensure_reidm_host() -> Result<Vec<String>> {
     #[cfg(windows)]
     {
         let dir = reidm_core::default_data_dir();
-        let file = dir.join(format!("{REIDM_HOST_NAME}.json"));
-        if write_if_changed(&file, &reidm_manifest(&host))? {
-            changed.push(format!("wrote {}", file.display()));
+        let chromium = dir.join(format!("{REIDM_HOST_NAME}.json"));
+        if write_if_changed(&chromium, &reidm_manifest(&host, false))? {
+            changed.push(format!("wrote {}", chromium.display()));
+        }
+        let firefox = dir.join(format!("{REIDM_HOST_NAME}.firefox.json"));
+        if write_if_changed(&firefox, &reidm_manifest(&host, true))? {
+            changed.push(format!("wrote {}", firefox.display()));
         }
         for (browser, base) in WINDOWS_BROWSERS {
             let key = format!(r"{base}\{REIDM_HOST_NAME}");
@@ -231,19 +190,24 @@ pub fn ensure_reidm_host() -> Result<Vec<String>> {
             if current.as_deref().is_some_and(|m| manifest_points_at(Path::new(m), &host)) {
                 continue;
             }
-            if reg_set_default(&key, &file) {
+            if reg_set_default(&key, &chromium) {
                 changed.push(format!("{browser}: registered {REIDM_HOST_NAME}"));
             }
         }
+        let key = format!(r"HKCU\Software\Mozilla\NativeMessagingHosts\{REIDM_HOST_NAME}");
+        let current = reg_default_value(&key);
+        if !current.as_deref().is_some_and(|m| manifest_points_at(Path::new(m), &host)) && reg_set_default(&key, &firefox) {
+            changed.push(format!("firefox: registered {REIDM_HOST_NAME}"));
+        }
     }
     #[cfg(not(windows))]
-    for t in targets().into_iter().filter(|t| !t.firefox) {
+    for t in targets() {
         let Some(parent) = t.dir.parent() else { continue };
         if !parent.exists() {
             continue;
         }
         let f = t.dir.join(format!("{REIDM_HOST_NAME}.json"));
-        if write_if_changed(&f, &reidm_manifest(&host))? {
+        if write_if_changed(&f, &reidm_manifest(&host, t.firefox))? {
             changed.push(format!("{}: wrote {}", t.browser, f.display()));
         }
     }
@@ -263,31 +227,30 @@ fn manifest_points_at(manifest: &Path, host: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     };
-    let origin_ok = v["allowed_origins"].as_array().is_some_and(|o| o.iter().any(|x| x.as_str() == Some(&format!("chrome-extension://{REIDM_EXTENSION_ID}/"))));
-    origin_ok && same(&p, host)
+    let chrome = v["allowed_origins"].as_array().is_some_and(|o| o.iter().any(|x| x.as_str() == Some(&format!("chrome-extension://{REIDM_EXTENSION_ID}/"))));
+    let firefox = v["allowed_extensions"].as_array().is_some_and(|o| o.iter().any(|x| x.as_str() == Some(REIDM_FIREFOX_ID)));
+    (chrome || firefox) && same(&p, host)
 }
 
 pub fn uninstall() -> Result<()> {
     #[cfg(windows)]
     {
-        let mut keys: Vec<String> = Vec::new();
         for (_, base) in WINDOWS_BROWSERS {
-            keys.push(format!(r"{base}\{HOST_NAME}"));
-            keys.push(format!(r"{base}\{REIDM_HOST_NAME}"));
+            let _ = std::process::Command::new("reg").args(["delete", &format!(r"{base}\{REIDM_HOST_NAME}"), "/f"]).status();
         }
-        keys.push(format!(r"HKCU\Software\Mozilla\NativeMessagingHosts\{HOST_NAME}"));
-        for key in keys {
-            let _ = std::process::Command::new("reg").args(["delete", &key, "/f"]).status();
+        let _ = std::process::Command::new("reg").args(["delete", &format!(r"HKCU\Software\Mozilla\NativeMessagingHosts\{REIDM_HOST_NAME}"), "/f"]).status();
+        // The manifests the keys pointed at, which `install` wrote into the data folder.
+        let dir = reidm_core::default_data_dir();
+        for f in [format!("{REIDM_HOST_NAME}.json"), format!("{REIDM_HOST_NAME}.firefox.json")] {
+            let _ = std::fs::remove_file(dir.join(f));
         }
     }
     #[cfg(not(windows))]
     for t in targets() {
-        for name in [HOST_NAME, REIDM_HOST_NAME] {
-            let f = t.dir.join(format!("{name}.json"));
-            if f.exists() {
-                std::fs::remove_file(&f)?;
-                println!("{}: removed {}", t.browser, f.display());
-            }
+        let f = t.dir.join(format!("{REIDM_HOST_NAME}.json"));
+        if f.exists() {
+            std::fs::remove_file(&f)?;
+            println!("{}: removed {}", t.browser, f.display());
         }
     }
     Ok(())
@@ -297,7 +260,7 @@ pub fn uninstall() -> Result<()> {
 
 /// Where the installer put reIDM's extension, if anywhere: next to the binaries on Windows,
 /// in the app bundle's resources on macOS, under `/usr/share` on Linux, or the source tree when
-/// running from a build directory.
+/// running a development build from the build directory.
 pub fn bundled_extension_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let bin = exe.parent()?.to_path_buf();
@@ -307,8 +270,12 @@ pub fn bundled_extension_dir() -> Option<PathBuf> {
         bin.join("../share/reidm/extension"),
         PathBuf::from("/usr/share/reidm/extension"),
     ];
-    // target/{debug,release}/reidm -> the repository's own copy
-    candidates.push(bin.join("../../extension"));
+    // target/debug/reidm -> the repository's own copy. Development builds only: from an
+    // installed `C:\Program Files\reIDM\reidm.exe` the same path is `C:\extension`, a folder
+    // any user can create, whose contents would then be offered as reIDM's extension.
+    if cfg!(debug_assertions) {
+        candidates.push(bin.join("../../extension"));
+    }
     candidates.into_iter().find(|d| d.join("manifest.json").is_file()).and_then(|d| d.canonicalize().ok()).map(plain_path)
 }
 
@@ -408,7 +375,7 @@ mod tests {
         let host = root.join("reidm-host");
         std::fs::write(&host, b"").unwrap();
         let mf = root.join("m.json");
-        let mut m = reidm_manifest(Path::new("reidm-host"));
+        let mut m = reidm_manifest(Path::new("reidm-host"), false);
         std::fs::write(&mf, serde_json::to_vec(&m).unwrap()).unwrap();
         assert!(manifest_points_at(&mf, &host));
         m["allowed_origins"] = serde_json::json!(["chrome-extension://someoneelse/"]);
@@ -419,8 +386,15 @@ mod tests {
 
     #[test]
     fn reidm_host_admits_only_reidms_extension() {
-        let m = reidm_manifest(Path::new("/usr/bin/reidm-host"));
+        let m = reidm_manifest(Path::new("/usr/bin/reidm-host"), false);
         assert_eq!(m["name"], REIDM_HOST_NAME);
         assert_eq!(m["allowed_origins"], serde_json::json!([format!("chrome-extension://{REIDM_EXTENSION_ID}/")]));
+    }
+
+    #[test]
+    fn the_firefox_host_admits_only_reidms_firefox_id() {
+        let m = reidm_manifest(Path::new("/usr/bin/reidm-host"), true);
+        assert_eq!(m["allowed_extensions"], serde_json::json!([REIDM_FIREFOX_ID]));
+        assert!(m.get("allowed_origins").is_none(), "Firefox hosts use allowed_extensions, not origins");
     }
 }

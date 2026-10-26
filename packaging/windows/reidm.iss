@@ -30,19 +30,12 @@ Source: "..\..\target\release\reidm-host.exe"; DestDir: "{app}"; Flags: ignoreve
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\docs\*.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\..\CHANGELOG.md"; DestDir: "{app}\docs"; Flags: ignoreversion
-Source: "com.tonec.idm.chromium.json"; DestDir: "{app}"; Flags: ignoreversion
-Source: "com.tonec.idm.firefox.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "com.zektopic.reidm.json"; DestDir: "{app}"; Flags: ignoreversion
 ; reIDM's own browser extension, for the browser's "Load unpacked"
 Source: "..\..\extension\*"; DestDir: "{app}\extension"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\..\packaging\icon\reidm.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
-; Native-messaging host registration (same host name as the original IDM installer used)
-Root: HKCU; Subkey: "Software\Google\Chrome\NativeMessagingHosts\com.tonec.idm"; ValueType: string; ValueData: "{app}\com.tonec.idm.chromium.json"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\com.tonec.idm"; ValueType: string; ValueData: "{app}\com.tonec.idm.chromium.json"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.tonec.idm"; ValueType: string; ValueData: "{app}\com.tonec.idm.chromium.json"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Mozilla\NativeMessagingHosts\com.tonec.idm"; ValueType: string; ValueData: "{app}\com.tonec.idm.firefox.json"; Flags: uninsdeletekey
 ; The host reIDM's own extension uses to start reIDM when it is not running
 Root: HKCU; Subkey: "Software\Google\Chrome\NativeMessagingHosts\com.zektopic.reidm"; ValueType: string; ValueData: "{app}\com.zektopic.reidm.json"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Microsoft\Edge\NativeMessagingHosts\com.zektopic.reidm"; ValueType: string; ValueData: "{app}\com.zektopic.reidm.json"; Flags: uninsdeletekey

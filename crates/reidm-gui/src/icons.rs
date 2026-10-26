@@ -194,7 +194,7 @@ pub fn grabber(p: &Painter, r: Rect, color: Color32) {
     p.line_segment([Pos2::new(c.x + r.width() * 0.11, c.y + r.width() * 0.11), Pos2::new(c.x + r.width() * 0.24, c.y + r.width() * 0.24)], s);
 }
 
-/// A small "file card" tinted by category, the way IDM marks each row with a file-type
+/// A small "file card" tinted by category, marking each row with a file-type
 /// icon. A filled rounded card with a white mark stays readable down to 16 px, where a
 /// literal page outline would turn to mush.
 pub fn file_card(p: &Painter, r: Rect, cat: crate::model::Category, dark: bool) {

@@ -87,24 +87,39 @@ function hostOf(url) {
   }
 }
 
+/** The same rule as the service worker's: an entry `example.com` covers `a.example.com`. */
+const entryCovers = (entry, host) => {
+  const e = String(entry).trim().toLowerCase().replace(/^\*\./, '');
+  return !!e && (host === e || host.endsWith(`.${e}`));
+};
+
 async function loadToggles() {
   const s = await chrome.storage.sync.get({ capture: true, skipHosts: [] });
   $('capture').checked = s.capture;
   const host = tab ? hostOf(tab.url) : '';
   $('host').textContent = host || 'this site';
-  $('siteSkip').disabled = !host;
-  $('siteSkip').checked = !!host && (s.skipHosts || []).includes(host);
+  $('siteSkip').checked = !!host && (s.skipHosts || []).some((e) => entryCovers(e, host));
+  syncSiteToggle();
 }
 
-$('capture').addEventListener('change', (e) => chrome.storage.sync.set({ capture: e.target.checked }));
+/** "Never on this site" means nothing while taking over is off. */
+function syncSiteToggle() {
+  const host = tab ? hostOf(tab.url) : '';
+  $('siteSkip').disabled = !host || !$('capture').checked;
+}
+
+$('capture').addEventListener('change', (e) => {
+  chrome.storage.sync.set({ capture: e.target.checked });
+  syncSiteToggle();
+});
 $('siteSkip').addEventListener('change', async (e) => {
   const host = tab ? hostOf(tab.url) : '';
   if (!host) return;
   const s = await chrome.storage.sync.get({ skipHosts: [] });
-  const set = new Set(s.skipHosts || []);
-  if (e.target.checked) set.add(host);
-  else set.delete(host);
-  await chrome.storage.sync.set({ skipHosts: [...set] });
+  // Unticking removes every entry that covers this site, a parent domain's included.
+  const list = (s.skipHosts || []).filter((x) => !entryCovers(x, host));
+  if (e.target.checked) list.push(host);
+  await chrome.storage.sync.set({ skipHosts: list });
   say(e.target.checked ? `Downloads from ${host} stay with the browser.` : `reIDM takes downloads from ${host} again.`);
 });
 
@@ -123,9 +138,11 @@ async function renderRecent() {
     const row = el('div', 'row');
     const meta = el('span', 'meta');
     meta.append(el('div', 'fn', c.filename || baseName(c.url)), el('div', 'sub', `${ago(c.at)} · ${c.url}`));
-    const res = c.error
-      ? el('span', 'res err', 'browser kept it')
-      : el('span', 'res ok', c.outcome === 'already_complete' ? 'already have it' : c.outcome === 'existing' ? 'resumed' : c.outcome === 'refreshed' ? 'address refreshed' : 'in reIDM');
+    const res = c.outcome === 'cancelled'
+      ? el('span', 'res', 'cancelled')
+      : c.error
+        ? el('span', 'res err', c.nothing ? 'not downloaded' : 'browser kept it')
+        : el('span', 'res ok', c.outcome === 'already_complete' ? 'already have it' : c.outcome === 'existing' ? 'resumed' : c.outcome === 'refreshed' ? 'address refreshed' : 'in reIDM');
     if (c.error) res.title = c.error;
     row.append(meta, res);
     box.appendChild(row);
@@ -147,32 +164,35 @@ function renderMedia() {
     const cb = el('input');
     cb.type = 'checkbox';
     cb.dataset.i = String(i);
-    cb.checked = i === 0;
+    // Nothing is ticked for the user unless there is only one thing, or it is the YouTube video.
+    cb.checked = media.length === 1 || !!it.ytdlp;
     const kind = (it.kind || 'media').toLowerCase();
     const meta = el('span', 'meta');
     const bits = [it.mime, humanBytes(it.size), it.formats && it.formats.length ? `${it.formats.length} qualities` : null].filter(Boolean);
     if (it.ytdlp) bits.push('best quality, through yt-dlp');
-    meta.append(el('div', 'fn', it.title || baseName(it.url)), el('div', 'sub', bits.length ? `${bits.join(' · ')} — ${it.url}` : it.url));
-    meta.lastChild.title = it.url;
+    meta.append(el('div', 'fn', it.title || baseName(it.url)), el('div', 'sub', [hostOf(it.url), ...bits].join(' · ')));
+    meta.title = it.url;
     row.append(cb, el('span', `kind ${kind}`, kind), meta);
     box.appendChild(row);
   });
 }
 
+/** The service worker does the work, so it carries on when this popup closes — which it does
+ *  as soon as the download dialog takes the focus. */
 async function queue(urls) {
-  let ok = 0;
-  const errors = [];
-  for (const url of urls) {
+  const items = urls.map((url) => {
     const video = media.find((m) => m.url === url && m.ytdlp);
-    const r = video
-      ? await ask({ type: 'download-video', page: url, title: video.title, incognito: !!(tab && tab.incognito) })
-      : await ask({ type: 'add', details: { url, filename: baseName(url) || undefined, referer: tab ? tab.url : undefined } });
-    if (r && r.ok) ok++;
-    else errors.push(`${baseName(url)}: ${(r && r.error) || 'failed'}`);
-  }
-  if (ok && !errors.length) say(`Queued ${ok} download${ok === 1 ? '' : 's'}.`, 'ok');
-  else if (ok) say(`Queued ${ok}; ${errors.length} failed — ${errors[0]}`);
-  else say(errors[0] || 'nothing was queued', 'err');
+    return video ? { url, video: true, title: video.title } : { url, filename: baseName(url) || undefined };
+  });
+  say('Handing over to reIDM…');
+  const r = await ask({ type: 'queue-media', tabId: tab ? tab.id : undefined, incognito: !!(tab && tab.incognito), items });
+  if (!r) return say('No answer from the extension.', 'err');
+  const n = r.done || 0;
+  const errors = r.errors || [];
+  if (n && !errors.length) say(`Queued ${n} download${n === 1 ? '' : 's'}.`, 'ok');
+  else if (n) say(`Queued ${n}; ${errors.length} failed — ${errors[0]}`);
+  else if (errors.length) say(errors[0], 'err');
+  else say('Nothing was queued.');
 }
 
 $('downloadSelected').addEventListener('click', () => {
@@ -217,16 +237,16 @@ const isYouTubeVideo = (u) => /^https?:\/\/(www\.|m\.|music\.)?youtube\.com\/(wa
   loadToggles();
   renderRecent();
   const up = await refreshStatus();
-  if (!up) say('reIDM is not running. Downloads stay with the browser until it is — or press Start reIDM.');
+  if (!up) say('reIDM is not running: downloads go to the browser meanwhile. Press Start reIDM to start it.');
   if (tab) {
     const r = await ask({ type: 'media-for-tab', tabId: tab.id });
-    media = ((r && r.items) || []).filter((m) => m.kind !== 'link');
+    media = ((r && r.items) || []).filter((m) => m.kind !== 'link' && m.url !== tab.url);
     // Streams first (they carry the qualities), then newest first.
     media.sort((a, b) => (b.kind === 'stream') - (a.kind === 'stream') || (b.at || 0) - (a.at || 0));
     // On a YouTube video what the page loads is the player's own traffic, not files: offer the
     // video itself instead, which reIDM fetches through yt-dlp.
     if (isYouTubeVideo(tab.url)) {
-      media = media.filter((m) => !['formats', 'mse', 'media', 'stream'].includes(m.kind));
+      media = media.filter((m) => !['media', 'stream'].includes(m.kind));
       media.unshift({ url: tab.url, kind: 'video', title: (tab.title || '').replace(/ - YouTube$/, '') || null, ytdlp: true, at: Date.now() });
     }
   }

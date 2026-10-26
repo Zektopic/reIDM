@@ -3,20 +3,23 @@
 // Runs in the *page's* JavaScript context, so it can see the requests and globals the page
 // itself uses. `chrome.webRequest` already reports every media URL, but it cannot read response
 // bodies, and the information a download manager actually needs to offer "1080p H.264" lives
-// inside those bodies. So this file does three things:
+// inside those bodies. So this file does two things:
 //
 //   * fetch(): report the request URL, and read manifest/player bodies without disturbing them.
 //   * XMLHttpRequest: report the URL, and read the body when it is a manifest.
-//   * MediaSource.addSourceBuffer: a player using MSE usually means a stream is playing.
 //
+// The service worker registers it as a `document_start` content script in the page's world, and
+// only while "Look for video and audio" is on; it then runs before any of the page's scripts.
 // It reports by postMessage to the content script, which forwards to the service worker. It
 // never blocks or modifies a request — the page must keep working exactly as before.
 //
 // Two body shapes matter for a video grabber:
 //   * YouTube's player response (`streamingData.formats` / `.adaptiveFormats`) is where the
-//     per-codec, per-resolution list comes from.  Both the `ytInitialPlayerResponse` global and
-//     `/youtubei/v1/player` carry it; SPA navigation updates the API, not the global, so both
-//     are read.
+//     per-codec, per-resolution list comes from. YouTube is a single-page app: the
+//     `ytInitialPlayerResponse` global describes the *first* video of the visit and is never
+//     updated, while `/youtubei/v1/player` describes each later one (and sometimes one it
+//     merely preloads). So every response is kept by its `videoDetails.videoId`, and only the
+//     one for the video in the address bar is ever offered.
 //   * HLS master playlists and DASH MPDs describe their variants in the body.
 
 (() => {
@@ -30,12 +33,22 @@
 
   const MEDIA = /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|flv|ts|mp3|m4a|flac|ogg|opus|wav|aac)(\?|#|$)/i;
   const MANIFEST = /\.(m3u8|mpd)(\?|#|$)/i;
-  const LIKELY_MANIFEST = /(?:^|\/)(manifest|playlist|master|index)\.(m3u8|mpd)/i;
   const YT_PLAYER = /\/youtubei\/v1\/player|\/youtubei\/v1\/get_video_info/i;
 
-  /** Manifest URL -> the variants parsed out of its body. Kept so an on-demand query can
-   *  still answer with the variants after the body itself is long gone. */
+  /** Manifest URL -> {kind, formats, at}: the variants parsed out of its body, kept so an
+   *  on-demand query can still answer after the body is gone. Bounded, and emptied when the
+   *  page moves to another address: on a single-page video site that is another video. */
   const seenManifests = new Map();
+  const MAX_MANIFESTS = 20;
+  /** YouTube video id -> its player response. */
+  const players = new Map();
+  const MAX_PLAYERS = 10;
+
+  function remember(map, key, value, max) {
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > max) map.delete(map.keys().next().value);
+  }
 
   // ── format normalisation ───────────────────────────────────────────────
 
@@ -83,7 +96,6 @@
         // A ciphered URL needs the player's signature logic, which an extension must not
         // reimplement. The picker still lists the format and says so.
         url: f.url || null,
-        ciphered: !f.url && !!(f.signatureCipher || f.cipher),
         fps: f.fps || null,
       });
     };
@@ -176,6 +188,67 @@
     return null;
   }
 
+  function noteManifestBody(url, body) {
+    const f = formatsFromBody(body, url);
+    if (!f || !f.formats.length) return;
+    remember(seenManifests, url, { kind: f.kind, formats: f.formats, at: Date.now() }, MAX_MANIFESTS);
+    REPORT([{ url, kind: 'formats', source: f.kind, formats: f.formats, title: document.title || null, page: location.href }]);
+  }
+
+  // ── YouTube ────────────────────────────────────────────────────────────
+
+  /** The id of the video in the address bar: `watch?v=`, `/shorts/`, `/live/`, `/embed/`. */
+  function currentVideoId() {
+    try {
+      const u = new URL(location.href);
+      const v = u.searchParams.get('v');
+      if (v) return v;
+      const m = /^\/(?:shorts|live|embed)\/([\w-]{6,})/.exec(u.pathname);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const isYouTubeHost = () => /(^|\.)(youtube\.com|youtube-nocookie\.com)$/i.test(location.hostname);
+  const videoIdOf = (r) => (r && r.videoDetails && r.videoDetails.videoId) || null;
+
+  function notePlayer(r) {
+    const id = videoIdOf(r);
+    if (!id || !r.streamingData) return;
+    remember(players, id, r, MAX_PLAYERS);
+    if (id === currentVideoId()) REPORT([{ url: location.href, kind: 'formats', ...youTubeAnswer(id, r) }]);
+  }
+
+  function youTubeAnswer(id, r) {
+    return {
+      source: 'youtube',
+      title: (r && r.videoDetails && r.videoDetails.title) || document.title.replace(/ - YouTube$/, '') || null,
+      formats: r ? formatsFromYouTube(r) : [],
+      page: `https://www.youtube.com/watch?v=${encodeURIComponent(id)}`,
+    };
+  }
+
+  /** The formats of the video being watched, or — when no response for it has been seen — the
+   *  page alone, for which reIDM's yt-dlp picks the best quality. Never another video's. */
+  function currentYouTube() {
+    const id = currentVideoId();
+    if (!id) return null;
+    const global = window.ytInitialPlayerResponse;
+    if (!isYouTubeHost() && !players.size && !videoIdOf(global)) return null;
+    let live = null;
+    try {
+      const p = document.getElementById('movie_player');
+      live = p && typeof p.getPlayerResponse === 'function' ? p.getPlayerResponse() : null;
+    } catch {
+      /* the player is not ready */
+    }
+    for (const r of [live, players.get(id), global]) {
+      if (videoIdOf(r) === id && r.streamingData) return youTubeAnswer(id, r);
+    }
+    return youTubeAnswer(id, null);
+  }
+
   // ── the page's own fetches ─────────────────────────────────────────────
 
   const origFetch = window.fetch;
@@ -183,39 +256,20 @@
     window.fetch = function (input, init) {
       let url = null;
       try {
-        url = typeof input === 'string' ? input : input && input.url ? input.url : String(input);
+        // A relative address is resolved as the browser will resolve it; a Request or URL
+        // object already carries an absolute one.
+        url = new URL(typeof input === 'string' ? input : input && input.url ? input.url : String(input), document.baseURI).href;
       } catch {
         /* ignore */
       }
       const p = origFetch.apply(this, arguments);
       try {
-        if (url && (MANIFEST.test(url) || LIKELY_MANIFEST.test(url))) {
+        if (url && MANIFEST.test(url)) {
           REPORT([{ url, kind: 'stream' }]);
           // Read a copy for the variant list; never disturb what the caller receives.
-          p.then((r) => {
-            r.clone().text().then((body) => {
-              const f = formatsFromBody(body, url);
-              if (f && f.formats.length) {
-                const live = f.kind === 'hls' && !/#EXT-X-ENDLIST/.test(body);
-                seenManifests.set(url, { kind: f.kind, formats: f.formats, live });
-                REPORT([{
-                  url,
-                  kind: 'formats',
-                  source: f.kind,
-                  live,
-                  formats: f.formats,
-                }]);
-              }
-            }).catch(() => {});
-          }).catch(() => {});
+          p.then((r) => r.clone().text().then((body) => noteManifestBody(url, body))).catch(() => {});
         } else if (url && YT_PLAYER.test(url)) {
-          // The player response for the video currently being watched.
-          p.then((r) => {
-            r.clone().json().then((j) => {
-              const fs = formatsFromYouTube(j);
-              if (fs.length) REPORT([{ url, kind: 'formats', source: 'youtube', formats: fs, title: ytTitle() }]);
-            }).catch(() => {});
-          }).catch(() => {});
+          p.then((r) => r.clone().json().then(notePlayer)).catch(() => {});
         } else if (url && MEDIA.test(url)) {
           REPORT([{ url, kind: 'media' }]);
         }
@@ -245,18 +299,12 @@
           try {
             const ct = this.getResponseHeader('content-type') || '';
             const isText = /mpegurl|dash\+xml|xml|json|text/i.test(ct);
-            if (MANIFEST.test(url) || LIKELY_MANIFEST.test(url) || /mpegurl|dash\+xml/i.test(ct)) {
+            const text = isText && (this.responseType === '' || this.responseType === 'text') ? this.responseText : null;
+            if (MANIFEST.test(url) || /mpegurl|dash\+xml/i.test(ct)) {
               REPORT([{ url, kind: 'stream' }]);
-              if (isText && typeof this.responseText === 'string') {
-                const f = formatsFromBody(this.responseText, url);
-                if (f && f.formats.length) {
-                  seenManifests.set(url, { kind: f.kind, formats: f.formats });
-                  REPORT([{ url, kind: 'formats', source: f.kind, formats: f.formats }]);
-                }
-              }
-            } else if (YT_PLAYER.test(url) && isText && typeof this.responseText === 'string') {
-              const fs = formatsFromYouTube(JSON.parse(this.responseText));
-              if (fs.length) REPORT([{ url, kind: 'formats', source: 'youtube', formats: fs, title: ytTitle() }]);
+              if (text) noteManifestBody(url, text);
+            } else if (YT_PLAYER.test(url) && text) {
+              notePlayer(JSON.parse(text));
             } else if (MEDIA.test(url)) {
               REPORT([{ url, kind: 'media' }]);
             }
@@ -269,61 +317,42 @@
     };
   }
 
-  // MSE in use is a strong hint that a stream is playing even when no single URL looks like one.
-  if (window.MediaSource && window.MediaSource.prototype && window.MediaSource.prototype.addSourceBuffer) {
-    const add = window.MediaSource.prototype.addSourceBuffer;
-    let told = false;
-    window.MediaSource.prototype.addSourceBuffer = function (mime) {
-      try {
-        if (!told) {
-          told = true;
-          REPORT([{ url: location.href, kind: 'mse', mime: String(mime) }]);
-        }
-      } catch {
-        /* ignore */
-      }
-      return add.apply(this, arguments);
-    };
+  // ── on-demand: the formats for whatever is playing right now ───────────
+
+  /** The first video on the page. `deep` also looks inside open shadow roots — a web-component
+   *  player keeps its <video> where document.querySelector cannot see it — but that walk reads
+   *  every element, so only the picker's on-demand query asks for it. */
+  function findVideo(deep = false) {
+    const v = document.querySelector('video');
+    if (v || !deep) return v;
+    return findVideoInShadows(document, 0);
   }
 
-  // ── on-demand: the formats for whatever is playing right now ───────────
-  //
-  // The content script asks for this when the button is clicked, rather than the hook pushing
-  // continuously. The player response can change without a network request the hook sees
-  // (SPA navigation, a different player instance), and the global is always the current one.
-
-  function ytTitle() {
-    try {
-      const d = window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.videoDetails;
-      if (d && d.title) return d.title;
-      const el = document.querySelector('h1.ytd-watch-metadata, #title h1, h1.title');
-      const t = el && el.textContent && el.textContent.trim();
-      return t || document.title.replace(/ - YouTube$/, '') || null;
-    } catch {
-      return null;
+  function findVideoInShadows(root, depth) {
+    if (depth >= 8) return null;
+    for (const el of root.querySelectorAll('*')) {
+      if (!el.shadowRoot) continue;
+      const v = el.shadowRoot.querySelector('video');
+      if (v) return v;
+      const found = findVideoInShadows(el.shadowRoot, depth + 1);
+      if (found) return found;
     }
+    return null;
   }
 
   /** Everything the picker can offer for the current page. */
-  function currentFormats() {
+  function currentFormats(deep = false) {
+    // 1. YouTube: the player response for this video holds the full per-codec list.
+    const yt = currentYouTube();
+    if (yt) return yt;
+
     const out = { source: null, title: null, formats: [], page: location.href };
 
-    // 1. YouTube: the player response holds the full per-codec list.
-    const yt = window.ytInitialPlayerResponse || window.playerResponse;
-    if (yt && yt.streamingData) {
-      const fs = formatsFromYouTube(yt);
-      if (fs.length) {
-        return { source: 'youtube', title: ytTitle(), formats: fs, page: location.href };
-      }
-    }
-
-    // 2. A manifest the page fetched earlier. Answering with only the <video> element would
-    //    silently downgrade a four-variant stream to one progressive file, and the content
-    //    script re-queries on a timer, so this list has to stay the better one.
+    // 2. The manifest the page fetched most recently. Answering with only the <video> element
+    //    would silently downgrade a four-variant stream to one progressive file.
     let best = null;
     for (const [url, m] of seenManifests) {
-      if (!m.formats.length) continue;
-      if (!best || m.formats.length > best.formats.length) best = { url, ...m };
+      if (m.formats.length && (!best || m.at >= best.at)) best = { url, ...m };
     }
     if (best) {
       out.source = best.kind;
@@ -333,10 +362,10 @@
 
     // 3. A <video> element with a plain source. Kept alongside the manifest rather than
     //    instead of it: an unlabelled progressive file is still worth offering.
-    const v = document.querySelector('video');
+    const v = findVideo(deep);
     if (v) {
       const src = v.currentSrc || v.src;
-      if (src && /^https?:/i.test(src) && !/^blob:/i.test(src)) {
+      if (src && /^https?:/i.test(src)) {
         out.source = out.source || 'video-element';
         if (!out.formats.some((f) => f.url === src)) {
           out.formats.push({ url: src, quality: v.videoHeight ? `${v.videoHeight}p` : null, kind: 'progressive' });
@@ -357,7 +386,7 @@
     if (e.source !== window || !e.data || e.data.__reidmQuery !== true) return;
     let payload;
     try {
-      payload = currentFormats();
+      payload = currentFormats(true);
     } catch (err) {
       payload = { source: null, formats: [], error: String(err && err.message) };
     }
@@ -368,7 +397,7 @@
   const announce = () => {
     try {
       const f = currentFormats();
-      if (f.formats.length) REPORT([{ url: location.href, kind: 'formats', ...f }]);
+      if (f.formats.length || f.source === 'youtube') REPORT([{ url: location.href, kind: 'formats', ...f }]);
     } catch {
       /* ignore */
     }
@@ -378,13 +407,19 @@
   } else {
     setTimeout(announce, 0);
   }
-  window.addEventListener('load', announce, { once: true });
-  // SPA navigations replace the video without a load event.
+
+  // A single-page site moves to another video without a load event. The Navigation API says
+  // when (Chrome 102+); polling the address is only the fallback.
   let lastHref = location.href;
-  setInterval(() => {
-    if (location.href !== lastHref) {
-      lastHref = location.href;
-      announce();
-    }
-  }, 2000);
+  const onNavigate = () => {
+    if (location.href === lastHref) return;
+    lastHref = location.href;
+    seenManifests.clear();
+    announce();
+  };
+  if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+    window.navigation.addEventListener('navigatesuccess', onNavigate);
+  } else {
+    setInterval(onNavigate, 2000);
+  }
 })();

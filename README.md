@@ -28,8 +28,7 @@ most day to day: **when you click a download link in your browser, reIDM downloa
 The browser shows nothing and keeps nothing, and if reIDM ever can't fetch a file, the browser
 quietly carries on as if reIDM weren't there.
 
-It is an independent project that also speaks the *IDM browser-extension protocol*, so Tonec's
-official "IDM Integration Module" extension can hand downloads to it too.
+reIDM is made by Zektopic, with its own browser extension.
 
 ## Highlights
 
@@ -41,7 +40,7 @@ official "IDM Integration Module" extension can hand downloads to it too.
 - **YouTube**: pick any quality from the list over the video and reIDM downloads it, picture and sound joined into one file. It uses [yt-dlp](https://github.com/yt-dlp/yt-dlp), which it fetches and keeps up to date by itself.
 - **YouTube playlists**: every video listed with the resolutions and codecs it comes in; choose per video or for all.
 - **Torrents**: magnet links and `.torrent` files, from the browser or the window; pick the files, and seed until a share ratio.
-- IDM's **Download file info** dialog before each download: name, folder, size; Start, Later or Cancel.
+- The **Download file info** dialog before each download: name, folder, size; Start, Later or Cancel.
 
 **Download engine**
 - Up to 32 connections per download with **dynamic segmentation**: a connection that finishes early takes over half of the slowest one's remaining part.
@@ -50,8 +49,8 @@ official "IDM Integration Module" extension can hand downloads to it too.
 - Files sorted into **category folders** (Video, Compressed, Programs…), with unfinished downloads kept in a temporary folder until complete.
 - **Refresh an expired link** and carry on where it stopped — by pasting the new address, or by clicking the link in the browser again.
 
-**Everything else IDM users expect**
-- *Download Later*, batch downloads from `*` patterns (`img001.jpg` … `img250.jpg`), site grabber, IDM `.ef2` import and export, "Download complete" window, keyboard shortcuts, dark theme.
+**Everything else a download manager should have**
+- *Download Later*, batch downloads from `*` patterns (`img001.jpg` … `img250.jpg`), site grabber, "Download complete" window, keyboard shortcuts, dark theme.
 - A command line and a local JSON API for scripting; a web view for headless machines.
 - No telemetry, no accounts, no ads. It checks GitHub for a new release once at start-up and tells you; it never downloads or installs anything by itself.
 
@@ -69,12 +68,14 @@ Download the latest release for your system from the [Releases page](https://git
 | **Windows** 10/11 (x64) | `reIDM-setup-<version>.exe` | Per-user install, no admin rights. Starts with Windows. |
 | **macOS** 11+ (Intel and Apple silicon) | `reIDM-<version>-universal.dmg` | Open it and drag reIDM onto Applications. |
 | **Debian / Ubuntu** (x64) | `reidm_<version>-1_amd64.deb` | `sudo apt install ./reidm_*.deb` |
-| Any | `reidm-extension-<version>.zip` | The browser extension on its own. |
+| Any | `reidm-extension-<version>.zip` | The browser extension on its own (Chromium). |
+| Any | `reidm-extension-firefox-<extension version>.zip` | The same extension for Firefox 128 and later. |
 
 Then connect your browser once — it takes a minute:
 
 1. Open reIDM and choose **Help › Browser integration**. It shows a folder.
 2. In Chrome, Edge, Brave, Vivaldi or Opera, open the extensions page (`chrome://extensions`, `edge://extensions`, …), turn on **Developer mode**, choose **Load unpacked**, and pick that folder.
+3. In Firefox 128 or later, open `about:debugging#/runtime/this-firefox`, choose **Load Temporary Add-on**, and pick `manifest.json` from the Firefox zip (or sign it for a permanent install; see the guide).
 
 That's it: the status bar now says *Browser: Chrome 1xx*, and downloads you start in the browser go to reIDM.
 The full walkthrough, including every browser and what to do when something doesn't connect, is in
@@ -109,7 +110,6 @@ reidm get https://example.com/file.zip -c 16           # one-off download, no se
 | [Architecture](docs/ARCHITECTURE.md) | How the engine, service, window and extension fit together, and the security model |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | When a download or the browser connection doesn't behave |
 | [Building](docs/BUILDING.md) | Building from source, running the test suites, packaging |
-| [IDM extension](docs/EXTENSION.md) · [Protocol](docs/PROTOCOL.md) · [Reverse engineering](docs/REVERSE_ENGINEERING.md) | Using Tonec's official extension with reIDM, and how that was worked out |
 
 ## Building from source
 
@@ -126,13 +126,12 @@ See [docs/BUILDING.md](docs/BUILDING.md) for the real-browser test suite and the
 
 reIDM is young and moving quickly; see the [changelog](CHANGELOG.md). Things it does not do (yet), stated plainly:
 
-- The browser extension runs in **Chromium-based browsers**. Firefox is not supported by it (Firefox users can use Tonec's extension, see [docs/EXTENSION.md](docs/EXTENSION.md)).
+- The browser extension runs in **Chromium-based browsers** and in **Firefox 128 and later** (from extension 1.8; Firefox cannot hold a download before it starts, so a very small one may finish in the browser first). Firefox also needs the add-on signed for a permanent install, or Developer Edition/Nightly; see [docs/BROWSER_INTEGRATION.md](docs/BROWSER_INTEGRATION.md).
 - Video streams on sites other than YouTube are found and listed, but reIDM does not merge their HLS/DASH segments into one file. DRM-protected media cannot be downloaded by any tool.
 - No FTP, no HTTP authentication prompts.
-- The extension isn't on the Chrome Web Store yet, hence *Load unpacked*.
+- The extension isn't on the Chrome Web Store or addons.mozilla.org yet, hence *Load unpacked* or a temporary Firefox add-on.
 
 ## Legal
 
-reIDM is not affiliated with, endorsed by, or derived from the source code of Tonec Inc.; "Internet Download Manager" and
-"IDM" are their trademarks. `decomp/` holds decompiler output kept as interoperability reference — read [NOTICE.md](NOTICE.md).
-Use reIDM only for content you are entitled to download. Licensed under the [MIT license](LICENSE).
+reIDM is made by Zektopic. Use it only for content you are entitled to download. Licensed under
+the [MIT license](LICENSE); [NOTICE.md](NOTICE.md) says who made it.

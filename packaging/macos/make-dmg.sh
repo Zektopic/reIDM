@@ -16,6 +16,9 @@
 # symptom is a bare "Killed: 9" with no dialog on Apple silicon.
 set -euo pipefail
 VER=$1; REIDM=$2; HOST=$3; GUI=$4; OUT=$5
+# Info.plist's version fields are dotted integers (a release candidate's "-rc" is not one);
+# the file name keeps the full version, and About shows the binary's own version string.
+SHORT=${VER%%-*}
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 SIGN_ID="${MACOS_SIGN_IDENTITY:--}"
@@ -76,8 +79,8 @@ cat > "$APP/Contents/Info.plist" <<EOP
   <key>CFBundleName</key><string>reIDM</string>
   <key>CFBundleDisplayName</key><string>reIDM</string>
   <key>CFBundleIdentifier</key><string>com.zektopic.reidm</string>
-  <key>CFBundleVersion</key><string>$VER</string>
-  <key>CFBundleShortVersionString</key><string>$VER</string>
+  <key>CFBundleVersion</key><string>$SHORT</string>
+  <key>CFBundleShortVersionString</key><string>$SHORT</string>
   <key>CFBundleExecutable</key><string>reidm-gui</string>
   <key>CFBundleIconFile</key><string>reIDM.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>

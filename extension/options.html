@@ -33,12 +33,13 @@
   #status.ok { color: var(--ok); } #status.err { color: var(--err); }
   code { background: rgba(128,128,128,.16); padding:1px 5px; border-radius:4px; font-size:12px; }
   .save { position: sticky; bottom: 0; background: var(--bg); padding: 12px 0; }
+  details > summary { cursor: pointer; color: var(--mut); font-size: 13px; margin: 4px 0 12px; }
 </style>
 </head>
 <body>
 <main>
   <h1><img src="icons/48.png" alt="">reIDM Integration</h1>
-  <div class="sub">Lets the reIDM download manager take over the browser's downloads. Independent of Tonec's IDM extension.</div>
+  <div class="sub">Lets the reIDM download manager take over the browser's downloads.</div>
 
   <section>
     <h2>Taking over downloads</h2>
@@ -51,7 +52,45 @@
           cannot, so nothing is ever lost.</div>
       </div>
     </div>
-    <div class="indent">
+    <div class="check">
+      <input type="checkbox" id="askBeforeDownload">
+      <div>
+        <div class="t">Ask before each download</div>
+        <div class="d">Shows the <i>Download file info</i> dialog — the file's name, folder and size — with Start download,
+          Download later and Cancel. Off: downloads start at once, except programs a page starts by itself, which
+          always ask.</div>
+      </div>
+    </div>
+    <label class="field">
+      <span>Never take downloads from these sites (one per line; subdomains included)</span>
+      <textarea id="skipHosts" spellcheck="false" placeholder="example.com"></textarea>
+    </label>
+    <div class="check">
+      <input type="checkbox" id="notifications">
+      <div>
+        <div class="t">Show a notification when reIDM takes a download</div>
+        <div class="d">The browser's own download bubble doesn't appear for what reIDM takes; this says it started (or why
+          reIDM couldn't take it).</div>
+      </div>
+    </div>
+    <div class="check">
+      <input type="checkbox" id="captureIncognito">
+      <div>
+        <div class="t">Also in incognito windows</div>
+        <div class="d">Needs "Allow in incognito" on the extension's details page as well. Off by default: reIDM keeps
+          a history of what it downloaded. While off, reIDM does nothing in incognito windows — the menus, the popup
+          and the grabber included.</div>
+      </div>
+    </div>
+    <div class="d" style="color:var(--mut);font-size:12.5px">Always left to the browser: form submissions (POST),
+      files a page builds itself (<code>blob:</code>, <code>data:</code>), downloads the browser flags as dangerous, and
+      downloads started by other extensions.</div>
+  </section>
+
+  <details>
+    <summary>Advanced</summary>
+    <section>
+      <h2>Which downloads</h2>
       <div class="check">
         <input type="checkbox" id="interceptClicks">
         <div>
@@ -68,81 +107,52 @@
         </div>
       </div>
       <label class="field">
-        <span>File types (IDM's list; <code>R0*</code> style wildcards allowed)</span>
+        <span>File types (the built-in list; <code>R0*</code> style wildcards allowed)</span>
         <textarea id="fileTypes" spellcheck="false"></textarea>
       </label>
       <label class="field">
         <span>Leave downloads smaller than this to the browser (KB, 0 = none)</span>
         <input type="number" id="minSizeKB" min="0" step="1">
       </label>
-      <label class="field">
-        <span>Never take downloads from these sites (one per line; subdomains included)</span>
-        <textarea id="skipHosts" spellcheck="false" placeholder="example.com"></textarea>
-      </label>
+    </section>
+
+    <section>
+      <h2>reIDM</h2>
       <div class="check">
-        <input type="checkbox" id="captureIncognito">
+        <input type="checkbox" id="launchReidm">
         <div>
-          <div class="t">Also in incognito windows</div>
-          <div class="d">Needs "Allow in incognito" on the extension's details page as well. Off by default: reIDM keeps
-            a history of what it downloaded.</div>
+          <div class="t">Start reIDM when it is not running</div>
+          <div class="d">Uses the <code>com.zektopic.reidm</code> helper that reIDM registers with your browsers. Without it,
+            downloads stay with the browser until reIDM is started.</div>
         </div>
       </div>
-    </div>
-    <div class="d" style="color:var(--mut);font-size:12.5px">Always left to the browser: form submissions (POST),
-      files a page builds itself (<code>blob:</code>, <code>data:</code>), and downloads started by other extensions.</div>
-  </section>
+      <label class="field">
+        <span>reIDM port (its local API)</span>
+        <input type="number" id="port" min="1" max="65535" step="1">
+      </label>
+      <div class="row">
+        <button id="test">Test connection</button>
+        <span id="status"></span>
+      </div>
+    </section>
 
-  <section>
-    <h2>reIDM</h2>
-    <div class="check">
-      <input type="checkbox" id="askBeforeDownload">
-      <div>
-        <div class="t">Ask before each download</div>
-        <div class="d">Shows IDM's <i>Download file info</i> dialog — the file's name, folder and size — with Start download,
-          Download later and Cancel. Off: downloads start at once.</div>
+    <section>
+      <h2>Finding media</h2>
+      <div class="check">
+        <input type="checkbox" id="sniffMedia">
+        <div>
+          <div class="t">Look for video and audio</div>
+          <div class="d">Watches the page's network requests for streams and media files (HLS/DASH manifests, mp4, webm,
+            audio), by address and by the type the server reports, and lists them in the popup and the quality picker.
+            Off: no page is watched, and the video button does not appear.</div>
+        </div>
       </div>
-    </div>
-    <div class="check">
-      <input type="checkbox" id="notifications">
-      <div>
-        <div class="t">Show a notification when reIDM takes a download</div>
-        <div class="d">The browser's own download bubble doesn't appear for what reIDM takes; this says it started (or why
-          reIDM couldn't take it).</div>
-      </div>
-    </div>
-    <div class="check">
-      <input type="checkbox" id="launchReidm">
-      <div>
-        <div class="t">Start reIDM when it is not running</div>
-        <div class="d">Uses the <code>com.zektopic.reidm</code> helper that reIDM registers with your browsers. Without it,
-          downloads stay with the browser until reIDM is started.</div>
-      </div>
-    </div>
-    <label class="field">
-      <span>reIDM port (its local API)</span>
-      <input type="number" id="port" min="1" max="65535" step="1">
-    </label>
-    <div class="row">
-      <button id="test">Test connection</button>
-      <span id="status"></span>
-    </div>
-  </section>
-
-  <section>
-    <h2>Finding media</h2>
-    <div class="check">
-      <input type="checkbox" id="sniffMedia">
-      <div>
-        <div class="t">Look for video and audio</div>
-        <div class="d">Watches the page's network requests for streams and media files (HLS/DASH manifests, mp4, webm,
-          audio), by address and by the type the server reports, and lists them in the popup and the quality picker.</div>
-      </div>
-    </div>
-    <label class="field">
-      <span>Never capture or list addresses starting with (one per line)</span>
-      <textarea id="ignore" spellcheck="false"></textarea>
-    </label>
-  </section>
+      <label class="field">
+        <span>Never capture or list addresses starting with (one per line)</span>
+        <textarea id="ignore" spellcheck="false"></textarea>
+      </label>
+    </section>
+  </details>
 
   <div class="save row">
     <button class="primary" id="save">Save</button>
@@ -154,9 +164,11 @@
     Requests to reIDM are made from the extension's service worker, so they carry a
     <code>chrome-extension://</code> origin. reIDM accepts only extension origins and local
     processes on that endpoint, which is what keeps ordinary web pages out. Cookies are read only
-    for the address being handed over, at the moment it is handed over.
+    for the address being handed over, at the moment it is handed over, and reIDM receives their values
+    (HttpOnly ones included) so it can download what you can.
   </p>
 </main>
+<script src="defaults.js"></script>
 <script src="options.js"></script>
 </body>
 </html>

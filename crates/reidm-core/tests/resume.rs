@@ -7,8 +7,62 @@
 use reidm_core::{Manager, Request, Status};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[allow(dead_code)]
+struct AutoCleanDir {
+    path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl AutoCleanDir {
+    fn create(path: PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn new(path: PathBuf) -> Self {
+        Self::create(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Deref for AutoCleanDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for AutoCleanDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AutoCleanDir {
+    fn drop(&mut self) {
+        if matches!(std::env::var("REIDM_KEEP_TEST_DIR").as_deref(), Ok("1" | "true")) {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+        if self.path.exists() {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = std::fs::remove_dir_all(&self.path);
+                if !self.path.exists() {
+                    break;
+                }
+            }
+        }
+    }
+}
 
 /// Deterministic body so a corrupted result is obvious.
 fn body(len: usize) -> Vec<u8> {
@@ -132,11 +186,9 @@ fn part_file(m: &Manager, id: u64) -> PathBuf {
     m.temp_dir().join(format!("{id}-{name}.reidm"))
 }
 
-fn tmp(tag: &str) -> PathBuf {
+fn tmp(tag: &str) -> AutoCleanDir {
     let p = std::env::temp_dir().join(format!("reidm-it-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    AutoCleanDir::create(p)
 }
 
 /// Wait until `f` holds; panics with `what` if it never does.

@@ -42,7 +42,7 @@ CI runs both on Linux, Windows and macOS for every push and pull request.
 
 | Suite | Where | What |
 |---|---|---|
-| unit tests | `src/` of each crate | the IDM wire format, segment claiming and splitting, the limiter, schedules, `.ef2`, batch patterns, URL keys, file names, host manifests, rate parsing |
+| unit tests | `src/` of each crate | segment claiming and splitting, the limiter, schedules, batch patterns, URL keys, file names, host manifests, rate parsing |
 | `resume` | `crates/reidm-core/tests/resume.rs` | against a local HTTP server: resuming with and without range support, after the part file is lost, zero-byte files, duplicate names and addresses, removal and purge, the concurrency limit, batch adds, the site grabber |
 | `engine` | `crates/reidm-core/tests/engine.rs` | a slow connection's range taken over, servers that refuse extra connections, the global and per-download limits, a file that changes on the server (with and without an `ETag`), refreshing an address, the scheduled queue, checked adds and web pages posing as files |
 
@@ -91,9 +91,7 @@ whose path is stable. It checks, among other things, that:
 It exits non-zero if any check fails. The service it starts uses the usual ports, so stop any
 running reIDM first.
 
-Two older scripts remain for the IDM-extension path: `tools/extension-flow-test.py` speaks the
-IDM WebSocket protocol exactly as Tonec's extension does, and `tools/browser-extension-test.py`
-is an earlier Playwright smoke test of reIDM's extension.
+`tools/browser-extension-test.py` is an earlier Playwright smoke test of reIDM's extension.
 
 ## Cross-compiling for Windows from Linux
 
@@ -139,9 +137,3 @@ tagging:
 2. bump `version` in `extension/manifest.json` if the extension changed;
 3. add the release to `CHANGELOG.md`.
 
-## The decompiled reference
-
-`decomp/` holds Ghidra output for IDM's binaries, used to match its protocol and formats
-([REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md), [NOTICE.md](../NOTICE.md)). Nothing in it is
-built or linked. `tools/decomp.sh` regenerates a file from a binary with headless Ghidra;
-`tools/unpack_idm.py` and `tools/make_manifest.py` take an installer apart for analysis.

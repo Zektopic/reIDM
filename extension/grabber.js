@@ -12,6 +12,13 @@
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const TAB_ID = Number(params.get('tab'));
+/** `select=files`: opened as "Download all links on this page" — the links to files come
+ *  ticked, so the user confirms one list instead of reIDM queueing every page link blind. */
+const PRESELECT_FILES = params.get('select') === 'files';
+/** The source tab's window was incognito. Kept in the URL because that tab may be closed by
+ *  the time the selection is handed over, and the cookies must still come from its store. */
+const INCOGNITO = params.get('inc') === '1';
+const FILE_CATS = new Set(['video', 'audio', 'document', 'archive', 'program']);
 
 const CATEGORIES = [
   ['all', 'All'],
@@ -46,6 +53,7 @@ let filterCat = 'all';
 let sortKey = 'type';
 let sortAsc = true;
 let pageInfo = { url: '', title: '' };
+let collected = false;
 
 // ── collecting ───────────────────────────────────────────────────────────
 
@@ -216,6 +224,10 @@ async function collect() {
   items = [...byUrl.values()].map((it) => ({ ...it, name: nameOf(it.url, it.download), cat: categorise(it) }));
   for (const it of items) if (it.download) it.name = it.download;
   selected = new Set([...selected].filter((u) => byUrl.has(u)));
+  if (PRESELECT_FILES && !collected) {
+    for (const it of items) if (it.kinds.has('link') && FILE_CATS.has(it.cat)) selected.add(it.url);
+  }
+  collected = true;
   $('page').textContent = pageInfo.title ? `${pageInfo.title} — ${pageInfo.url}` : pageInfo.url || '';
   document.title = `reIDM — ${pageInfo.title || 'Resource grabber'}`;
   render();
@@ -251,9 +263,14 @@ function filterFn() {
     test = (it) => it.url.toLowerCase().includes(q) || it.name.toLowerCase().includes(q) || (it.text || '').toLowerCase().includes(q);
   }
   const sameSite = $('sameSite').checked;
+  // "Same site" by registrable domain, approximated without a public-suffix list: the last
+  // two labels, or three under a two-letter country code with a short second level
+  // (`example.co.uk`), so that `co.uk` doesn't count as one site.
   const host = (() => {
     try {
-      return new URL(pageInfo.url).hostname.split('.').slice(-2).join('.');
+      const labels = new URL(pageInfo.url).hostname.split('.');
+      const cc = labels.length > 2 && labels[labels.length - 1].length === 2 && labels[labels.length - 2].length <= 3;
+      return labels.slice(cc ? -3 : -2).join('.');
     } catch {
       return '';
     }
@@ -266,7 +283,8 @@ function filterFn() {
     if (it.cat === 'image' && minPx && it.width && it.height && Math.max(it.width, it.height) < minPx) return false;
     if (sameSite && host) {
       try {
-        if (!new URL(it.url).hostname.endsWith(host)) return false;
+        const h = new URL(it.url).hostname;
+        if (h !== host && !h.endsWith(`.${host}`)) return false;
       } catch {
         return false;
       }
@@ -310,7 +328,11 @@ function renderChips() {
     const b = document.createElement('button');
     b.className = `chip${filterCat === c ? ' on' : ''}`;
     b.disabled = !counts[c] && c !== 'all';
-    b.innerHTML = `${label} <span class="n">${counts[c] || 0}</span>`;
+    b.textContent = `${label} `;
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = String(counts[c] || 0);
+    b.appendChild(n);
     b.addEventListener('click', () => {
       filterCat = c;
       render();
@@ -431,6 +453,8 @@ async function queue(later) {
   setMsg(`Handing ${list.length} to reIDM…`);
   const r = await chrome.runtime.sendMessage({
     type: 'add-batch',
+    tabId: TAB_ID,
+    incognito: INCOGNITO,
     referer: pageInfo.url,
     later,
     items: list.map((it) => ({ url: it.url, filename: it.download || undefined })),
@@ -475,7 +499,9 @@ async function sizeOf(url) {
 }
 
 async function getSizes() {
-  const want = visible().filter((it) => !it.size && it.cat !== 'page');
+  // Only addresses that name a file: asking a server about a plain page link is a request to
+  // that page, with the user's cookies, and some such links do things (log out, unsubscribe).
+  const want = visible().filter((it) => !it.size && it.cat !== 'page' && it.ext);
   if (!want.length) return setMsg('Every listed file already has a size.');
   $('sizes').disabled = true;
   let done = 0;
@@ -517,12 +543,10 @@ $('copy').addEventListener('click', async () => {
   setMsg(`Copied ${chosen().length} address(es)`, 'ok');
 });
 $('export').addEventListener('click', () => {
-  // IDM's .ef2, which IDM and reIDM both import; the page goes along as the referer.
-  const ef2 = chosen()
-    .map((it) => `<\r\n${it.url}\r\n${pageInfo.url ? `referer: ${pageInfo.url}\r\n` : ''}>\r\n`)
-    .join('');
-  download('reidm-grabbed.ef2', ef2);
-  setMsg(`Exported ${chosen().length} address(es) as an IDM/reIDM .ef2 list`, 'ok');
+  // A plain list of addresses, one per line, which reIDM and its import both understand.
+  const list = chosen().map((it) => it.url).join('\n') + '\n';
+  download('reidm-grabbed.txt', list);
+  setMsg(`Exported ${chosen().length} address(es) as a URL list`, 'ok');
 });
 $('all').addEventListener('change', (e) => {
   for (const it of visible()) {
@@ -550,4 +574,5 @@ for (const th of document.querySelectorAll('thead th[data-sort]')) {
   });
   if (!Number.isInteger(TAB_ID)) return setMsg('Open this from the reIDM popup or the page’s right-click menu.', 'err');
   await collect();
+  if (PRESELECT_FILES) setMsg(selected.size ? `${selected.size} links to files are ticked. Check them, then press Download.` : 'No links to files on this page.');
 })();

@@ -3,7 +3,7 @@ name = "reidm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "reIDM: cross-platform download manager compatible with the IDM browser extension"
+description = "reIDM: cross-platform download manager with a browser extension of its own"
 
 [[bin]]
 name = "reidm"
@@ -11,13 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 reidm-core = { path = "../reidm-core" }
-reidm-proto = { path = "../reidm-proto" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
-futures-util.workspace = true
 clap.workspace = true
 directories.workspace = true
 tracing.workspace = true
@@ -32,7 +29,7 @@ name = "reidm"
 maintainer = "Zektopic <opensource@zektopic.invalid>"
 copyright = "reIDM contributors"
 license-file = ["../../LICENSE", "0"]
-extended-description = "Cross-platform download manager (segmented, resumable) that speaks the IDM browser-extension protocol. Not affiliated with Tonec."
+extended-description = "Cross-platform download manager (segmented, resumable) with a browser extension of its own."
 section = "net"
 priority = "optional"
 # `$auto` picks up the shared libraries the binaries link against; these are the GUI's, which are
@@ -48,10 +45,6 @@ assets = [
   ["../../packaging/icon/reidm-256.png", "usr/share/icons/hicolor/256x256/apps/reidm.png", "644"],
   ["../../packaging/icon/reidm-512.png", "usr/share/icons/hicolor/512x512/apps/reidm.png", "644"],
   ["../../packaging/linux/reidm.service", "usr/lib/systemd/user/reidm.service", "644"],
-  ["../../packaging/linux/com.tonec.idm.chromium.json", "etc/opt/chrome/native-messaging-hosts/com.tonec.idm.json", "644"],
-  ["../../packaging/linux/com.tonec.idm.chromium.json", "etc/chromium/native-messaging-hosts/com.tonec.idm.json", "644"],
-  ["../../packaging/linux/com.tonec.idm.chromium.json", "etc/opt/edge/native-messaging-hosts/com.tonec.idm.json", "644"],
-  ["../../packaging/linux/com.tonec.idm.firefox.json", "usr/lib/mozilla/native-messaging-hosts/com.tonec.idm.json", "644"],
   # reIDM's own extension, and the host it uses to start reIDM on demand.
   ["../../extension/*.js", "usr/share/reidm/extension/", "644"],
   ["../../extension/*.html", "usr/share/reidm/extension/", "644"],

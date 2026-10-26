@@ -1,9 +1,0 @@
-[package]
-name = "reidm-proto"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Codec for the IDM browser-integration wire format (MSG#id#type#flags#j:args,key=value;)"
-
-[dependencies]
-serde_json.workspace = true

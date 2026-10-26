@@ -1,4 +1,4 @@
-//! IDM's categories: each download is filed by its type into a folder of its own — Compressed,
+//! Categories: each download is filed by its type into a folder of its own — Compressed,
 //! Documents, Images, Music, Programs, Video — under the download folder unless the user moved
 //! one. Anything else is *General* and goes to the download folder itself.
 

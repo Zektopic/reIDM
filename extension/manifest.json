@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "reIDM Integration",
-  "version": "1.5.0",
+  "version": "1.9.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1g8TrYakz9gLb2tMgOTBI+96F0+Mp5eZgmWRPSoCciIN91AtMZ9k7DRux3GCKzvZlafQM7PTUOotfnGBJvPFt8dNLi/ogZCyswpt3m+yoVrqg/QrM4GYz6mG1tR8sTVFxv9hH3t0IyZbah+g7Wgy2zjVun76yn5R2X/4l1U6u4v8nKCxUTrMY6iuC1GrXU2PYyrCI2VkYY8gPUa7aUCmJKHam8BJp/HrCjiz2/qD9KXaM/7HPKFlputZB/KIrnJydtVrTR3iKDJavtH8ESDoJXa7bntzS0dXaBOjqxRaoGe/LQBDSnb1PBtneUFJdOuo4ElDVKI/4/dQrodcr8ZHSwIDAQAB",
-  "description": "Lets the reIDM download manager take over the browser's downloads, and finds video, audio and every resource on a page. Independent of the IDM extension.",
+  "description": "Lets the reIDM download manager take over the browser's downloads, and finds video, audio and every resource on a page.",
   "minimum_chrome_version": "120",
   "icons": {
     "16": "icons/16.png",
@@ -47,20 +47,11 @@
         "<all_urls>"
       ],
       "js": [
+        "defaults.js",
         "content.js"
       ],
       "all_frames": true,
       "run_at": "document_start"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "inject.js"
-      ],
-      "matches": [
-        "<all_urls>"
-      ]
     }
   ]
 }

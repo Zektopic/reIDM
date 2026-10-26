@@ -3,8 +3,11 @@
 //! changed on its own; what each video really offers is looked up in the background and shown
 //! beside it, a few videos at a time.
 
-use crate::api::Api;
+use crate::api::Client;
 use crate::model::size_human;
+
+/// Height of one video row, for laying out only those in view.
+const ROW_HEIGHT: f32 = 30.0;
 use crate::theme::Palette;
 use egui::{RichText, Vec2};
 use reidm_core::media::{audio_selector, selector, Playlist, PlaylistEntry, VideoCodec, VideoInfo};
@@ -140,7 +143,7 @@ impl Row {
         s
     }
 
-    /// The file's name, after the video as IDM names it; yt-dlp sets the real extension.
+    /// The file's name, after the video; yt-dlp sets the real extension.
     fn file_name(&self) -> String {
         let ext = if self.choice.res == Res::Audio { self.choice.audio.code() } else { "mp4" };
         format!("{}.{ext}", reidm_core::sanitize_filename(&self.entry.title))
@@ -185,6 +188,13 @@ pub struct PlaylistWindow {
 }
 
 impl PlaylistWindow {
+    /// Waiting on the service, so the window must keep drawing to notice the answer.
+    pub fn busy(&self) -> bool {
+        self.loading.is_some() || self.sending.is_some() || self.rows.iter().any(|r| r.lookup.is_some())
+    }
+}
+
+impl PlaylistWindow {
     pub fn open_with(&mut self, url: Option<String>, video_dir: String, music_dir: String) {
         self.open = true;
         self.own_folder = true;
@@ -196,7 +206,7 @@ impl PlaylistWindow {
     }
 
     /// Draw the window. Returns a message for the status bar when something was queued.
-    pub fn show(&mut self, ctx: &egui::Context, api: &Api, p: &Palette) -> Option<String> {
+    pub fn show(&mut self, ctx: &egui::Context, api: &Client, p: &Palette) -> Option<String> {
         if !self.open {
             return None;
         }
@@ -267,13 +277,19 @@ impl PlaylistWindow {
                 ui.separator();
 
                 let footer = 74.0;
-                egui::ScrollArea::vertical().max_height((ui.available_height() - footer).max(160.0)).auto_shrink([false, false]).show(ui, |ui| {
-                    egui::Grid::new("playlist").num_columns(7).striped(true).spacing(Vec2::new(10.0, 6.0)).show(ui, |ui| {
-                        for h in ["", "#", "Title", "Length", "Available", "Download as", "You get"] {
-                            ui.label(RichText::new(h).color(p.text_dim).size(12.0));
+                // Only the rows in view are laid out: a channel can list thousands of videos,
+                // each with two drop-downs.
+                let n = self.rows.len();
+                egui::ScrollArea::vertical().max_height((ui.available_height() - footer).max(160.0)).auto_shrink([false, false]).show_rows(ui, ROW_HEIGHT, n, |ui, range| {
+                    egui::Grid::new("playlist").num_columns(7).striped(true).spacing(Vec2::new(10.0, 6.0)).min_row_height(ROW_HEIGHT - 6.0).show(ui, |ui| {
+                        if range.start == 0 {
+                            for h in ["", "#", "Title", "Length", "Available", "Download as", "You get"] {
+                                ui.label(RichText::new(h).color(p.text_dim).size(12.0));
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
-                        for (i, r) in self.rows.iter_mut().enumerate() {
+                        let start = range.start;
+                        for (i, r) in self.rows[range].iter_mut().enumerate().map(|(k, r)| (k + start, r)) {
                             ui.checkbox(&mut r.on, "");
                             ui.label(RichText::new(format!("{}", i + 1)).color(p.text_dim));
                             ui.horizontal(|ui| {
@@ -354,7 +370,7 @@ impl PlaylistWindow {
     }
 
     /// The listing, and each video's lookup, as they come in; and start the next lookups.
-    fn poll(&mut self, api: &Api) {
+    fn poll(&mut self, api: &Client) {
         if let Some(rx) = &self.loading {
             if let Ok(r) = rx.try_recv() {
                 self.loading = None;
@@ -382,7 +398,7 @@ impl PlaylistWindow {
         }
     }
 
-    fn send(&mut self, api: &Api, later: bool) {
+    fn send(&mut self, api: &Client, later: bool) {
         let folder = self.own_folder.then(|| self.folder_preview()).flatten();
         let items: Vec<(String, serde_json::Value, String)> = self.rows.iter().filter(|r| r.on).map(|r| (r.entry.url.clone(), r.choice.media(), r.file_name())).collect();
         self.sending = Some(api.add_videos_async(items, folder, later));

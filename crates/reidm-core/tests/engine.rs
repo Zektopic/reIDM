@@ -1,15 +1,69 @@
-//! The engine features IDM users expect, checked end to end against an in-process server:
+//! The engine features users expect, checked end to end against an in-process server:
 //! dynamic segmentation, servers that cap connections, the speed limiter, noticing a file that
 //! changed on the server, refreshing an expired address, and *Download Later*.
 
-use reidm_core::{AddOptions, Manager, Request, SettingsPatch, Status};
+use reidm_core::{AddOptions, Checksum, Manager, Move, Proxy, ProxyMode, Request, SettingsPatch, Status};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[allow(dead_code)]
+struct AutoCleanDir {
+    path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl AutoCleanDir {
+    fn create(path: PathBuf) -> Self {
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+
+    fn new(path: PathBuf) -> Self {
+        Self::create(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Deref for AutoCleanDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for AutoCleanDir {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for AutoCleanDir {
+    fn drop(&mut self) {
+        if matches!(std::env::var("REIDM_KEEP_TEST_DIR").as_deref(), Ok("1" | "true")) {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+        if self.path.exists() {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = std::fs::remove_dir_all(&self.path);
+                if !self.path.exists() {
+                    break;
+                }
+            }
+        }
+    }
+}
 
 fn body(len: usize, seed: u8) -> Vec<u8> {
     (0..len).map(|i| ((i % 251) as u8).wrapping_add(seed)).collect()
@@ -36,6 +90,21 @@ struct Cfg {
     need_cookie: Option<String>,
     /// `Content-Type` to send per path.
     types: Mutex<HashMap<String, String>>,
+    /// `Content-Disposition` to send per path.
+    disposition: Mutex<HashMap<String, String>>,
+    /// Sent as `Last-Modified`.
+    last_modified: Mutex<Option<String>>,
+    /// Answer the 1-byte probe, then accept every other request and never answer it: a
+    /// connection that died somewhere between here and the server.
+    hang: bool,
+    /// Close the connection after this many bytes of each body, short of its `Content-Length`:
+    /// a flaky line, or a server that caps responses.
+    cut_after: Option<usize>,
+    /// Send `206` without `Content-Range` (except to the probe), and the bytes from the start of
+    /// the file whatever was asked: a broken server.
+    no_content_range: bool,
+    /// Ignore `Range` entirely.
+    no_ranges: bool,
 }
 
 struct Server {
@@ -118,6 +187,14 @@ fn handle(mut s: TcpStream, cfg: &Cfg) {
         if let Some(r) = &range {
             cfg.ranges.lock().unwrap().push(r.clone());
         }
+        let probe = range.as_deref() == Some("bytes=0-0");
+        if cfg.hang && !probe {
+            // Hold the connection open, silent, until the client gives up on it.
+            let mut sink = [0u8; 64];
+            while std::io::Read::read(&mut s, &mut sink).is_ok_and(|n| n > 0) {}
+            return;
+        }
+        let range = range.filter(|_| !cfg.no_ranges);
         if let Some(max) = cfg.max_conns {
             if cfg.active.load(Ordering::SeqCst) >= max {
                 reply(&mut s, "503 Service Unavailable");
@@ -146,8 +223,15 @@ fn handle(mut s: TcpStream, cfg: &Cfg) {
             }
             _ => false,
         };
+        if partial && start >= data.len() {
+            let _ = s.write_all(format!("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\n\r\n", data.len()).as_bytes());
+            continue;
+        }
+        let (start, end) = if partial && cfg.no_content_range && !probe { (0, end - start) } else { (start, end) };
         let slice = if start <= end && start < data.len() { &data[start..=end] } else { &data[0..0] };
-        let mut head = if partial {
+        let mut head = if partial && cfg.no_content_range && !probe {
+            format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n", slice.len())
+        } else if partial {
             format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\nContent-Length: {}\r\n", data.len(), slice.len())
         } else {
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n", slice.len())
@@ -159,8 +243,19 @@ fn handle(mut s: TcpStream, cfg: &Cfg) {
         if let Some(e) = &etag {
             head.push_str(&format!("ETag: {e}\r\n"));
         }
+        if let Some(d) = cfg.disposition.lock().unwrap().get(&path) {
+            head.push_str(&format!("Content-Disposition: {d}\r\n"));
+        }
+        if let Some(lm) = &*cfg.last_modified.lock().unwrap() {
+            head.push_str(&format!("Last-Modified: {lm}\r\n"));
+        }
         head.push_str("\r\n");
         if s.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        if let Some(n) = cfg.cut_after.filter(|n| *n < slice.len()) {
+            let _ = s.write_all(&slice[..n]);
+            let _ = s.flush();
             return;
         }
         let rate = if start == 0 { cfg.slow_first.or(cfg.throttle) } else { cfg.throttle };
@@ -185,11 +280,9 @@ fn handle(mut s: TcpStream, cfg: &Cfg) {
     }
 }
 
-fn tmp(tag: &str) -> PathBuf {
+fn tmp(tag: &str) -> AutoCleanDir {
     let p = std::env::temp_dir().join(format!("reidm-eng-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+    AutoCleanDir::create(p)
 }
 
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
@@ -207,10 +300,11 @@ fn state(m: &Manager, id: u64) -> Status {
     m.get(id).unwrap().status
 }
 
-fn manager(tag: &str, connections: usize) -> (Manager, PathBuf) {
+fn manager(tag: &str, connections: usize) -> (Manager, PathBuf, AutoCleanDir) {
     let dir = tmp(tag);
-    let m = Manager::open(&dir.join("data"), dir.join("dl"), connections).unwrap();
-    (m, dir.join("dl"))
+    let dl = dir.join("dl");
+    let m = Manager::open(&dir.join("data"), dl.clone(), connections).unwrap();
+    (m, dl, dir)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -221,7 +315,7 @@ async fn a_slow_connection_has_its_range_taken_over() {
     let data = body(4 << 20, 1);
     let srv = serve(Cfg { slow_first: Some(64 << 10), ..Default::default() });
     srv.cfg.files.lock().unwrap().insert("/f.bin".into(), data.clone());
-    let (m, dl) = manager("steal", 2);
+    let (m, dl, _dir) = manager("steal", 2);
 
     let t0 = Instant::now();
     let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
@@ -242,7 +336,7 @@ async fn more_connections_than_the_server_allows_still_finishes() {
     let data = body(3 << 20, 2);
     let srv = serve(Cfg { max_conns: Some(2), throttle: Some(2 << 20), ..Default::default() });
     srv.cfg.files.lock().unwrap().insert("/capped.bin".into(), data.clone());
-    let (m, dl) = manager("capped", 8);
+    let (m, dl, _dir) = manager("capped", 8);
 
     let id = m.add(Request { url: srv.url("/capped.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
     wait_until("download ends", || matches!(state(&m, id), Status::Done | Status::Failed(_)));
@@ -255,7 +349,7 @@ async fn the_speed_limiter_caps_the_rate() {
     let data = body(768 << 10, 3);
     let srv = serve(Cfg::default());
     srv.cfg.files.lock().unwrap().insert("/limited.bin".into(), data.clone());
-    let (m, dl) = manager("limit", 4);
+    let (m, dl, _dir) = manager("limit", 4);
     m.update_settings(SettingsPatch { speed_limit: Some(256 << 10), limit_enabled: Some(true), ..Default::default() }).unwrap();
 
     let t0 = Instant::now();
@@ -274,7 +368,7 @@ async fn a_per_download_limit_applies_while_running() {
     let data = body(1 << 20, 4);
     let srv = serve(Cfg::default());
     srv.cfg.files.lock().unwrap().insert("/one.bin".into(), data.clone());
-    let (m, dl) = manager("perlimit", 2);
+    let (m, dl, _dir) = manager("perlimit", 2);
 
     let id = m.add_with(Request { url: srv.url("/one.bin"), dir: Some(dl.clone()), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap().id;
     m.set_speed_limit(id, Some(128 << 10)).unwrap();
@@ -292,7 +386,7 @@ async fn a_file_that_changed_on_the_server_is_not_spliced() {
     let srv = serve(Cfg { throttle: Some(256 << 10), ..Default::default() });
     *srv.cfg.etag.lock().unwrap() = Some("\"v1\"".into());
     srv.cfg.files.lock().unwrap().insert("/changing.bin".into(), old.clone());
-    let (m, dl) = manager("changed", 2);
+    let (m, dl, _dir) = manager("changed", 2);
 
     let id = m.add(Request { url: srv.url("/changing.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
     wait_until("some progress", || m.get(id).unwrap().downloaded > 100_000);
@@ -321,7 +415,7 @@ async fn a_file_that_changed_on_the_server_is_not_spliced() {
 async fn a_size_change_without_an_etag_is_noticed_too() {
     let srv = serve(Cfg { throttle: Some(256 << 10), ..Default::default() });
     srv.cfg.files.lock().unwrap().insert("/grow.bin".into(), body(2 << 20, 6));
-    let (m, dl) = manager("grow", 2);
+    let (m, dl, _dir) = manager("grow", 2);
     let id = m.add(Request { url: srv.url("/grow.bin"), dir: Some(dl), ..Default::default() }).unwrap();
     wait_until("some progress", || m.get(id).unwrap().downloaded > 100_000);
     m.pause(id);
@@ -342,7 +436,7 @@ async fn an_expired_address_can_be_refreshed() {
         f.insert("/mirror.bin".into(), data.clone());
         f.insert("/other.bin".into(), body(1 << 20, 8));
     }
-    let (m, dl) = manager("refresh", 2);
+    let (m, dl, _dir) = manager("refresh", 2);
     let id = m.add(Request { url: srv.url("/expiring.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
     wait_until("some progress", || m.get(id).unwrap().downloaded > 200_000);
     // The link expires mid-download.
@@ -370,7 +464,7 @@ async fn an_expired_address_can_be_refreshed() {
 fn refresh_capture_is_one_shot_and_expires_unused() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let (m, dl) = manager("arm", 1);
+        let (m, dl, _dir) = manager("arm", 1);
         let id = m
             .add_with(Request { url: "http://127.0.0.1:9/x.bin".into(), dir: Some(dl), ..Default::default() }, AddOptions { later: true, ..Default::default() })
             .unwrap()
@@ -388,7 +482,7 @@ async fn download_later_waits_for_the_queue() {
     let data = body(300 << 10, 9);
     let srv = serve(Cfg::default());
     srv.cfg.files.lock().unwrap().insert("/later.bin".into(), data.clone());
-    let (m, dl) = manager("later", 2);
+    let (m, dl, _dir) = manager("later", 2);
 
     let o = m.add_with(Request { url: srv.url("/later.bin"), dir: Some(dl.clone()), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap();
     std::thread::sleep(Duration::from_millis(500));
@@ -419,7 +513,7 @@ async fn stop_queue_pauses_only_scheduled_downloads() {
         f.insert("/q.bin".into(), body(1 << 20, 10));
         f.insert("/now.bin".into(), body(1 << 20, 11));
     }
-    let (m, dl) = manager("stopq", 1);
+    let (m, dl, _dir) = manager("stopq", 1);
     let q = m.add_with(Request { url: srv.url("/q.bin"), dir: Some(dl.clone()), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap().id;
     let now = m.add(Request { url: srv.url("/now.bin"), dir: Some(dl), ..Default::default() }).unwrap();
     m.start_queue();
@@ -432,7 +526,7 @@ async fn stop_queue_pauses_only_scheduled_downloads() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn invalid_schedules_are_refused() {
-    let (m, _) = manager("sched", 1);
+    let (m, _, _dir) = manager("sched", 1);
     let bad = reidm_core::schedule::Schedule { enabled: true, start: Some("26:00".into()), ..Default::default() };
     assert!(m.update_settings(SettingsPatch { schedule: Some(bad), ..Default::default() }).is_err());
     let good = reidm_core::schedule::Schedule { enabled: true, start: Some("02:30".into()), stop: Some("07:00".into()), days: vec![0, 1, 2, 3, 4] };
@@ -445,7 +539,7 @@ async fn a_checked_add_takes_only_what_it_can_fetch() {
     let data = body(2 << 20, 12);
     let srv = serve(Cfg { need_cookie: Some("session=ok".into()), ..Default::default() });
     srv.cfg.files.lock().unwrap().insert("/private.bin".into(), data.clone());
-    let (m, dl) = manager("checked", 4);
+    let (m, dl, _dir) = manager("checked", 4);
 
     // Without the browser's cookie the server refuses, so the hand-off must be refused too and
     // nothing may be left in the list.
@@ -481,7 +575,7 @@ async fn a_file_link_that_is_really_a_web_page_is_refused_when_asked() {
         t.insert("/setup.zip".into(), "text/html; charset=utf-8".into());
         t.insert("/page.html".into(), "text/html".into());
     }
-    let (m, dl) = manager("html", 1);
+    let (m, dl, _dir) = manager("html", 1);
     let opts = AddOptions { refuse_html: true, ..Default::default() };
     let err = m.add_checked(Request { url: srv.url("/setup.zip"), dir: Some(dl.clone()), ..Default::default() }, opts).await.unwrap_err();
     assert!(format!("{err:#}").contains("web page"), "{err:#}");
@@ -494,14 +588,14 @@ async fn a_file_link_that_is_really_a_web_page_is_refused_when_asked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn downloads_are_filed_by_type_and_wait_in_the_temporary_folder() {
-    // IDM's categories: with no folder asked for, an archive goes to Compressed under the
+    // Categories: with no folder asked for, an archive goes to Compressed under the
     // download folder, and until it is complete its part file sits in the temporary folder,
     // not among the finished files.
     let data = body(512 << 10, 9);
     let srv = serve(Cfg { throttle: Some(256 << 10), ..Default::default() });
     srv.cfg.files.lock().unwrap().insert("/pack.zip".into(), data.clone());
     srv.cfg.files.lock().unwrap().insert("/notes.txt".into(), b"hello".to_vec());
-    let (m, dl) = manager("folders", 2);
+    let (m, dl, _dir) = manager("folders", 2);
     let parts = m.temp_dir();
 
     let id = m.add(Request { url: srv.url("/pack.zip"), ..Default::default() }).unwrap();
@@ -520,4 +614,534 @@ async fn downloads_are_filed_by_type_and_wait_in_the_temporary_folder() {
     let id = m.add(Request { url: srv.url("/notes.txt"), ..Default::default() }).unwrap();
     wait_until("download completes", || matches!(state(&m, id), Status::Done | Status::Failed(_)));
     assert_eq!(m.get(id).unwrap().path, dl.join("notes.txt"));
+}
+
+fn failed_with(m: &Manager, id: u64) -> Option<String> {
+    match state(m, id) {
+        Status::Failed(e) => Some(e),
+        _ => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pause_works_while_the_server_never_answers() {
+    let srv = serve(Cfg { hang: true, ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(4 << 20, 0));
+    let (m, dl, _dir) = manager("hang", 2);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("running", || state(&m, id) == Status::Running && !m.get(id).unwrap().segments().is_empty());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The connections are waiting on requests the server will never answer. Pause used to be
+    // ignored until the system gave up on them, a quarter of an hour later.
+    let t = Instant::now();
+    m.pause(id);
+    wait_until("paused", || state(&m, id) == Status::Paused);
+    assert!(t.elapsed() < Duration::from_secs(5), "pause took {:?}", t.elapsed());
+    // And with the run over, a restart is allowed to go ahead.
+    m.restart(id).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_that_keep_breaking_off_still_finish() {
+    // Every response stops after 256 KiB: with 3 MiB per connection, that is a dozen breaks
+    // each, more than the retries a connection gets for failures that make no progress.
+    let srv = serve(Cfg { cut_after: Some(256 << 10), ..Default::default() });
+    let data = body(6 << 20, 3);
+    srv.cfg.files.lock().unwrap().insert("/flaky.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("flaky", 2);
+    let id = m.add(Request { url: srv.url("/flaky.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("finished or failed", || matches!(state(&m, id), Status::Done | Status::Failed(_)));
+    assert_eq!(state(&m, id), Status::Done);
+    assert!(std::fs::read(m.get(id).unwrap().path).unwrap() == data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_that_appears_at_the_destination_is_kept() {
+    // Slow enough that the file below is certainly there before the download finishes: at 1 MiB/s
+    // on a fast Windows runner it could finish before the write, and the test then proved nothing.
+    let srv = serve(Cfg { throttle: Some(128 << 10), ..Default::default() });
+    let data = body(1 << 20, 5);
+    srv.cfg.files.lock().unwrap().insert("/report.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("taken", 2);
+    let id = m.add(Request { url: srv.url("/report.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    assert_eq!(m.get(id).unwrap().path, dl.join("report.bin"));
+    // While it downloads, something else saves a file under the same name: the browser's own
+    // copy, or the user's.
+    std::fs::write(dl.join("report.bin"), b"the user's own file").unwrap();
+    wait_until("progress", || m.get(id).unwrap().downloaded > 0);
+    wait_until("done", || state(&m, id) == Status::Done);
+    assert_eq!(std::fs::read(dl.join("report.bin")).unwrap(), b"the user's own file", "an existing file was replaced");
+    let path = m.get(id).unwrap().path;
+    assert_eq!(path, dl.join("report (1).bin"));
+    assert!(std::fs::read(path).unwrap() == data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_downloads_the_server_names_alike_both_survive() {
+    let srv = serve(Cfg::default());
+    for (p, seed) in [("/get?id=1", 1u8), ("/get?id=2", 2u8)] {
+        srv.cfg.files.lock().unwrap().insert(p.into(), body(600_000, seed));
+        srv.cfg.disposition.lock().unwrap().insert(p.into(), "attachment; filename=\"report.pdf\"".into());
+    }
+    let (m, dl, _dir) = manager("samename", 2);
+    let a = m.add(Request { url: srv.url("/get?id=1"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    let b = m.add(Request { url: srv.url("/get?id=2"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    wait_until("both done", || state(&m, a) == Status::Done && state(&m, b) == Status::Done);
+    let (pa, pb) = (m.get(a).unwrap().path, m.get(b).unwrap().path);
+    assert_ne!(pa, pb);
+    assert!(std::fs::read(pa).unwrap() == body(600_000, 1));
+    assert!(std::fs::read(pb).unwrap() == body(600_000, 2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pausing_a_queued_download_keeps_it_from_starting() {
+    let srv = serve(Cfg { throttle: Some(2 << 20), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/one.bin".into(), body(1 << 20, 1));
+    srv.cfg.files.lock().unwrap().insert("/two.bin".into(), body(1 << 20, 2));
+    let (m, dl, _dir) = manager("pausequeued", 2);
+    m.update_settings(SettingsPatch { max_concurrent: Some(1), ..Default::default() }).unwrap();
+    let one = m.add(Request { url: srv.url("/one.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    let two = m.add(Request { url: srv.url("/two.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    assert_eq!(state(&m, two), Status::Queued);
+    m.pause(two);
+    assert_eq!(state(&m, two), Status::Paused);
+    wait_until("the first done", || state(&m, one) == Status::Done);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(state(&m, two), Status::Paused, "a paused download started when a slot came free");
+    assert_eq!(m.get(two).unwrap().downloaded, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_pressed_while_a_download_stops_is_kept() {
+    let srv = serve(Cfg { throttle: Some(400_000), ..Default::default() });
+    let data = body(1_500_000, 9);
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("pauseresume", 2);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("progress", || m.get(id).unwrap().downloaded > 100_000);
+    m.pause(id);
+    m.resume(id).unwrap();
+    wait_until("done or paused", || matches!(state(&m, id), Status::Done | Status::Paused | Status::Failed(_)));
+    assert_eq!(state(&m, id), Status::Done, "the Resume was lost");
+    assert!(std::fs::read(m.get(id).unwrap().path).unwrap() == data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_download_whose_file_was_deleted_downloads_again() {
+    let srv = serve(Cfg::default());
+    let data = body(300_000, 4);
+    srv.cfg.files.lock().unwrap().insert("/setup.exe".into(), data.clone());
+    let (m, dl, _dir) = manager("deleted", 2);
+    let req = Request { url: srv.url("/setup.exe"), dir: Some(dl), ..Default::default() };
+    let id = m.add(req.clone()).unwrap();
+    wait_until("done", || state(&m, id) == Status::Done);
+    let path = m.get(id).unwrap().path;
+    assert_eq!(m.add_detailed(req.clone()).unwrap().outcome, reidm_core::Outcome::AlreadyComplete);
+    std::fs::remove_file(&path).unwrap();
+    // Told "already downloaded", the browser would give up its copy and nobody would have it.
+    let again = m.add_detailed(req).unwrap();
+    assert_eq!((again.id, again.outcome), (id, reidm_core::Outcome::Existing));
+    wait_until("downloaded again", || state(&m, id) == Status::Done && path.exists());
+    assert!(std::fs::read(&path).unwrap() == data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn re_adding_a_link_brings_fresh_cookies() {
+    let srv = serve(Cfg { need_cookie: Some("s=2".into()), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/private.zip".into(), body(200_000, 6));
+    let (m, dl, _dir) = manager("cookies", 2);
+    let req = |c: &str| Request { url: srv.url("/private.zip"), cookie: Some(c.into()), dir: Some(dl.clone()), ..Default::default() };
+    let id = m.add(req("s=1")).unwrap();
+    wait_until("failed with the expired session", || failed_with(&m, id).is_some());
+    // The user signs in again and clicks the link: the new session must be used.
+    assert_eq!(m.add(req("s=2")).unwrap(), id);
+    wait_until("done", || state(&m, id) == Status::Done);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_running_download_deletes_its_files_once_it_stops() {
+    let srv = serve(Cfg { throttle: Some(300_000), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/big.bin".into(), body(3 << 20, 7));
+    let (m, dl, _dir) = manager("rmrunning", 4);
+    let id = m.add(Request { url: srv.url("/big.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    wait_until("progress", || m.get(id).unwrap().downloaded > 100_000);
+    let parts = m.temp_dir();
+    m.remove(id, true);
+    assert!(m.get(id).is_none());
+    // Once its connections have stopped, nothing of it is left: no part file still being
+    // written by them, and no finished file.
+    wait_until("the part file gone", || std::fs::read_dir(&parts).map(|d| d.count() == 0).unwrap_or(true));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(std::fs::read_dir(&parts).map(|d| d.count()).unwrap_or(0), 0);
+    assert!(!dl.join("big.bin").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn moving_the_temporary_folder_does_not_start_downloads_again() {
+    let srv = serve(Cfg { throttle: Some(500_000), ..Default::default() });
+    let data = body(2 << 20, 8);
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("tempmove", 2);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    wait_until("progress", || m.get(id).unwrap().downloaded > 200_000);
+    m.pause(id);
+    wait_until("paused", || state(&m, id) == Status::Paused);
+    let had = m.get(id).unwrap().downloaded;
+    let old_parts = m.temp_dir();
+    let elsewhere = dl.parent().unwrap().join("elsewhere");
+    m.update_settings(SettingsPatch { temp_dir: Some(elsewhere.clone()), ..Default::default() }).unwrap();
+    srv.cfg.ranges.lock().unwrap().clear();
+    m.resume(id).unwrap();
+    wait_until("done", || state(&m, id) == Status::Done);
+    assert!(std::fs::read(m.get(id).unwrap().path).unwrap() == data);
+    // It carried on where it was, from the part file it had, and left nothing behind.
+    assert!(had > 0);
+    assert!(!srv.cfg.ranges.lock().unwrap().iter().any(|r| r.starts_with("bytes=0-")), "it started again from byte 0");
+    assert_eq!(std::fs::read_dir(&old_parts).unwrap().count(), 0, "the old part file was left behind");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_answer_that_does_not_say_which_part_is_not_used() {
+    let srv = serve(Cfg { no_content_range: true, ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(2 << 20, 10));
+    let (m, dl, _dir) = manager("nocr", 4);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    // Every connection is sent the start of the file whatever it asked for. Taking that at
+    // its word wrote the first bytes into every range and reported a corrupt file as done.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_ne!(state(&m, id), Status::Done);
+    assert_eq!(m.get(id).unwrap().downloaded, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_that_got_shorter_is_reported_as_changed() {
+    let srv = serve(Cfg { throttle: Some(400_000), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(3 << 20, 11));
+    let (m, dl, _dir) = manager("shrunk", 1);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("progress", || m.get(id).unwrap().downloaded > 600_000);
+    m.pause(id);
+    wait_until("paused", || state(&m, id) == Status::Paused);
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(500_000, 11));
+    m.resume(id).unwrap();
+    // The server answers 416: what was being resumed is past its end now.
+    wait_until("failed", || failed_with(&m, id).is_some());
+    let e = failed_with(&m, id).unwrap();
+    assert!(e.contains("changed on the server"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_different_length_from_a_server_without_ranges_is_a_change() {
+    let srv = serve(Cfg { no_ranges: true, throttle: Some(400_000), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(1 << 20, 12));
+    let (m, dl, _dir) = manager("norangeslen", 2);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("progress", || m.get(id).unwrap().downloaded > 100_000);
+    m.pause(id);
+    wait_until("paused", || state(&m, id) == Status::Paused);
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(2 << 20, 13));
+    m.resume(id).unwrap();
+    // Cut to the old length, this used to be reported done: half of a different file.
+    wait_until("failed", || failed_with(&m, id).is_some());
+    assert!(failed_with(&m, id).unwrap().contains("changed on the server"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_date_without_an_etag_is_noticed() {
+    let srv = serve(Cfg { throttle: Some(400_000), ..Default::default() });
+    *srv.cfg.last_modified.lock().unwrap() = Some("Mon, 05 Oct 2026 10:00:00 GMT".into());
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(2 << 20, 14));
+    let (m, dl, _dir) = manager("lastmod", 2);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("progress", || m.get(id).unwrap().downloaded > 200_000);
+    m.pause(id);
+    wait_until("paused", || state(&m, id) == Status::Paused);
+    // Same size, new contents and date: resuming would splice two versions together.
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(2 << 20, 15));
+    *srv.cfg.last_modified.lock().unwrap() = Some("Tue, 06 Oct 2026 10:00:00 GMT".into());
+    m.resume(id).unwrap();
+    wait_until("failed", || failed_with(&m, id).is_some());
+    assert!(failed_with(&m, id).unwrap().contains("changed on the server"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refreshing_onto_a_server_without_ranges_before_any_bytes_works() {
+    let data = body(2 << 20, 16);
+    let a = serve(Cfg::default());
+    a.cfg.files.lock().unwrap().insert("/f.bin".into(), data.clone());
+    let b = serve(Cfg { no_ranges: true, ..Default::default() });
+    b.cfg.files.lock().unwrap().insert("/mirror.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("refreshnoranges", 4);
+    // Checked (so its ranges are planned for a server that serves them) but not started.
+    let id = m.add_checked(Request { url: a.url("/f.bin"), dir: Some(dl), ..Default::default() }, AddOptions { later: true, ..Default::default() }).await.unwrap().id;
+    m.refresh_address(id, Request { url: b.url("/mirror.bin"), ..Default::default() }).await.unwrap();
+    wait_until("done or failed", || matches!(state(&m, id), Status::Done | Status::Failed(_)));
+    assert_eq!(state(&m, id), Status::Done);
+    assert!(std::fs::read(m.get(id).unwrap().path).unwrap() == data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_revision_moves_with_every_visible_change_and_only_then() {
+    let srv = serve(Cfg { throttle: Some(500_000), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(1 << 20, 17));
+    let (m, dl, _dir) = manager("revision", 2);
+    let r0 = m.revision();
+    assert_eq!(m.revision(), r0, "reading changes nothing");
+    let _ = m.list();
+    assert_eq!(m.revision(), r0);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    let r1 = m.revision();
+    assert!(r1 > r0, "an add");
+    wait_until("progress", || m.get(id).unwrap().downloaded > 0);
+    assert!(m.revision() > r1, "progress");
+    wait_until("done", || state(&m, id) == Status::Done);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r2 = m.revision();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(m.revision(), r2, "nothing running, nothing changing");
+    m.set_scheduled(id, false).unwrap();
+    m.remove(id, false);
+    assert!(m.revision() > r2, "a removal");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_list_holding_cookies_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let (m, dl, _dir) = manager("private", 2);
+    m.add_with(Request { url: "http://127.0.0.1:9/x.bin".into(), cookie: Some("sid=secret".into()), dir: Some(dl), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap();
+    assert!(m.flush());
+    let mode = |f: &str| std::fs::metadata(m.data_dir().join(f)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode("downloads.json"), 0o600);
+    m.update_settings(SettingsPatch { connections: Some(3), ..Default::default() }).unwrap();
+    assert_eq!(mode("settings.json"), 0o600);
+}
+
+// ── phase 2 ──────────────────────────────────────────────────────────────
+
+fn later(m: &Manager, url: String, dl: &std::path::Path) -> u64 {
+    m.add_with(Request { url, dir: Some(dl.to_path_buf()), ..Default::default() }, AddOptions { later: true, ..Default::default() }).unwrap().id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_queue_starts_the_first_in_its_order_and_downloads_can_be_moved() {
+    let srv = serve(Cfg { throttle: Some(256 << 10), ..Default::default() });
+    for n in 1..=4 {
+        srv.cfg.files.lock().unwrap().insert(format!("/{n}.bin"), body(1 << 20, n));
+    }
+    let (m, dl, _dir) = manager("order", 1);
+    m.update_settings(SettingsPatch { max_concurrent: Some(1), ..Default::default() }).unwrap();
+    let ids: Vec<u64> = (1..=4).map(|n| later(&m, srv.url(&format!("/{n}.bin")), &dl)).collect();
+    assert_eq!(m.queue_order(), ids, "added in order");
+    m.move_in_queue(&[ids[3]], Move::Top).unwrap();
+    m.move_in_queue(&[ids[1], ids[2]], Move::Bottom).unwrap();
+    assert_eq!(m.queue_order(), [ids[3], ids[0], ids[1], ids[2]]);
+    m.move_in_queue(&[ids[2]], Move::Up).unwrap();
+    assert_eq!(m.queue_order(), [ids[3], ids[0], ids[2], ids[1]]);
+    assert!(m.move_in_queue(&[999], Move::Up).is_err(), "an unknown download is refused");
+
+    // One at a time: the first in the queue's order starts, not the first added.
+    m.start_queue();
+    wait_until("one running", || ids.iter().any(|id| state(&m, *id) == Status::Running));
+    assert_eq!(state(&m, ids[3]), Status::Running);
+    assert_eq!(state(&m, ids[0]), Status::Queued);
+    wait_until("the first done", || state(&m, ids[3]) == Status::Done);
+    wait_until("the next running", || state(&m, ids[0]) == Status::Running);
+    assert_eq!(state(&m, ids[2]), Status::Queued, "the moved one waits its turn");
+
+    // Moving down steps over finished downloads: they never wait in the queue.
+    m.move_in_queue(&[ids[0]], Move::Down).unwrap();
+    assert_eq!(m.queue_order(), [ids[3], ids[2], ids[0], ids[1]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_checksum_is_checked_and_a_mismatch_keeps_the_file() {
+    let data = body(600 << 10, 21);
+    let srv = serve(Cfg::default());
+    srv.cfg.files.lock().unwrap().insert("/good.bin".into(), data.clone());
+    srv.cfg.files.lock().unwrap().insert("/bad.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("checksum", 2);
+    let sha = {
+        let p = dl.parent().unwrap().join("ref.bin");
+        std::fs::write(&p, &data).unwrap();
+        reidm_core::checksum::of_file(&p, reidm_core::checksum::Algo::Sha256).unwrap()
+    };
+    let good = m.add(Request { url: srv.url("/good.bin"), dir: Some(dl.clone()), checksum: Some(Checksum::parse(&format!("SHA256:{}", sha.to_uppercase())).unwrap()), ..Default::default() }).unwrap();
+    let wrong = format!("sha256:{}", "0".repeat(64));
+    let bad = m.add(Request { url: srv.url("/bad.bin"), dir: Some(dl.clone()), checksum: Some(Checksum::parse(&wrong).unwrap()), ..Default::default() }).unwrap();
+    wait_until("both finish", || [good, bad].iter().all(|id| matches!(state(&m, *id), Status::Done | Status::Failed(_))));
+    assert_eq!(state(&m, good), Status::Done);
+    assert_eq!(m.get(good).unwrap().checksum_ok, Some(true));
+    let Status::Failed(why) = state(&m, bad) else { panic!("a mismatch fails") };
+    assert!(why.starts_with("checksum mismatch: expected sha256 0000"), "{why}");
+    assert!(why.contains(&sha), "says what it got: {why}");
+    assert_eq!(m.get(bad).unwrap().checksum_ok, Some(false));
+    assert_eq!(std::fs::read(dl.join("bad.bin")).unwrap(), data, "the file is kept");
+
+    // Resuming checks the file again rather than fetching it: still wrong, still kept.
+    let asked = srv.cfg.ranges.lock().unwrap().len();
+    m.resume(bad).unwrap();
+    wait_until("checked again", || matches!(state(&m, bad), Status::Failed(_)));
+    assert_eq!(srv.cfg.ranges.lock().unwrap().len(), asked, "nothing was downloaded again");
+    assert_eq!(std::fs::read(dl.join("bad.bin")).unwrap(), data);
+
+    // On demand, for Properties.
+    assert_eq!(m.checksum_of(good, reidm_core::checksum::Algo::Sha256).await.unwrap(), sha);
+    // A video or a torrent can't be given one.
+    let e = m.add(Request { url: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(), checksum: Some(Checksum::parse(&wrong).unwrap()), ..Default::default() }).unwrap_err();
+    assert!(e.to_string().contains("single file"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_waits_for_space_and_carries_on_when_there_is_some() {
+    let data = body(400 << 10, 23);
+    let srv = serve(Cfg::default());
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("space", 2);
+    // More free space kept than any disk has.
+    m.update_settings(SettingsPatch { min_free_space_mib: Some(1 << 40), ..Default::default() }).unwrap();
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    wait_until("stopped for space", || m.get(id).unwrap().waiting_for_space);
+    let it = m.get(id).unwrap();
+    assert_eq!(it.status, Status::Paused);
+    assert!(it.note.as_deref().unwrap().starts_with("not enough space on "), "{:?}", it.note);
+    assert!(it.note.as_deref().unwrap().contains("more free space"), "{:?}", it.note);
+    // Still no room: it stays.
+    assert_eq!(m.retry_waiting_for_space(), 0);
+    m.update_settings(SettingsPatch { min_free_space_mib: Some(0), ..Default::default() }).unwrap();
+    assert_eq!(m.retry_waiting_for_space(), 1);
+    wait_until("done", || state(&m, id) == Status::Done);
+    assert_eq!(std::fs::read(dl.join("f.bin")).unwrap(), data);
+    assert!(!m.get(id).unwrap().waiting_for_space);
+
+    // Paused by the user while waiting, it waits for the user instead.
+    m.update_settings(SettingsPatch { min_free_space_mib: Some(1 << 40), ..Default::default() }).unwrap();
+    let other = m.add(Request { url: srv.url("/f.bin?2"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("stopped for space", || m.get(other).unwrap().waiting_for_space);
+    m.pause(other);
+    assert!(!m.get(other).unwrap().waiting_for_space);
+    m.update_settings(SettingsPatch { min_free_space_mib: Some(0), ..Default::default() }).unwrap();
+    assert_eq!(m.retry_waiting_for_space(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn running_out_of_space_part_way_keeps_everything_downloaded() {
+    // The temporary folder on another drive than the download folder: the finished file has to
+    // be copied, so the download folder's drive needs the whole file. Where both are on one
+    // drive (no /dev/shm), this can't be shown this way.
+    let shm = PathBuf::from("/dev/shm");
+    if !shm.is_dir() {
+        return;
+    }
+    let data = body(3 << 20, 25);
+    let srv = serve(Cfg { throttle: Some(256 << 10), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/big.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("space-run", 2);
+    std::fs::create_dir_all(&dl).unwrap();
+    let _parts = AutoCleanDir::create(shm.join(format!("reidm-eng-space-{}", std::process::id())));
+    let parts = _parts.to_path_buf();
+    if std::fs::metadata(&parts).map(|a| std::os::unix::fs::MetadataExt::dev(&a)).ok() == std::fs::metadata(&dl).map(|b| std::os::unix::fs::MetadataExt::dev(&b)).ok() {
+        return;
+    }
+    // Start with no free-space floor (/dev/shm is often far smaller than the default 200 MiB
+    // in a container); the floor is raised below, once there is progress, to force the pause.
+    m.update_settings(SettingsPatch { temp_dir: Some(parts.clone()), min_free_space_mib: Some(0), ..Default::default() }).unwrap();
+    let id = m.add(Request { url: srv.url("/big.bin"), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    wait_until("some progress", || m.get(id).unwrap().downloaded > 300_000);
+    m.update_settings(SettingsPatch { min_free_space_mib: Some(1 << 40), ..Default::default() }).unwrap();
+    wait_until("stopped for space", || m.get(id).unwrap().waiting_for_space);
+    let it = m.get(id).unwrap();
+    assert_eq!(it.status, Status::Paused);
+    assert!(it.downloaded > 0 && it.downloaded < data.len() as u64);
+    // Every byte counted is in the part file.
+    let part = std::fs::read_dir(&parts).unwrap().next().unwrap().unwrap().path();
+    let on_disk = std::fs::read(&part).unwrap();
+    for s in it.segments() {
+        let (a, b) = (s.start as usize, (s.start + s.done) as usize);
+        assert_eq!(&on_disk[a..b], &data[a..b], "range {a}..{b} is counted but not on disk");
+    }
+    m.update_settings(SettingsPatch { min_free_space_mib: Some(0), ..Default::default() }).unwrap();
+    assert_eq!(m.retry_waiting_for_space(), 1);
+    wait_until("done", || state(&m, id) == Status::Done);
+    assert_eq!(std::fs::read(dl.join("big.bin")).unwrap(), data, "carried on, not started again, and whole");
+    let _ = std::fs::remove_dir_all(&parts);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_list_says_which_downloads_changed() {
+    let (m, dl, _dir) = manager("changes", 2);
+    let a = later(&m, "http://127.0.0.1:9/a.bin".into(), &dl);
+    let b = later(&m, "http://127.0.0.1:9/b.bin".into(), &dl);
+    let r = m.revision();
+    assert_eq!(m.changed_since(r), Some(vec![]));
+    m.set_scheduled(a, false).unwrap();
+    assert_eq!(m.changed_since(r), Some(vec![a]));
+    m.remove(b, false);
+    assert_eq!(m.changed_since(r), Some(vec![a, b]), "a removed one is named too");
+    let got = m.get_many(&[a, b]);
+    assert!(got[0].1.is_some() && got[1].1.is_none());
+    assert_eq!(m.changed_since(0), None, "from before this run: look at everything");
+    // Moving one in the queue changes the places of only the ones that move.
+    let c = later(&m, "http://127.0.0.1:9/c.bin".into(), &dl);
+    let d = later(&m, "http://127.0.0.1:9/d.bin".into(), &dl);
+    let r = m.revision();
+    m.move_in_queue(&[d], Move::Up).unwrap();
+    assert_eq!(m.changed_since(r), Some(vec![c, d]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn downloads_go_through_the_proxy_when_one_is_set() {
+    // The test server answers requests in a proxy's form (`GET http://host/path`): a file
+    // filed under its full address is only reachable through it.
+    let data = body(300 << 10, 27);
+    let srv = serve(Cfg::default());
+    srv.cfg.files.lock().unwrap().insert("http://files.invalid/f.bin".into(), data.clone());
+    let (m, dl, _dir) = manager("proxy", 2);
+    let proxy = Proxy { mode: ProxyMode::Manual, host: "127.0.0.1".into(), port: srv.port, ..Default::default() };
+    m.update_settings(SettingsPatch { proxy: Some(proxy), ..Default::default() }).unwrap();
+    let id = m.add(Request { url: "http://files.invalid/f.bin".into(), dir: Some(dl.clone()), ..Default::default() }).unwrap();
+    wait_until("done", || matches!(state(&m, id), Status::Done | Status::Failed(_)));
+    assert_eq!(state(&m, id), Status::Done);
+    assert_eq!(std::fs::read(dl.join("f.bin")).unwrap(), data);
+    // Without it, the address can't be reached at all.
+    let direct = Proxy { mode: ProxyMode::None, ..m.settings().proxy };
+    m.update_settings(SettingsPatch { proxy: Some(direct), ..Default::default() }).unwrap();
+    let e = m.add_checked(Request { url: "http://files.invalid/g.bin".into(), dir: Some(dl), ..Default::default() }, AddOptions::default()).await.unwrap_err();
+    assert!(!format!("{e:#}").is_empty());
+    // A proxy that can't be used is refused, and the one there is stays.
+    let bad = Proxy { mode: ProxyMode::Manual, host: "".into(), port: 1, ..Default::default() };
+    assert!(m.update_settings(SettingsPatch { proxy: Some(bad), ..Default::default() }).is_err());
+    assert_eq!(m.settings().proxy.mode, ProxyMode::None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_address_is_checked_before_the_download_is_stopped() {
+    let srv = serve(Cfg { throttle: Some(256 << 10), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/f.bin".into(), body(2 << 20, 29));
+    srv.cfg.files.lock().unwrap().insert("/other.bin".into(), body(1 << 20, 30));
+    let (m, dl, _dir) = manager("refresh-first", 2);
+    let id = m.add(Request { url: srv.url("/f.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("running with progress", || m.get(id).unwrap().downloaded > 100_000);
+    let e = m.refresh_address(id, Request { url: srv.url("/other.bin"), ..Default::default() }).await.unwrap_err();
+    assert!(format!("{e:#}").contains("different file"), "{e:#}");
+    // It was never stopped: still running, still on its own address, still moving.
+    assert_eq!(state(&m, id), Status::Running);
+    let before = m.get(id).unwrap().downloaded;
+    wait_until("still moving", || m.get(id).unwrap().downloaded > before);
+    assert!(m.get(id).unwrap().request.url.ends_with("/f.bin"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retries_follow_the_settings() {
+    // A server that always cuts the connection short, before any byte, would be retried
+    // `retries` times; with 1 retry and a 1 s first wait it gives up in about a second.
+    let srv = serve(Cfg { cut_after: Some(0), ..Default::default() });
+    srv.cfg.files.lock().unwrap().insert("/cut.bin".into(), body(64 << 10, 31));
+    let (m, dl, _dir) = manager("retries", 1);
+    m.update_settings(SettingsPatch { retries: Some(1), retry_wait_secs: Some(1), ..Default::default() }).unwrap();
+    let t = Instant::now();
+    let id = m.add(Request { url: srv.url("/cut.bin"), dir: Some(dl), ..Default::default() }).unwrap();
+    wait_until("gives up", || matches!(state(&m, id), Status::Failed(_)));
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
 }

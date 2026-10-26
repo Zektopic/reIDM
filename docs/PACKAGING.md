@@ -7,8 +7,8 @@ build each one are in [BUILDING.md](BUILDING.md#packaging).
 
 | Artifact | Built by | Contents |
 |---|---|---|
-| `reIDM-setup-<v>.exe` | Inno Setup, `packaging/windows/reidm.iss` | `reidm.exe`, `reidm-gui.exe`, `reidm-host.exe`, the browser extension, docs, icon; registers both native-messaging hosts (`com.zektopic.reidm` for Chrome, Edge, Brave and Vivaldi; `com.tonec.idm` for Chrome, Edge, Brave and Firefox) and a login autostart; Start-menu entries for the user guide and the extension folder |
-| `reidm_<v>-1_amd64.deb` | `cargo deb -p reidm` | the three binaries, the browser extension in `/usr/share/reidm/extension`, a `.desktop` entry, hicolor icons, a systemd user unit, both native-messaging hosts system-wide for Chrome, Chromium and Edge (`com.tonec.idm` also for Firefox), and the docs |
+| `reIDM-setup-<v>.exe` | Inno Setup, `packaging/windows/reidm.iss` | `reidm.exe`, `reidm-gui.exe`, `reidm-host.exe`, the browser extension, docs, icon; registers the native-messaging host (`com.zektopic.reidm` for Chrome, Edge, Brave, Vivaldi and Firefox) and a login autostart; Start-menu entries for the user guide and the extension folder |
+| `reidm_<v>-1_amd64.deb` | `cargo deb -p reidm` | the three binaries, the browser extension in `/usr/share/reidm/extension`, a `.desktop` entry, hicolor icons, a systemd user unit, the native-messaging host system-wide for Chrome, Chromium and Edge, and the docs |
 | `reIDM-<v>-universal.dmg` | `packaging/macos/make-dmg.sh` | a drag-to-Applications disk image holding `reIDM.app` (universal, with icon): the window, the service and the native host in `Contents/MacOS`, the extension in `Contents/Resources` |
 | `reidm-extension-<v>.zip` | `zip` in the release workflow | the browser extension alone |
 
