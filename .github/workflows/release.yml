@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   linux-deb:
-    runs-on: [self-hosted, manupa-hnx]
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - name: Configure Git safe directory
@@ -26,9 +26,10 @@ jobs:
       - run: cargo build --release --locked
       - run: cargo install cargo-deb --locked --version 2.7.0
       - run: cargo deb -p reidm --no-build --output dist/
-      - name: Browser extension zip
+      - name: Browser extension zips
         run: |
           V="${GITHUB_REF_NAME#v}"; [ "$GITHUB_REF_TYPE" = tag ] || V="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)-dev"
+          node tools/build-firefox-extension.mjs
           (cd extension && zip -r -X "../dist/reidm-extension-$V.zip" .)
       - uses: actions/upload-artifact@v4
         with: { name: deb, path: "dist/*" }
@@ -120,15 +121,18 @@ jobs:
       - name: Create release
         env: { GH_TOKEN: "${{ github.token }}" }
         run: |
+          PRE=""
+          case "${{ github.ref_name }}" in *-*) PRE="--prerelease" ;; esac
           ls -la dist
           gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" \
-            --title "reIDM ${{ github.ref_name }}" --notes-file - <<'EON'
+            --title "reIDM ${GITHUB_REF_NAME#v}" --notes-file - $PRE <<'EON'
           A cross-platform download manager that takes over your browser's downloads. See CHANGELOG.md for what is new.
 
           * `reIDM-setup-*.exe` – Windows installer (the app, the browser extension, native hosts, start at login)
           * `reidm_*_amd64.deb` – Debian/Ubuntu (desktop entry, the browser extension, native hosts, systemd user unit)
           * `reIDM-*-universal.dmg` – macOS app bundle (Intel + Apple silicon; drag it to Applications; ad-hoc signed unless a Developer ID is configured)
           * `reidm-extension-*.zip` – the browser extension on its own, for Chrome, Edge, Brave, Vivaldi and Opera
+          * `reidm-extension-firefox-*.zip` – the same extension for Firefox 128 and later (load it from about:debugging, or sign it for a permanent install)
 
           Install the app, then load the extension once: open the reIDM window and choose Help › Browser integration.
           The window is a front-end for the background service, so downloads keep running when it is closed.

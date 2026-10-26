@@ -1,9 +1,9 @@
 # reIDM Integration (browser extension)
 
 A Manifest V3 extension for Chromium-based browsers (Chrome, Edge, Brave, Vivaldi, Opera,
-Chromium; version 120 or later) that hands the browser's downloads, links and page media to the
-**reIDM** download manager. It is reIDM's own and doesn't depend on, or talk to, Tonec's IDM
-extension.
+Chromium; version 120 or later) and, from 1.8, for Firefox 128 or later through the Firefox build,
+that hands the browser's downloads, links and page media to the **reIDM** download manager. It is
+reIDM's own and doesn't depend on, or talk to, Tonec's IDM extension.
 
 **For users:** installing, what it does with your downloads, every setting, and privacy are in
 [docs/BROWSER_INTEGRATION.md](../docs/BROWSER_INTEGRATION.md). This file is for working on the
@@ -22,12 +22,42 @@ when packing or publishing, or the ID — and with it the native host's `allowed
 After editing a file, press the reload arrow on the extension's card. Run reIDM (`reidm daemon`,
 or open the window) for it to talk to.
 
+## Firefox
+
+Firefox 128 and later runs the same extension from a build of this folder:
+
+```sh
+node tools/build-firefox-extension.mjs          # dist/firefox-extension/ and the zip
+npx web-ext lint --source-dir dist/firefox-extension
+```
+
+Then open `about:debugging#/runtime/this-firefox`, choose **Load Temporary Add-on**, and pick
+`dist/firefox-extension/manifest.json`. Firefox removes temporary add-ons when it closes; sign the
+zip for a permanent install (see [docs/BROWSER_INTEGRATION.md](../docs/BROWSER_INTEGRATION.md)).
+
+The build makes three changes to the shared sources:
+
+* `tools/firefox-shim.mjs` is prepended to every script and `chrome.` is renamed to `reidmApi.`.
+  Firefox gives promises on `browser.*`, while this code is written for Chrome's mix of promises
+  and callbacks (including `runtime.lastError`); the shim supports both under one name.
+* The manifest becomes a Firefox one: an event page with module scripts (Firefox has no MV3
+  service workers), the gecko ID `reidm@zektopic.in` (which reIDM's native host admits), the
+  required data-collection declaration, and Firefox 128 as the minimum — the first version whose
+  `scripting.registerContentScripts` supports `world: "MAIN"`, which the page hook needs.
+* `inject.js` stays a registered content script, not a web-accessible resource: pages cannot probe
+  for it, exactly as in Chromium.
+
+Firefox has no `chrome.downloads.onDeterminingFilename`. The worker's non-Chromium path pauses a
+download when it is created and offers it; reIDM's taking the file cancels the browser's copy, and
+declining resumes it. A very small file may finish before the pause lands, and then stays with
+Firefox. Links, the right-click menu, the video picker, playlists and the grabber are unchanged.
+
 ## How it works
 
 | Part | Does |
 |---|---|
 | `defaults.js` | Every setting's default, loaded by the worker, the content scripts and the options page alike. |
-| `service-worker.js` | Holds each browser download in `chrome.downloads.onDeterminingFilename`, pauses it, writes it down (`storage.local`, `reidm-pending:<id>`, with the holding worker's id), offers it to reIDM with the cookies for that address from the right cookie store, and only then cancels the browser's copy (or resumes it, if reIDM refused). A worker that starts resumes whatever another worker left held. Also: the dialog queue, the media list, context menus, the popup's data, starting reIDM through native messaging, and a once-a-minute check that reIDM is running. |
+| `service-worker.js` | Holds each browser download in `chrome.downloads.onDeterminingFilename` (Chromium; Firefox pauses it on creation instead, in the same function), pauses it, writes it down (`storage.local`, `reidm-pending:<id>`, with the holding worker's id), offers it to reIDM with the cookies for that address from the right cookie store, and only then cancels the browser's copy (or resumes it, if reIDM refused). A worker that starts resumes whatever another worker left held. Also: the dialog queue, the media list, context menus, the popup's data, starting reIDM through native messaging, and a once-a-minute check that reIDM is running. |
 | `confirm.html`, `confirm.js` | The *Download file info* dialog: one window, a queue of requests, over a port named `confirm`. |
 | `content.js` | Stops plain left clicks on links to listed file types and asks the service worker to hand them over, replaying the click for the browser when reIDM declines. While media detection is on: reports media it sees in the DOM (only added nodes, debounced into idle time) and shows the video button and picker. |
 | `inject.js` | Registered by the service worker as a `document_start` content script in the page's own world (`chrome.scripting.registerContentScripts`, `world: "MAIN"`), only while media detection is on. Sees the page's `fetch`/XHR responses — YouTube player data (kept per video id), HLS and DASH manifests — which `chrome.webRequest` can't read. Observes only; never changes a request. It is not a web-accessible resource, so pages can't probe for it. |

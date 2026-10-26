@@ -9,6 +9,53 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — Extension 1.8.0: Firefox, and the 0.7.1-rc release (PR #10)
+
+**Context.** The user's Mac showed extension **1.5.0**'s console error *"Unsafe attempt to load URL
+…/inject.js"* (reIDM 0.7.0 stages 1.5.0) and asked for the extensions to run smoothly and work in
+Firefox. The inject error and the YouTube format bugs were already fixed in 1.6–1.7; a Firefox
+build was genuinely missing. The user also asked for the release candidate to be called
+**0.7.1-rc**.
+
+**Decision.** One source tree, with a Firefox build made by `tools/build-firefox-extension.mjs`:
+- `tools/firefox-shim.mjs` is prepended to every script and `chrome.` is renamed to `reidmApi.`.
+  Firefox gives promises on `browser.*`; this code mixes awaits with Chrome-style callbacks and
+  `runtime.lastError`. The shim returns promises when awaited, calls callbacks when given, sets
+  `lastError` for them, and passes event objects through untouched.
+- The Firefox manifest is a Firefox one: an event page with module scripts (Firefox has no MV3
+  service workers; `background.scripts` + `type: module`, Firefox 112+), the gecko ID
+  `reidm@zektopic.in` (which the native host now admits), `data_collection_permissions`
+  (`browsingActivity`, `websiteContent` — what is handed to reIDM on this machine), and
+  `strict_min_version` 128, the first Firefox whose registered content scripts take
+  `world: "MAIN"`, which the page hook needs.
+- `inject.js` stays a registered content script, not a web-accessible resource: the same
+  `scripting.registerContentScripts` call as Chromium, so pages cannot probe for it. This is also
+  why the 1.5.0 script-tag path was not brought back.
+- Firefox has no `onDeterminingFilename`; the worker's existing non-Chromium path pauses a
+  download on creation and offers it, cancelling the browser's copy when reIDM takes it and
+  resuming it when declined. A tiny file can finish first and stays with Firefox; documented.
+- Native host: `com.zektopic.reidm` now has a Firefox manifest (`allowed_extensions`) on
+  Linux/macOS and in the Windows registry, alongside the Chromium `allowed_origins`.
+
+**Alternatives.** A separate Firefox fork (rejected: drift); a web-accessible `inject.js` plus a
+script tag (rejected: pages can probe it, and it is exactly the error the user reported); requiring
+Firefox 140 for the data-permission key (rejected: the extension works from 128; the key is simply
+ignored below 140, which the linter notes).
+
+**Release naming.** `Cargo.toml` and the changelog's top section are **0.7.1-rc** — the user's
+requested release name; the extension keeps its own version 1.8.0. `release.yml` now marks
+hyphenated tags as GitHub prereleases, and its Linux job runs on GitHub's `ubuntu-22.04` because
+the self-hosted runner `manupa-hnx` was offline (the .deb is built there; local equivalents pass).
+
+**Evidence.** `web-ext lint`: 0 errors, 2 expected warnings (the data key's Firefox 140 note).
+Headless Firefox under Xvfb installs the temporary add-on and its background pings
+`/ext/ping?v=1.8.0` (verified against a throw-away endpoint). The Chromium browser suite passes
+100/100, 48/48 and 20/20 on the 1.8.0 sources. The `reidm` tests (39, including the new Firefox
+host test) and clippy pass.
+
+**Follow-ups.** AMO signing is left to the user or the release process; Firefox's tiny-download
+race is inherent to its API.
+
 ## 2026-10-26 — A service log on disk, for the next report (0.8.0, PR #10)
 
 **Context.** The 0.7.0 hang report arrived with no logs: the service was started by the window (or

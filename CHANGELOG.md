@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.0 (unreleased)
+## 0.7.1-rc
 
 ### New
 
@@ -119,8 +119,19 @@
 * Pages can no longer detect the extension through `inject.js`, use its privileged messages, or
   plant fake formats in the video picker.
 
-### Extension 1.7.0
+### Extension 1.8.0
 
+* **Firefox 128 and later is supported.** The same extension, built for Firefox: an event-page
+  background (Firefox has no MV3 service workers), its own promise/callback bridge, and the page
+  hook registered in the page's own world. Clicked links, the right-click menu, the video picker,
+  playlists and the resource grabber work as in Chromium. A download Firefox starts by itself is
+  paused as soon as it is seen and offered; if you decline, Firefox carries on. A very small file
+  may finish before the pause lands and then stays with Firefox. reIDM's native host admits the
+  Firefox extension (`reidm@zektopic.in`), so it can start the service too.
+* The console error **"Unsafe attempt to load URL …/inject.js"** seen with extension 1.5 and
+  earlier is gone: the page hook is registered by the worker, not added as a script tag.
+* The resource grabber's filter buttons and the video button are built from elements instead of
+  HTML strings (Firefox's add-on linter flags the latter).
 * While reIDM waits for a new address (*Refresh download address*), a link the browser hands over
   asks **"Use this link to refresh *name*?"** — Refresh, New download or Cancel — instead of looking
   like a new download; the result is announced by the download's name.

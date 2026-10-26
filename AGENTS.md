@@ -75,7 +75,22 @@ CARGO_TARGET_DIR=target/ci cargo +1.99.1 clippy --workspace --all-targets --lock
 ```
 
 The browser suite needs a Chromium (`npx playwright install chromium`; it finds the newest) and
-ports 61001/61002 free — stop any running reIDM first. For macOS lint without a Mac:
+ports 61001/61002 free — stop any running reIDM first.
+
+The extension also builds for **Firefox 128+** from the same sources (a shim and a Firefox
+manifest; see `extension/README.md`):
+
+```sh
+node tools/build-firefox-extension.mjs --self-test
+npx web-ext lint --source-dir dist/firefox-extension
+xvfb-run -a npx web-ext run --source-dir dist/firefox-extension --firefox=/usr/bin/firefox --no-reload
+```
+
+`web-ext run` installs it as a temporary add-on; its background pings the running service, so a
+throw-away endpoint on 61002 shows that it started. Firefox has no MV3 service workers or
+`onDeterminingFilename`: the build handles the first, and the worker's non-Chromium path pauses
+downloads on creation for the second.
+ For macOS lint without a Mac:
 `CC_aarch64_apple_darwin=true AR_aarch64_apple_darwin=true cargo clippy … --target aarch64-apple-darwin`.
 
 Video and torrent features have offline tests (a stand-in yt-dlp shell script in

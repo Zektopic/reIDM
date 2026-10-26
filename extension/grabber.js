@@ -325,7 +325,11 @@ function renderChips() {
     const b = document.createElement('button');
     b.className = `chip${filterCat === c ? ' on' : ''}`;
     b.disabled = !counts[c] && c !== 'all';
-    b.innerHTML = `${label} <span class="n">${counts[c] || 0}</span>`;
+    b.textContent = `${label} `;
+    const n = document.createElement('span');
+    n.className = 'n';
+    n.textContent = String(counts[c] || 0);
+    b.appendChild(n);
     b.addEventListener('click', () => {
       filterCat = c;
       render();

@@ -69,12 +69,14 @@ Download the latest release for your system from the [Releases page](https://git
 | **Windows** 10/11 (x64) | `reIDM-setup-<version>.exe` | Per-user install, no admin rights. Starts with Windows. |
 | **macOS** 11+ (Intel and Apple silicon) | `reIDM-<version>-universal.dmg` | Open it and drag reIDM onto Applications. |
 | **Debian / Ubuntu** (x64) | `reidm_<version>-1_amd64.deb` | `sudo apt install ./reidm_*.deb` |
-| Any | `reidm-extension-<version>.zip` | The browser extension on its own. |
+| Any | `reidm-extension-<version>.zip` | The browser extension on its own (Chromium). |
+| Any | `reidm-extension-firefox-<extension version>.zip` | The same extension for Firefox 128 and later. |
 
 Then connect your browser once — it takes a minute:
 
 1. Open reIDM and choose **Help › Browser integration**. It shows a folder.
 2. In Chrome, Edge, Brave, Vivaldi or Opera, open the extensions page (`chrome://extensions`, `edge://extensions`, …), turn on **Developer mode**, choose **Load unpacked**, and pick that folder.
+3. In Firefox 128 or later, open `about:debugging#/runtime/this-firefox`, choose **Load Temporary Add-on**, and pick `manifest.json` from the Firefox zip (or sign it for a permanent install; see the guide).
 
 That's it: the status bar now says *Browser: Chrome 1xx*, and downloads you start in the browser go to reIDM.
 The full walkthrough, including every browser and what to do when something doesn't connect, is in
@@ -126,10 +128,10 @@ See [docs/BUILDING.md](docs/BUILDING.md) for the real-browser test suite and the
 
 reIDM is young and moving quickly; see the [changelog](CHANGELOG.md). Things it does not do (yet), stated plainly:
 
-- The browser extension runs in **Chromium-based browsers**. Firefox is not supported by it (Firefox users can use Tonec's extension, see [docs/EXTENSION.md](docs/EXTENSION.md)).
+- The browser extension runs in **Chromium-based browsers** and in **Firefox 128 and later** (from extension 1.8; Firefox cannot hold a download before it starts, so a very small one may finish in the browser first). Firefox also needs the add-on signed for a permanent install, or Developer Edition/Nightly; see [docs/BROWSER_INTEGRATION.md](docs/BROWSER_INTEGRATION.md). Tonec's official extension also works with reIDM (see [docs/EXTENSION.md](docs/EXTENSION.md)).
 - Video streams on sites other than YouTube are found and listed, but reIDM does not merge their HLS/DASH segments into one file. DRM-protected media cannot be downloaded by any tool.
 - No FTP, no HTTP authentication prompts.
-- The extension isn't on the Chrome Web Store yet, hence *Load unpacked*.
+- The extension isn't on the Chrome Web Store or addons.mozilla.org yet, hence *Load unpacked* or a temporary Firefox add-on.
 
 ## Legal
 

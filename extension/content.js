@@ -488,8 +488,11 @@
 
       btn = document.createElement('div');
       btn.className = 'btn';
-      btn.innerHTML = '<span class="dot"></span><b></b>';
-      btn.querySelector('b').textContent = BUTTON_TEXT;
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      const caption = document.createElement('b');
+      caption.textContent = BUTTON_TEXT;
+      btn.append(dot, caption);
       btn.addEventListener('click', (ev) => {
         ev.preventDefault();
         ev.stopPropagation();

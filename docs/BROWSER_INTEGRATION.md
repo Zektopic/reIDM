@@ -4,9 +4,10 @@ reIDM's browser extension makes reIDM — not the browser — download the files
 page covers installing it, exactly what it does with a download, every capture setting, media
 and the resource grabber, and what to check when it doesn't connect.
 
-It works in Chromium-based browsers: **Google Chrome, Microsoft Edge, Brave, Vivaldi, Opera and
-Chromium**, on Windows, macOS and Linux alike. (Tonec's own "IDM Integration Module" can also
-talk to reIDM — see [EXTENSION.md](EXTENSION.md) — but reIDM's extension is the one to use.)
+It works in Chromium-based browsers — **Google Chrome, Microsoft Edge, Brave, Vivaldi, Opera and
+Chromium** — and from extension 1.8 in **Firefox 128 and later**, on Windows, macOS and Linux
+alike. (Tonec's own "IDM Integration Module" can also talk to reIDM — see
+[EXTENSION.md](EXTENSION.md) — but reIDM's extension is the one to use.)
 
 ## Install
 
@@ -38,6 +39,16 @@ the browser picks up the new extension the next time it starts — no reloading 
 **Without the installer** (a source build, or just the zip from the Releases page): unzip
 `reidm-extension-<version>.zip` anywhere and load that folder instead; or load `extension/` from a
 checkout of this repository.
+
+**Firefox 128 and later** uses a Firefox build of the same extension:
+`reidm-extension-firefox-<version>.zip` from the Releases page, or build it from a checkout with
+`node tools/build-firefox-extension.mjs`. Then open `about:debugging#/runtime/this-firefox`,
+choose **Load Temporary Add-on**, and pick the zip (or its `manifest.json`). Firefox removes a
+temporary add-on when it closes. To keep it, sign the build for addons.mozilla.org (`npx web-ext
+sign --source-dir dist/firefox-extension`, with AMO credentials) and install the signed file, or
+use Firefox Developer Edition or Nightly, where `xpinstall.signatures.required` can be turned off.
+The extension's Firefox ID is `reidm@zektopic.in`; reIDM's native host admits that ID, so the
+extension can start the service just as it does in Chromium.
 
 ## What happens when you download
 
@@ -120,9 +131,19 @@ question: reIDM tries every link against the waiting download itself.
 The extension starts it. reIDM registers a small helper with your browsers
 (`com.zektopic.reidm`, the native-messaging host) that the extension uses to launch the reIDM
 service and wait for it. The installers register it; reIDM also re-registers it every time it
-starts, for every Chromium-based browser it finds, which keeps it right after reIDM is moved or
-updated. If the helper is missing, downloads simply stay with the browser until you open reIDM —
-the popup's **Start reIDM** button tries the helper too.
+starts, for every Chromium-based browser it finds and for Firefox when it is installed, which
+keeps it right after reIDM is moved or updated. If the helper is missing, downloads simply stay
+with the browser until you open reIDM — the popup's **Start reIDM** button tries the helper too.
+
+### In Firefox
+
+Firefox has no `onDeterminingFilename`, the Chromium API that lets the extension decide a
+download's name before it starts. Firefox downloads are therefore caught as they are created and
+paused as quickly as the browser allows: the dialog asks as usual, reIDM cancels the browser's
+copy when it takes the file, and Firefox resumes it if you decline. A very small file may finish
+before the pause lands; the browser then keeps that one. Links you click, the right-click menu,
+the video picker, playlists and the resource grabber work exactly as in Chromium, and the page
+hook needs Firefox 128 or later (older versions fall back to the manifests `webRequest` sees).
 
 ### What always stays with the browser
 
