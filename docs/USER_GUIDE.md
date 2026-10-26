@@ -234,8 +234,9 @@ reIDM downloads torrents, and shares them back — *seeding* — the way a torre
   private tracker's work too, and adds the torrent it describes;
 - **Tasks › Add torrent…**: paste a magnet link or a `.torrent` address, or *Browse .torrent…*.
   **Show files** lists what is in it — tick only the files you want — then **Download** or
-  **Download later**. For a magnet link, the list waits until a peer describes the torrent,
-  which can take a minute;
+  **Download later**. For a magnet link, the list waits until a peer describes the torrent, which
+  can take minutes in a quiet swarm (up to 30 before it gives up and says so; *Resume* keeps
+  looking);
 - `reidm add 'magnet:?xt=…'` or `reidm add file.torrent` in a terminal.
 
 A torrent sits in the list like any download: it takes a turn in *Downloads at the same time*,

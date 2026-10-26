@@ -23,6 +23,14 @@ const FORGET_WAIT: Duration = Duration::from_secs(30);
 /// so instead of waiting for ever. Generous: a large torrent's files can take a while to check.
 const OP_WAIT: Duration = Duration::from_secs(120);
 
+/// How long a magnet link may take to find a peer that describes it. This is not the engine
+/// failing to answer: a quiet swarm can take many minutes, and Pause and Remove cancel it. The
+/// two-minute engine bound used to apply here too, and failed magnets that were healthy but slow
+/// to meet a peer (a real report: a magnet failed after exactly 120s while the engine could
+/// fetch another torrent on the same machine at once). Long enough for a quiet swarm, short
+/// enough that a torrent nobody is sharing stops holding a queue slot and says so.
+const METADATA_WAIT: Duration = Duration::from_secs(30 * 60);
+
 /// What to download of a torrent; on [`Request::torrent`]. The request's URL is the magnet link,
 /// or the address of the `.torrent` file.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -466,9 +474,13 @@ impl Manager {
                 AddTorrent::from_url(url.to_string())
             }
         };
-        let describe = tokio::time::timeout(OP_WAIT, s.add_torrent(add, Some(AddTorrentOptions { list_only: true, initial_peers: (!peers.is_empty()).then(|| peers.clone()), ..Default::default() })));
+        let asked = Instant::now();
+        let describe = tokio::time::timeout(METADATA_WAIT, s.add_torrent(add, Some(AddTorrentOptions { list_only: true, initial_peers: (!peers.is_empty()).then(|| peers.clone()), ..Default::default() })));
         let Some(described) = unless_stopped(&live.cancel, describe).await else { return Ok(None) };
-        let described = described.map_err(|_| anyhow!("the torrent engine did not answer within {}s", OP_WAIT.as_secs()))??;
+        let described = described.map_err(|_| anyhow!("no peer described this torrent within {} minutes: nobody may be sharing it, or torrent traffic is blocked (a firewall or VPN). Resume to keep looking; DHT is in Options › Torrents", METADATA_WAIT.as_secs() / 60))??;
+        if asked.elapsed() > Duration::from_secs(60) {
+            tracing::info!("download {id}: a peer described the torrent after {}s", asked.elapsed().as_secs());
+        }
         let AddTorrentResponse::ListOnly(l) = described else { bail!("the torrent could not be read") };
         let hash = hash_hex(&l.info_hash);
         let bytes = l.torrent_bytes.to_vec();

@@ -116,6 +116,14 @@ between reIDM choosing the place and the torrent starting: move it away and resu
 under different addresses (a magnet link and a `.torrent` from another site, say). Keep one; two
 would share one set of files, and removing either with its files would delete the other's.
 
+**A magnet link says *Asking peers for the torrent…* and then fails after 30 minutes.** A magnet
+carries only the torrent's ID: another peer has to describe it (its files and sizes) before reIDM
+can download it, and a quiet swarm can take minutes to answer. If none does, nobody may be sharing
+that torrent any more — no client can download it then — or torrent traffic is being blocked (a
+firewall, a VPN, or a "public" Wi-Fi network). *Resume* starts looking again; check that DHT is on
+(Options › Torrents) and that reIDM is allowed through the firewall. A `.torrent` file, or an
+address that serves one, needs no peer for this step.
+
 **A torrent stays at *Looking for peers*.** No one is sharing it right now, or none can be
 reached: a magnet link needs the DHT (Options › Torrents), and a firewall may be blocking
 reIDM — allow it when Windows asks. An old torrent may simply have no seeders left.

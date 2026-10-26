@@ -248,6 +248,38 @@ async fn a_torrent_of_several_files_gets_a_folder_of_its_own() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_magnet_link_gets_its_description_from_a_peer() {
+    let dir = tmp("magnet");
+    std::fs::create_dir_all(dir.join("seeder")).unwrap();
+    let data: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.join("seeder").join("payload.bin"), &data).unwrap();
+    let (_bytes, hash, peer, _seeder) = seed(&dir.join("seeder").join("payload.bin")).await;
+
+    // No .torrent is given: the name, the files and their sizes have to come from a peer, as
+    // they must for every magnet link. This is the path whose two-minute bound failed a real
+    // magnet in a quiet swarm.
+    let m = quiet_manager(&dir);
+    let id = m
+        .add(Request {
+            url: format!("magnet:?xt=urn:btih:{hash}&dn=payload.bin"),
+            torrent: Some(TorrentRequest { peers: vec![peer], ..Default::default() }),
+            ..Default::default()
+        })
+        .unwrap();
+    let it = finished(&m, id).await;
+    assert_eq!(it.status, Status::Done, "{:?}", it.status);
+    assert_eq!(std::fs::read(&it.path).unwrap(), data, "the bytes are the seeder's");
+    let t = it.torrent.clone().unwrap();
+    assert_eq!(t.info_hash, hash);
+    assert_eq!(t.name, "payload.bin");
+    assert_eq!(t.files.len(), 1);
+    // The description the peer gave is kept, so starting it again need not ask the swarm.
+    let kept = it.request.torrent.as_ref().and_then(|r| r.file.clone()).expect("the .torrent is kept");
+    let kept_bytes = std::fs::read(kept).unwrap();
+    assert_eq!(librqbit::torrent_from_bytes(&kept_bytes).unwrap().info_hash.as_string(), hash);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn starting_a_finished_torrent_again_downloads_it_again() {
     let dir = tmp("restart");
     std::fs::create_dir_all(dir.join("seeder")).unwrap();

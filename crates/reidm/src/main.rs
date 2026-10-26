@@ -547,7 +547,7 @@ async fn run_daemon(connections: usize, dir: Option<PathBuf>, no_idm_port: bool)
 fn init_logging(daemon: bool) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "reidm=info,reidm_core=info".into());
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "reidm=info,reidm_core=info,librqbit=warn,librqbit_dht=warn,librqbit_tracker_comms=warn".into());
     if !daemon {
         tracing_subscriber::fmt().with_env_filter(filter).init();
         return;

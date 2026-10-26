@@ -9,6 +9,51 @@ Format: `## YYYY-MM-DD — title (version, PR)`, then **Context**, **Decision**,
 
 ---
 
+## 2026-10-26 — A magnet's description waits for peers, not two minutes (0.7.1-rc3)
+
+**Context.** On the user's Windows PC a magnet download showed *Failed* with "the torrent engine
+did not answer within 120s". The list records the error, and the log shows the download begun at
+10:47:19 and failed at 10:49:19 — exactly the two-minute bound. A magnet carries only its info
+hash: before it can be fetched, a peer must describe it (name, files, sizes, piece hashes).
+`add_to_session` asks librqbit with `list_only: true`, and librqbit waits for that peer until the
+peer stream ends — for a quiet swarm, a long time. The 120 s `OP_WAIT`, added in the hang audit
+for engine calls that should answer, was applied to this wait too.
+
+**Evidence it was the bound, not the machine.** With the installed 0.7.1-rc on the same PC and
+network, a public-domain magnet (Big Buck Bunny) described itself in about a second and downloaded
+276 MB in 52 s from up to 31 peers. The service log showed the TCP listener and DHT up, with no
+firewall error, so DHT, trackers, the dual-stack sockets and the firewall were fine. Asked from
+the same network for ten minutes, with DHT and the link's own trackers, the user's magnet got no
+description at all: that swarm appears to have nobody left to serve it. The longer wait does not
+rescue a lifeless torrent — what it guarantees is that a healthy but quiet one is no longer failed
+at two minutes, and that a lifeless one ends with an explanation instead of an engine error.
+
+**Decision.** A separate `METADATA_WAIT` of 30 minutes bounds only the magnet's description, not
+the engine calls: session start and the real add keep `OP_WAIT` (120 s). The row says *Asking
+peers for the torrent…* meanwhile; after 30 minutes it fails with what to check (nobody sharing
+it, a firewall or VPN) and that *Resume* keeps looking. Both waits stay inside `unless_stopped`,
+so Pause and Remove act at once. A description that took over a minute is logged with its time.
+The service's default log filter now includes `librqbit=warn`, so the next torrent report carries
+the engine's own warnings (a corrupt piece from a peer, a failed announce) instead of silence.
+
+**Alternatives.** Leaving the 120 s bound (keeps failing magnets that merely met a quiet swarm);
+waiting without any bound (a torrent nobody shares would hold one of the four download slots for
+ever, and the row would never say why); giving metadata a state of its own outside the concurrency
+slots (the better long-term shape, but it changes the scheduler; deferred); retrying a failed
+magnet automatically (unexpected traffic, and failed HTTP downloads are not retried either).
+
+**Tests.** A new offline test, `a_magnet_link_gets_its_description_from_a_peer`, adds a magnet with
+no `.torrent` bytes and a local seeder as its only peer: reIDM asks it for the description, keeps
+it, and downloads the file. On the Windows PC the fixed build kept a magnet nobody shares
+*Running* past 130 s (the old one failed at 120 s), paused it in 277 ms, and then downloaded the
+live public-domain magnet to completion. The workspace tests and clippy (Linux, Windows and macOS
+targets, Rust 1.99.1) pass.
+
+**Follow-ups.** The *Add torrent* window still gives its choose-files lookup two minutes, because
+it is an interactive dialog; *Download all* beside it adds the magnet straight away with the long
+wait. A later release could move metadata resolution out of the queue slots (a *Resolving* state)
+so four quiet magnets cannot hold the queue.
+
 ## 2026-10-26 — An update replaces an older service that is still running (0.7.1-rc2)
 
 **Context.** On the user's Mac the window showed *"the service answered 405"* and no list right

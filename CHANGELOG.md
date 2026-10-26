@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.1-rc3
+
+### Fixed
+
+* **A magnet link no longer fails after two minutes while peers are still answering.** Its files
+  and sizes come from another peer, which a quiet swarm can take minutes to provide; reIDM gave
+  that the same two-minute limit as an engine call and marked the download *Failed* (a real
+  report: a magnet failed after exactly 120 s). It now waits up to 30 minutes and says *Asking
+  peers for the torrent…* meanwhile; if it gives up, the error explains that nobody may be
+  sharing it or that a firewall or VPN may block torrent traffic, and that *Resume* keeps looking.
+  Pause and Remove act at once throughout. The service's log now includes the torrent engine's
+  warnings.
+
 ## 0.7.1-rc2
 
 ### Fixed
