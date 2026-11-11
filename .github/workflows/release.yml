@@ -61,7 +61,7 @@ jobs:
         with: { name: exe, path: dist/*.exe }
 
   macos-dmg:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       # `secrets` is not available in a step's `if`, so surface them as job-level env
       # and test those. All are empty on a repository without them and the steps skip.
