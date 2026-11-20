@@ -1,4 +1,7 @@
 name: ci
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -16,7 +19,7 @@ jobs:
             runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure Git safe directory
         run: git config --global --add safe.directory '*'
       - uses: dtolnay/rust-toolchain@stable
